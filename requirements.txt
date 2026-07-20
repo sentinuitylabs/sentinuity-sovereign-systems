@@ -1,0 +1,12 @@
+base58>=2.1
+cryptography>=42
+pandas>=2.2
+psutil>=5.9
+python-dotenv>=1.0
+pytz>=2024.1
+requests>=2.31
+solders>=0.21
+streamlit>=1.36
+telethon>=1.36
+urllib3>=2.2
+websockets>=12

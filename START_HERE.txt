@@ -1,0 +1,9 @@
+WELCOME TO SENTINUITY V2
+
+1. Run INSTALL_PUBLIC_PAPER.bat
+2. Add your RPC and model-provider keys when .env opens
+3. Optionally run PERSONALISE_YOUR_TERMINAL.bat
+4. Run LAUNCH_PUBLIC_PAPER.bat
+5. Use STOP_SENTINUITY.bat to stop and safely maintain local databases
+
+Public edition: research and paper simulation only. No wallet is required.

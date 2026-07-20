@@ -1,0 +1,31 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Runtime state
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+logs/
+audits/
+backups/
+checkpoints/
+*.log
+
+# Python/build debris
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Local artefacts
+*.bak
+*.backup
+*.old
+*.orig
+*before_*
+*.zip
