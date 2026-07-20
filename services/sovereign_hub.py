@@ -2915,11 +2915,11 @@ def render_intelligence_scouts() -> None:
 
 
 @st.fragment(run_every=43)
-def render_intelligence_substrate_panel():
+def render_mycelial_signal_wilds():
     """
-    HUNTING GROUNDS{_holoq("hunting_grounds")} - Smart money substrate with real wallet data.
+    MYCELIAL SIGNAL WILDS — Sovereign intelligence ecology with real wallet, channel and enrichment telemetry.
     Reads from watched_wallets, telegram_channel_trust, and symbiotic_candidates.
-    Shows archetype badges, tier classification, and enrichment health.
+    Shows living wallet constellations, channel pulses and oracle nutrient health.
     """
     import time as _t, html as _h
     now = _t.time()
@@ -2946,7 +2946,7 @@ def render_intelligence_substrate_panel():
                 f'<span style="font-family:Share Tech Mono;font-size:0.66rem;color:{nc};">'
                 f'{label}{(" ×"+str(count)) if active and count>1 else ""}</span></span>')
 
-    _lamps = _lmp("PREDATORS", _wn>0, _wn) + _lmp("HIGH-WR", _hwn>0, _hwn) + _lmp("TG SIGNAL", _tn>0, _tn)
+    _lamps = _lmp("WALLET NODES", _wn>0, _wn) + _lmp("ELITE NODES", _hwn>0, _hwn) + _lmp("CHANNEL PULSES", _tn>0, _tn)
 
     # SENTINUITY_RUNNER_GOLD_20260621_V3: visual-only runner colour override.
 
@@ -2978,17 +2978,19 @@ def render_intelligence_substrate_panel():
 
 
     st.markdown(
-        f'''<div class="substrate-wrap">
-        <div class="substrate-title">⬡ MYCELIAL SIGNAL WILDS - SMART MONEY SUBSTRATE</div>
-        <div class="substrate-sub">Wallet constellations · signal provenance · enrichment health · shared Council research fabric.</div>
-        <div style="margin-top:6px;">{_lamps}</div>
+        f'''<div class="msw-shell">
+        <div style="position:absolute;inset:0 0 auto;height:1px;background:linear-gradient(90deg,transparent,#8EF9FF,#9945FF,#FFD700,transparent);opacity:.76;"></div>
+        <div style="font-family:Share Tech Mono,monospace;font-size:.54rem;letter-spacing:.24em;color:#8EF9FF;opacity:.58;margin-bottom:6px;">SOVEREIGN SENSORIUM · EXTERNAL INTELLIGENCE BIOME</div>
+        <div class="msw-title">⬡ MYCELIAL SIGNAL WILDS</div>
+        <div style="font-family:Share Tech Mono,monospace;font-size:.64rem;line-height:1.55;color:#78928C;margin-top:7px;max-width:920px;">A living sovereign intelligence ecology where wallet behaviour, trusted-channel pulse and oracle nourishment become traceable memory for the Council. Green marks verified life, cyan marks sensed flow, violet marks cognition, gold marks earned apex and doctrine red #FF073A marks failed provenance or dead signal tissue.</div>
+        <div style="margin-top:10px;">{_lamps}</div>
         </div>''',
         unsafe_allow_html=True
     )
 
     _sc1, _sc2, _sc3 = st.columns(3, gap="large")
 
-    # ── COL 1: WALLET PREDATOR REGISTRY ──────────────────────────────────────
+    # ── COL 1: SMART-WALLET CONSTELLATION ──────────────────────────────────────
     with _sc1:
         wallets = []
         try:
@@ -3022,17 +3024,17 @@ def render_intelligence_substrate_panel():
                 pass
 
         st.markdown(
-            f'<div class="substrate-card" style="border-color:#14F19588;">',
+            f'<div class="msw-card" style="border-color:#14F19588;">',
             unsafe_allow_html=True
         )
         st.markdown(
-            f'<div class="substrate-head" style="color:#14F195;">👁️ APEX WALLET CONSTELLATION ({len(wallets)})</div>',
+            f'<div class="msw-head" style="color:#14F195;">◉ SMART-WALLET CONSTELLATION ({len(wallets)})</div>',
             unsafe_allow_html=True
         )
 
         if not wallets:
             st.markdown(
-                '<div class="substrate-muted">// CONSTELLATION AWAITING FIRST APEX WALLET //<br>Tracking activates once wallets are profiled. Run: python initiate_intelligence_build.py</div>',
+                '<div class="msw-muted">// BIOME AWAITING FIRST VERIFIED WALLET NODE //<br>The sensory mycelium activates once wallets are profiled. Run: python initiate_intelligence_build.py</div>',
                 unsafe_allow_html=True
             )
         else:
@@ -3091,7 +3093,7 @@ def render_intelligence_substrate_panel():
                 )
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── COL 2: TELEGRAM SIGNAL PREY ──────────────────────────────────────────
+    # ── COL 2: CHANNEL PULSE CONSTELLATION ──────────────────────────────────────────
     with _sc2:
         tg_rows = []
         try:
@@ -3107,17 +3109,17 @@ def render_intelligence_substrate_panel():
             pass
 
         st.markdown(
-            '<div class="substrate-card" style="border-color:#8EF9FF88;">',
+            '<div class="msw-card" style="border-color:#8EF9FF88;">',
             unsafe_allow_html=True
         )
         st.markdown(
-            '<div class="substrate-head" style="color:#8EF9FF;">◈ SIGNAL WILDS - TELEGRAM SCOUT</div>',
+            '<div class="msw-head" style="color:#8EF9FF;">◈ CHANNEL PULSE CONSTELLATION</div>',
             unsafe_allow_html=True
         )
 
         if not tg_rows:
             st.markdown(
-                '<div class="substrate-muted">// SIGNAL WILDS ARMED - AWAITING TELEGRAM SCOUT //<br>Channel scoring begins when telegram_scout is started.</div>',
+                '<div class="msw-muted">// CHANNEL SENSORS ARMED — AWAITING FIRST TRUSTED PULSE //<br>Signal provenance begins when the channel scout is started.</div>',
                 unsafe_allow_html=True
             )
         else:
@@ -3201,8 +3203,8 @@ def render_intelligence_substrate_panel():
 
 
         st.markdown(
-            f'''<div class="substrate-card" style="border-color:{bc}88;">
-            <div class="substrate-head" style="color:{bc};">”¬ ORACLE ENRICHMENT FORGE</div>
+            f'''<div class="msw-card" style="border-color:{bc}88;">
+            <div class="msw-head" style="color:{bc};">✦ ORACLE NUTRIENT FORGE</div>
             <div style="font-family:Share Tech Mono;font-size:0.66rem;color:{bc};margin-bottom:8px;">{btext}</div>''',
             unsafe_allow_html=True
         )
@@ -3961,12 +3963,14 @@ def build_dynamic_css(dom_col="#9945FF"):
     }}
 
     /* ── INTELLIGENCE SUBSTRATE STRIP ── */
-    .substrate-wrap {{ margin-top: 22px; padding: 16px 18px 10px 18px; border:1px solid rgba(255,215,0,0.28); border-radius:16px; background:rgba(5,2,16,0.42); box-shadow:0 0 24px rgba(153,69,255,0.18); }}
-    .substrate-title {{ color:#FFD700; font-family:'Share Tech Mono',monospace; font-size:0.82rem; letter-spacing:4px; }}
+    .msw-shell {{ position:relative; margin-top:24px; padding:20px 20px 14px; border:1px solid rgba(153,69,255,.34); border-radius:22px 8px 22px 8px; background:radial-gradient(circle at 8% 0%,rgba(142,249,255,.10),transparent 36%),radial-gradient(circle at 94% 12%,rgba(153,69,255,.12),transparent 40%),linear-gradient(135deg,rgba(6,4,18,.94),rgba(4,2,13,.82)); box-shadow:0 22px 70px rgba(0,0,0,.32),inset 0 0 30px rgba(153,69,255,.035); overflow:hidden; }}
+    .msw-shell:after {{ content:'MYCELIAL SIGNAL WILDS'; position:absolute; right:18px; bottom:9px; font-family:'Share Tech Mono',monospace; font-size:.44rem; letter-spacing:.24em; color:rgba(153,69,255,.20); pointer-events:none; }}
+    .msw-title {{ color:#EAFEF9; font-family:'Orbitron',sans-serif; font-size:.92rem; font-weight:700; letter-spacing:.20em; text-shadow:0 0 18px rgba(142,249,255,.26); }}
     .substrate-sub {{ color:#8EF9FF99; font-family:'Share Tech Mono',monospace; font-size:0.66rem; margin-top:5px; letter-spacing:1.2px; }}
-    .substrate-card {{ min-height: 188px; border:1px solid; border-radius:14px; padding:14px 14px; background:rgba(255,255,255,0.025); margin-top:12px; }}
-    .substrate-head {{ font-family:'Share Tech Mono',monospace; font-size:0.74rem; letter-spacing:3px; margin-bottom:8px; }}
-    .substrate-muted {{ color:#888; font-size:0.68rem; font-style:italic; padding:12px 0; }}
+    .msw-card {{ position:relative; min-height:202px; border:1px solid; border-radius:16px 5px 16px 5px; padding:15px 15px; background:linear-gradient(145deg,rgba(9,7,24,.72),rgba(3,3,12,.88)); margin-top:12px; box-shadow:inset 0 0 20px rgba(142,249,255,.025),0 10px 28px rgba(0,0,0,.22); overflow:hidden; }}
+    .msw-card:before {{ content:''; position:absolute; left:0; right:0; top:0; height:1px; background:linear-gradient(90deg,currentColor,transparent 72%); opacity:.42; }}
+    .msw-head {{ font-family:'Orbitron',sans-serif; font-size:.68rem; font-weight:700; letter-spacing:.17em; margin-bottom:10px; text-transform:uppercase; }}
+    .msw-muted {{ color:#61716D; font-family:'Share Tech Mono',monospace; font-size:.64rem; line-height:1.55; letter-spacing:.04em; padding:14px 2px; }}
     .substrate-source {{ color:#777; font-size:0.66rem; letter-spacing:1px; margin-bottom:8px; }}
     .substrate-row {{ border-left:3px solid rgba(255,215,0,0.35); background:rgba(255,255,255,0.025); border-radius:0 8px 8px 0; padding:8px 10px; margin-bottom:7px; font-family:'Share Tech Mono',monospace; font-size:0.66rem; }}
     .substrate-status {{ float:right; color:#FFD70099; font-size:0.66rem; }}
@@ -10352,11 +10356,11 @@ if not _sec_active:
             st.markdown(f'<div style="display:flex;justify-content:space-between;align-items:center;padding:7px 10px;margin-bottom:5px;border-radius:6px;background:rgba(255,255,255,0.02);font-family:Share Tech Mono,monospace;"><span style="color:#FFF;font-size:0.68rem;">{html.escape(ptype)}</span><span style="color:{out_col};font-size:0.7rem;font-weight:700;">{ts_str}</span></div>',unsafe_allow_html=True)
         st.markdown("</div>",unsafe_allow_html=True)
     
-    # Convergence Gate and intelligence substrate - single render at bottom
+    # Mycelial Signal Wilds — canonical sovereign intelligence ecology render
     if _GV_UI_AVAILABLE:
-        try: _gv_section("intelligence", "06", "Secondary Systems", "Copytrade, Substrate and autonomous research surfaces")
+        try: _gv_section("intelligence", "06", "Mycelial Signal Wilds", "Wallet constellations, channel pulses, oracle nourishment and Council memory ecology")
         except Exception: pass
-    render_intelligence_substrate_panel()
+    render_mycelial_signal_wilds()
     st.markdown("<div style='margin-top:20px;padding:14px 16px;border:1px solid rgba(153,69,255,0.25);border-radius:12px;background:rgba(5,2,16,0.5);'>",unsafe_allow_html=True)
     
     # Live conviction score from 5 signals
