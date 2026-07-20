@@ -6,7 +6,7 @@ THE INTELLIGENCE SUBSTRATE — Sovereign Laboratory of the AI Council.
 BUILD SEPARATION (PERMANENT DOCTRINE):
   NOT the primary copy-trading execution bot.
   The Council's war room for researching and forging new profit species.
-  Copy-trade/wallet data = Smart Money Observatory (sensory substrate only; renamed from Hunting Grounds, SIGNOFF_OBSERVATORY_RENAME_20260718).
+  Copy-trade/wallet data = Smart Money Observatory (sensory substrate only; canonical intelligence ecology).
 
 CONVERGENCE DOCTRINE:
   Edge = independent corroboration across multiple attention systems.
@@ -2405,4 +2405,3 @@ def render_intelligence_tab(query_db) -> None:
         _safe_panel("NIM call log", _render_nim_call_log, query_db)
         _safe_panel("Forensic audit", _render_forensic_audit, debate_df, patch_df)
     _safe_panel("Operator petition membrane", _render_petition_membrane, queue_df)
-

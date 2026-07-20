@@ -34,6 +34,13 @@ from pathlib import Path
 from typing import Any, Optional
 
 # ── divergence taxonomy (directive: "It must distinguish…") ──────────────────
+# Canonical colour doctrine. DOCTRINE_RED is deliberately identical to the
+# live pressure-gauge SL fill in services/sovereign_hub.py. Do not substitute
+# rose, coral, faded red, opacity, or a text glow for negative truth states.
+DOCTRINE_RED = "#FF073A"
+METER_RED = "#CC052E"  # #FF073A rendered at 80% opacity on the Sentinuity void
+DOCTRINE_RED_RGB = "255,7,58"
+
 CLASS_EXPECTED_FRICTION = "EXPECTED_EXECUTION_FRICTION"
 CLASS_ORACLE_DELAY = "ORACLE_DELAY"
 CLASS_ROUTE_DELAY = "ROUTE_CONSTRUCTION_DELAY"
@@ -45,16 +52,16 @@ CLASS_MARKET_MOVE = "GENUINE_MARKET_MOVEMENT"
 CLASS_UNCLASSIFIED = "UNCLASSIFIED"
 
 _PALETTE = {
-    "ok": "#3ddc97",       # green — aligned
-    "warn": "#e6b450",     # amber — expected friction / delays
-    "bad": "#e4587c",      # rose — chain truth disagrees
-    "cyan": "#53d8e8",
-    "violet": "#9d7bde",
-    "gold": "#c9a24b",
-    "dim": "#8b93a7",
-    "bg": "#0b0f14",
-    "panel": "#101722",
-    "edge": "#1d2836",
+    "ok": "#14F195",       # doctrine green — aligned
+    "warn": "#FFB347",     # doctrine amber — expected friction / delay
+    "bad": DOCTRINE_RED,   # exact live-meter red — veto / mismatch / loss
+    "cyan": "#8EF9FF",
+    "violet": "#9945FF",
+    "gold": "#FFD700",
+    "dim": "#71817D",
+    "bg": "#05030D",
+    "panel": "#090713",
+    "edge": "#2A1647",
 }
 
 
@@ -327,54 +334,88 @@ def _render_inner(st, db_path: str | Path, limit: int) -> None:
          if pairs else
          "NO LIVE-FUNDED POSITIONS RECORDED — NOTHING TO COMPARE (this is a "
          "truthful empty state, not an error)"))
+
+    # The danger treatment deliberately mirrors the live pressure meter:
+    # the live meter’s effective #CC052E rail + crimson -> transparent bleed. Main copy remains
+    # neutral so browser font antialiasing cannot turn the doctrine red pink.
+    is_bad = n_bad > 0
+    status_class = "pld-bad" if is_bad else ("pld-warn" if pairs else "pld-empty")
     st.markdown(
-        f"<div style='background:{P['panel']};border:1px solid {P['edge']};"
-        f"border-left:3px solid {banner_col};padding:.7rem 1rem;border-radius:4px;"
-        f"margin-bottom:.6rem'>"
-        f"<span style='color:{P['gold']};font-size:.72rem;letter-spacing:.14em'>"
-        f"PAPER / LIVE DIVERGENCE INSTRUMENT</span><br>"
-        f"<span style='color:{banner_col};font-size:.9rem'>{html.escape(banner_txt)}"
-        f"</span></div>", unsafe_allow_html=True)
+        f"""
+<style>
+.pld-shell{{position:relative;overflow:hidden;margin:0 0 .72rem;padding:.82rem 1rem .78rem 1.18rem;
+ border:1px solid {P['edge']};border-radius:5px;background:linear-gradient(110deg,{P['panel']} 0%,#080510 72%,#05030d 100%);}}
+.pld-shell:before{{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:{banner_col};}}
+.pld-shell.pld-bad:after{{content:"";position:absolute;left:4px;right:0;top:0;height:3px;
+ background:linear-gradient(90deg,#CC052E 0%,#CC052E 18%,rgba(204,5,46,.22) 55%,transparent 100%);}}
+.pld-kicker{{font-family:Share Tech Mono,monospace;font-size:.72rem;letter-spacing:.14em;color:{P['gold']};}}
+.pld-status{{display:flex;align-items:center;gap:.55rem;margin-top:.42rem;font-family:Share Tech Mono,monospace;
+ font-size:.86rem;font-weight:700;letter-spacing:.015em;color:#DCE7E4;}}
+.pld-status-dot{{width:9px;height:9px;flex:0 0 9px;border-radius:2px;background:{banner_col};}}
+.pld-bad .pld-status-dot{{background:#CC052E;box-shadow:0 0 0 1px #CC052E,0 0 10px rgba(204,5,46,.48);}}
+.pld-exp{{margin:.42rem 0 .28rem;padding:.58rem .72rem;border-left:4px solid #CC052E;
+ background:linear-gradient(90deg,rgba(204,5,46,.12),rgba(204,5,46,.028) 46%,transparent 100%);
+ font-family:Share Tech Mono,monospace;font-size:.82rem;font-weight:650;line-height:1.45;color:#DCE7E4;}}
+.pld-exp b{{color:#CC052E;font-weight:900;}}
+</style>
+<div class="pld-shell {status_class}">
+  <div class="pld-kicker">PAPER / LIVE DIVERGENCE INSTRUMENT</div>
+  <div class="pld-status"><i class="pld-status-dot"></i><span>{html.escape(banner_txt)}</span></div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
     if not pairs:
         return
-    for p in pairs:
-        sev = p["severity"]
+
+    for pair in pairs:
+        sev = pair["severity"]
         edge = {"ok": P["ok"], "warn": P["warn"], "bad": P["bad"]}[sev]
-        hdr = (f"{p['token']} · #{p['position_id']} · {p['status']} · "
-               f"{p['classification']}")
+        hdr = (f"{pair['token']} · #{pair['position_id']} · {pair['status']} · "
+               f"{pair['classification']}")
         with st.expander(hdr, expanded=(sev == "bad")):
-            st.markdown(
-                f"<span style='color:{edge}'>{html.escape(p['explanation'])}"
-                f"</span>", unsafe_allow_html=True)
+            if sev == "bad":
+                explanation_html = (
+                    f"<div class='pld-exp'><b>CHAIN TRUTH DISAGREEMENT</b> · "
+                    f"{html.escape(pair['explanation'])}</div>"
+                )
+            else:
+                explanation_html = (
+                    f"<div style='color:{edge};font-family:Share Tech Mono,monospace;"
+                    f"font-weight:700;padding:.45rem 0'>{html.escape(pair['explanation'])}</div>"
+                )
+            st.markdown(explanation_html, unsafe_allow_html=True)
             rows = [
-                ("Signal timestamp", _fmt_ts(p.get("signal_ts"))),
-                ("Paper entry timestamp", _fmt_ts(p.get("paper_entry_ts"))),
-                ("Live submission timestamp", _fmt_ts(p.get("live_submit_ts"))),
-                ("Chain-confirmed fill timestamp", _fmt_ts(p.get("chain_fill_ts"))),
-                ("Paper entry price", _fmt_px(p.get("paper_entry_px"))),
-                ("Chain-derived live fill price", _fmt_px(p.get("live_fill_px"))),
-                ("Paper quantity", str(p.get("paper_qty") or "NOT RECORDED")),
-                ("Raw-token live quantity", str(p.get("live_qty") or "NOT RECORDED")),
-                ("Paper exit", _fmt_px(p.get("paper_exit_px"))
-                 + " @ " + _fmt_ts(p.get("paper_exit_ts"))),
-                ("Live exit", _fmt_px(p.get("live_exit_px"))
-                 + " @ " + _fmt_ts(p.get("live_exit_ts"))),
-                ("Paper PnL", _fmt_usd(p.get("paper_pnl"))),
-                ("Chain-reconciled live PnL", _fmt_usd(p.get("live_pnl"))),
-                ("Fee impact", _fmt_usd(p.get("fees_usd"))),
-                ("Slippage", (f"{p['slippage_bps']} bps"
-                              if p.get("slippage_bps") is not None
+                ("Signal timestamp", _fmt_ts(pair.get("signal_ts"))),
+                ("Paper entry timestamp", _fmt_ts(pair.get("paper_entry_ts"))),
+                ("Live submission timestamp", _fmt_ts(pair.get("live_submit_ts"))),
+                ("Chain-confirmed fill timestamp", _fmt_ts(pair.get("chain_fill_ts"))),
+                ("Paper entry price", _fmt_px(pair.get("paper_entry_px"))),
+                ("Chain-derived live fill price", _fmt_px(pair.get("live_fill_px"))),
+                ("Paper quantity", str(pair.get("paper_qty") or "NOT RECORDED")),
+                ("Raw-token live quantity", str(pair.get("live_qty") or "NOT RECORDED")),
+                ("Paper exit", _fmt_px(pair.get("paper_exit_px"))
+                 + " @ " + _fmt_ts(pair.get("paper_exit_ts"))),
+                ("Live exit", _fmt_px(pair.get("live_exit_px"))
+                 + " @ " + _fmt_ts(pair.get("live_exit_ts"))),
+                ("Paper PnL", _fmt_usd(pair.get("paper_pnl"))),
+                ("Chain-reconciled live PnL", _fmt_usd(pair.get("live_pnl"))),
+                ("Fee impact", _fmt_usd(pair.get("fees_usd"))),
+                ("Slippage", (f"{pair['slippage_bps']} bps"
+                              if pair.get("slippage_bps") is not None
                               else "NOT RECORDED")),
                 ("Latency (submit→chain fill)",
-                 (f"{p['latency_sec']:.1f}s" if p.get("latency_sec") is not None
+                 (f"{pair['latency_sec']:.1f}s" if pair.get("latency_sec") is not None
                   else "NOT RECORDED")),
-                ("Chain state", p.get("chain_state") or "NOT RECORDED"),
+                ("Chain state", pair.get("chain_state") or "NOT RECORDED"),
             ]
             body = "".join(
                 f"<tr><td style='color:{P['dim']};padding:.15rem .8rem .15rem 0;"
                 f"font-size:.78rem'>{html.escape(k)}</td>"
                 f"<td style='color:#cfd6e4;font-size:.82rem'>{html.escape(v)}</td></tr>"
-                for k, v in rows)
+                for k, v in rows
+            )
             st.markdown(
                 f"<table style='border-collapse:collapse'>{body}</table>",
-                unsafe_allow_html=True)
+                unsafe_allow_html=True,
+            )
