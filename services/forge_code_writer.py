@@ -47,7 +47,6 @@ CYCLE_SECONDS = 30
 # Files the forge is ALLOWED to write to autonomously
 # Everything else requires HITL approval
 AUTONOMOUS_TARGETS = {
-    "ui/sovereign_health_tab.py",
     "ui/substrate_node.py",
     "ui/sovereign_chamber_v1_5.py",
     "services/pump_activity_monitor.py",

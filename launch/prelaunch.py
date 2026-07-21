@@ -447,7 +447,6 @@ else:
 
 _ui_modules = [
     ("ui/substrate_tab.py",         "Substrate Lane 2 tab"),
-    ("ui/sovereign_health_tab.py",  "Biological Intelligence Lane 3 tab"),
 ]
 for _path, _desc in _ui_modules:
     if Path(_path).exists():

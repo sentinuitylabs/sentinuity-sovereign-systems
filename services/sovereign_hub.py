@@ -1277,7 +1277,7 @@ def render_top_command_nav() -> None:
     except Exception:
         _active = ""
 
-    secs = [("FOREST", "forest"), ("SUBSTRATE NODE", "substrate"), ("INTEL", "intel"), ("BIO·3", "bio"),
+    secs = [("FOREST", "forest"), ("SUBSTRATE NODE", "substrate"), ("INTEL", "intel"),
             ("README", "readme"), ("LAB", "lab"), ("VAULT", "vault"),
             ("POLARIS", "polaris"), ("IVARIS", "ivy")]
     jumps = [("PULSE", "#lore-modules"), ("GLASSBOX", "#glassbox-anchor")]
@@ -9775,7 +9775,7 @@ h1,h2,h3 {font-family:'Orbitron',sans-serif !important;letter-spacing:.12em}
 # selected, skip the entire home composite below so the section renders alone
 # (it used to render buried under the full home page, which read as "not loading").
 _sec_active = str(st.query_params.get("sec","")).strip().lower() in (
-    "worldos","forest","substrate","intel","bio","readme","polaris","ivy","lab","vault")
+    "worldos","forest","substrate","intel","readme","polaris","ivy","lab","vault")
 if not _sec_active:
     # ── SIGNOFF_CANONICAL_HIERARCHY_20260715 ─────────────────────────────────
     # 1. COMPACT SYSTEM HEADER + MODE/STATUS STRIP + BLOCKERS FIRST.
@@ -10456,11 +10456,8 @@ if not _sec_active:
     # and reads the same backend sources - only the navigation architecture moved.
 st.markdown('<div id="lore-modules"></div>', unsafe_allow_html=True)
 
-try:
-    from ui.sovereign_health_tab import render_health_tab as _render_health_tab
-    _health_tab_available = True
-except Exception:
-    _health_tab_available = False
+# BIO3_REMOVE_20260722: biological intelligence health tab removed.
+_health_tab_available = False
 
 # SUBSTRATE_NODE_CANONICAL_IDENTITY_20260720
 # One product identity, one renderer, one import path.  Backend services retain
@@ -10613,19 +10610,7 @@ def _sec_substrate() -> None:
 </div>""", unsafe_allow_html=True)
 
 
-def _sec_bio() -> None:
-    if _health_tab_available:
-        try:
-            _render_health_tab()
-        except Exception as _he:
-            st.error(f"Health tab error: {_he}")
-    else:
-        st.markdown("""
-<div style='text-align:center;padding:40px;font-family:Share Tech Mono,monospace;
-    font-size:0.66rem;color:#555;letter-spacing:2px;'>
-    // BIOLOGICAL INTELLIGENCE MODULE NOT FOUND //<br>
-    Copy ui/sovereign_health_tab.py to load Lane 3
-</div>""", unsafe_allow_html=True)
+# BIO3_REMOVE_20260722: _sec_bio renderer removed with the health tab.
 
 
 def _sec_intel() -> None:
@@ -10808,7 +10793,6 @@ _HUB_SECTIONS = {
     "forest":    ("🌲 LIVING EXCHANGE FOREST",                   _sec_forest),
     "substrate": ("🌐 SUBSTRATE NODE",                          _sec_substrate),
     "intel":     ("§  INTELLIGENCE - RESEARCH & SELF-EVOLUTION", _sec_intel),
-    "bio":       ("⬡ BIOLOGICAL INTELLIGENCE - LANE 3",         _sec_bio),
     "readme":    ("📋 POLARIZE - README",                        _sec_readme),
     "polaris":   ("❄️ POLARIS — AUTONOMOUS ARCHITECT",          _sec_polaris),
     "ivy":       ("🔥 IVY GENESIS SQUAD",                        _sec_ivy),
