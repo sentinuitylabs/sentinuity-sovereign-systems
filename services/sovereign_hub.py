@@ -3034,7 +3034,7 @@ def render_mycelial_signal_wilds():
 
         if not wallets:
             st.markdown(
-                '<div class="msw-muted">// BIOME AWAITING FIRST VERIFIED WALLET NODE //<br>The sensory mycelium activates once wallets are profiled. Run: python initiate_intelligence_build.py</div>',
+                '<div class="msw-muted">// BIOME AWAITING FIRST VERIFIED WALLET NODE //<br>The sensory mycelium activates once wallets are profiled. Run: python -m services.initiate_intelligence_build</div>',
                 unsafe_allow_html=True
             )
         else:

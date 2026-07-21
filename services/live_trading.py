@@ -507,6 +507,382 @@ def _execute_jupiter_swap(
 
 
 
+
+# ── CANONICAL RPC + CHAIN-FILL TRUTH (SIGNOFF_NTO_RESTORE_20260721) ───────────
+def _rpc_call(method: str, params: list, *, timeout: float = 8.0) -> Any:
+    """Call the configured Solana RPC and return only ``result``.
+
+    RPC errors are raised rather than converted into synthetic values.  Live
+    execution must never substitute a theoretical fill when chain truth is
+    unavailable.
+    """
+    import requests
+
+    response = requests.post(
+        _RPC_URL,
+        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+        timeout=float(timeout),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("error") is not None:
+        raise RuntimeError(f"rpc_{method}_error:{payload['error']}")
+    return payload.get("result")
+
+
+def _confirm_transaction(
+    signature: str,
+    *,
+    attempts: int = 20,
+    delay_sec: float = 0.75,
+) -> bool:
+    """Return True only after the signature reaches confirmed/finalized state.
+
+    A local timeout is deliberately non-terminal.  The signature has already
+    been written to ``live_tx_ledger`` and settlement recovery can reconcile it
+    later from chain truth.
+    """
+    signature = str(signature or "").strip()
+    if not signature:
+        return False
+
+    for attempt in range(max(1, int(attempts))):
+        try:
+            result = _rpc_call(
+                "getSignatureStatuses",
+                [[signature], {"searchTransactionHistory": True}],
+                timeout=8.0,
+            )
+            values = (result or {}).get("value") or []
+            status = values[0] if values else None
+            if status:
+                if status.get("err") is not None:
+                    log.error(
+                        "[LIVE_CONFIRM_ONCHAIN_ERROR] sig=%s err=%s",
+                        signature[:20],
+                        status.get("err"),
+                    )
+                    return False
+                confirmation = str(status.get("confirmationStatus") or "").lower()
+                if confirmation in {"confirmed", "finalized"}:
+                    return True
+                # Older RPC nodes may omit confirmationStatus after finalization.
+                if status.get("confirmations") is None and status.get("slot") is not None:
+                    return True
+        except Exception as exc:
+            log.warning(
+                "[LIVE_CONFIRM_RPC_RETRY] sig=%s attempt=%d/%d err=%s",
+                signature[:20],
+                attempt + 1,
+                max(1, int(attempts)),
+                exc,
+            )
+
+        if attempt + 1 < max(1, int(attempts)):
+            time.sleep(max(0.0, float(delay_sec)))
+    return False
+
+
+def _account_key_strings(transaction: dict, meta: dict) -> list[str]:
+    """Return static and loaded transaction account keys in canonical index order."""
+    message = (((transaction or {}).get("transaction") or {}).get("message") or {})
+    keys: list[str] = []
+
+    for item in message.get("accountKeys") or []:
+        if isinstance(item, dict):
+            key = item.get("pubkey")
+        else:
+            key = item
+        keys.append(str(key or ""))
+
+    loaded = (meta or {}).get("loadedAddresses") or {}
+    for group in ("writable", "readonly"):
+        for item in loaded.get(group) or []:
+            if isinstance(item, dict):
+                item = item.get("pubkey")
+            keys.append(str(item or ""))
+    return keys
+
+
+def _raw_token_balance_map(
+    entries: list,
+    *,
+    wallet_pubkey: str,
+    mint: str,
+    owner_indexes: set[int],
+) -> tuple[dict[int, int], Optional[int]]:
+    """Collect raw token balances belonging to the requested wallet and mint.
+
+    Ownership is selected primarily by the RPC-provided ``owner`` field.  When
+    one side omits owner metadata, the matching account index from the opposite
+    side is retained through ``owner_indexes``.
+    """
+    balances: dict[int, int] = {}
+    decimals: Optional[int] = None
+
+    for entry in entries or []:
+        if str(entry.get("mint") or "") != str(mint):
+            continue
+        try:
+            account_index = int(entry.get("accountIndex"))
+        except (TypeError, ValueError):
+            continue
+
+        owner = str(entry.get("owner") or "")
+        belongs = owner == str(wallet_pubkey) or account_index in owner_indexes
+        if not belongs:
+            continue
+
+        amount_info = entry.get("uiTokenAmount") or {}
+        try:
+            raw_amount = int(str(amount_info.get("amount") or "0"))
+            current_decimals = int(amount_info.get("decimals") or 0)
+        except (TypeError, ValueError):
+            continue
+
+        if decimals is None:
+            decimals = current_decimals
+        elif decimals != current_decimals:
+            raise RuntimeError("fill_token_decimal_mismatch")
+
+        balances[account_index] = balances.get(account_index, 0) + raw_amount
+        owner_indexes.add(account_index)
+
+    return balances, decimals
+
+
+def resolve_confirmed_fill(
+    signature: str,
+    wallet_pubkey: str,
+    mint: str,
+    *,
+    attempts: int = 6,
+    delay_sec: float = 0.75,
+) -> Optional[dict]:
+    """Resolve a confirmed BUY or SELL strictly from Solana transaction metadata.
+
+    Capital-truth contract:
+      * wallet account index is discovered dynamically, never assumed to be 0;
+      * versioned transaction loaded addresses are appended in canonical order;
+      * token movement uses raw integer ``amount`` values, never ``uiAmount``;
+      * ``blockTime`` is the canonical ownership boundary;
+      * wallet native delta includes any fee actually paid by that wallet;
+      * fee is also reported separately, including when another payer paid it;
+      * unresolved or errored transactions return None—there is no price fallback.
+    """
+    signature = str(signature or "").strip()
+    wallet_pubkey = str(wallet_pubkey or "").strip()
+    mint = str(mint or "").strip()
+    if not signature or not wallet_pubkey or not mint:
+        return None
+
+    request = [
+        signature,
+        {
+            "encoding": "jsonParsed",
+            "commitment": "confirmed",
+            "maxSupportedTransactionVersion": 0,
+        },
+    ]
+
+    transaction = None
+    for attempt in range(max(1, int(attempts))):
+        try:
+            transaction = _rpc_call("getTransaction", request, timeout=12.0)
+        except Exception as exc:
+            log.warning(
+                "[LIVE_FILL_RPC_RETRY] sig=%s attempt=%d/%d err=%s",
+                signature[:20],
+                attempt + 1,
+                max(1, int(attempts)),
+                exc,
+            )
+            transaction = None
+
+        if transaction and transaction.get("meta") is not None:
+            break
+        if attempt + 1 < max(1, int(attempts)):
+            time.sleep(max(0.0, float(delay_sec)))
+
+    if not transaction:
+        return None
+
+    meta = transaction.get("meta") or {}
+    if meta.get("err") is not None:
+        log.error("[LIVE_FILL_ONCHAIN_ERROR] sig=%s err=%s", signature[:20], meta.get("err"))
+        return None
+
+    block_time = transaction.get("blockTime")
+    if block_time is None:
+        return None
+
+    account_keys = _account_key_strings(transaction, meta)
+    wallet_indexes = {i for i, key in enumerate(account_keys) if key == wallet_pubkey}
+    if not wallet_indexes:
+        log.error("[LIVE_FILL_WALLET_NOT_FOUND] sig=%s wallet=%s", signature[:20], wallet_pubkey[:16])
+        return None
+
+    pre_balances = meta.get("preBalances") or []
+    post_balances = meta.get("postBalances") or []
+    valid_wallet_indexes = {
+        index
+        for index in wallet_indexes
+        if index < len(pre_balances) and index < len(post_balances)
+    }
+    if not valid_wallet_indexes:
+        return None
+
+    native_delta_lamports = sum(
+        int(post_balances[index]) - int(pre_balances[index])
+        for index in valid_wallet_indexes
+    )
+
+    pre_entries = meta.get("preTokenBalances") or []
+    post_entries = meta.get("postTokenBalances") or []
+
+    # First collect explicit owner matches from both sides, then repeat so an
+    # owner omitted on one side can inherit ownership by account index.
+    owner_indexes: set[int] = set()
+    for entry in list(pre_entries) + list(post_entries):
+        if (
+            str(entry.get("mint") or "") == mint
+            and str(entry.get("owner") or "") == wallet_pubkey
+        ):
+            try:
+                owner_indexes.add(int(entry.get("accountIndex")))
+            except (TypeError, ValueError):
+                pass
+
+    pre_map, pre_decimals = _raw_token_balance_map(
+        pre_entries,
+        wallet_pubkey=wallet_pubkey,
+        mint=mint,
+        owner_indexes=owner_indexes,
+    )
+    post_map, post_decimals = _raw_token_balance_map(
+        post_entries,
+        wallet_pubkey=wallet_pubkey,
+        mint=mint,
+        owner_indexes=owner_indexes,
+    )
+
+    decimals_values = {d for d in (pre_decimals, post_decimals) if d is not None}
+    if len(decimals_values) > 1:
+        raise RuntimeError("fill_token_decimal_mismatch")
+    decimals = next(iter(decimals_values), None)
+    if decimals is None:
+        # A zero-to-zero token movement cannot be a resolved fill.
+        return None
+
+    token_indexes = set(pre_map) | set(post_map)
+    token_delta_raw = sum(
+        int(post_map.get(index, 0)) - int(pre_map.get(index, 0))
+        for index in token_indexes
+    )
+    if token_delta_raw == 0:
+        return None
+
+    fee_lamports = int(meta.get("fee") or 0)
+    fee_payer = account_keys[0] if account_keys else None
+    wallet_is_fee_payer = fee_payer == wallet_pubkey
+    scale = Decimal(10) ** int(decimals)
+    token_delta = Decimal(token_delta_raw) / scale
+    native_delta_sol = Decimal(native_delta_lamports) / Decimal(1_000_000_000)
+    fee_sol = Decimal(fee_lamports) / Decimal(1_000_000_000)
+
+    return {
+        "signature": signature,
+        "mint": mint,
+        "wallet": wallet_pubkey,
+        "wallet_account_indexes": sorted(valid_wallet_indexes),
+        "fee_payer": fee_payer,
+        "wallet_is_fee_payer": wallet_is_fee_payer,
+        "token_account_indexes": sorted(token_indexes),
+        "token_decimals": int(decimals),
+        "token_delta_raw": int(token_delta_raw),
+        "token_delta": format(token_delta, "f"),
+        "native_delta_lamports": int(native_delta_lamports),
+        "native_delta_sol": format(native_delta_sol, "f"),
+        "fee_lamports": int(fee_lamports),
+        "fee_sol": format(fee_sol, "f"),
+        "slot": transaction.get("slot"),
+        "block_time": float(block_time),
+        "resolved_from": "solana_getTransaction_raw_integer_truth",
+    }
+
+
+def _sync_wallet_to_system_state() -> None:
+    """Best-effort refresh of canonical live wallet state after a resolved fill."""
+    try:
+        from services.live_wallet_sync import sync_live_wallet_state
+
+        sync_live_wallet_state()
+        return
+    except (ImportError, AttributeError):
+        pass
+    except Exception as exc:
+        log.warning("[LIVE_WALLET_SYNC_SERVICE_FAIL] %s", exc)
+
+    try:
+        kp = _load_keypair()
+        if not kp:
+            return
+        wallet = str(kp.pubkey())
+        balance_result = _rpc_call(
+            "getBalance",
+            [wallet, {"commitment": "confirmed"}],
+            timeout=8.0,
+        )
+        lamports = int((balance_result or {}).get("value") or 0)
+        sol_balance = Decimal(lamports) / Decimal(1_000_000_000)
+        reserve_sol = Decimal(str(_GAS_RESERVE_SOL))
+        usable_sol = max(Decimal(0), sol_balance - reserve_sol)
+        sol_usd_price = Decimal(str(_get_cached_sol_price() or 0.0))
+        balance_usd = sol_balance * sol_usd_price
+        available_usd = usable_sol * sol_usd_price
+        now = time.time()
+
+        from core.schema import get_connection
+        with get_connection() as conn:
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(live_wallet_state)").fetchall()
+            }
+            values = {
+                "wallet_address": wallet,
+                "sol_balance": float(sol_balance),
+                "gas_reserve_sol": float(reserve_sol),
+                "usable_sol": float(usable_sol),
+                "sol_usd_price": float(sol_usd_price),
+                "balance_usd": float(balance_usd),
+                "available_usd": float(available_usd),
+                "source": "chain_post_fill",
+                "sync_status": "SYNCED",
+                "last_error": None,
+                "synced_at": now,
+                "updated_at": now,
+            }
+            usable_values = {key: value for key, value in values.items() if key in columns}
+            if not usable_values:
+                return
+
+            existing = conn.execute("SELECT id FROM live_wallet_state LIMIT 1").fetchone()
+            if existing:
+                assignments = ", ".join(f"{key}=?" for key in usable_values)
+                conn.execute(
+                    f"UPDATE live_wallet_state SET {assignments} WHERE id=?",
+                    [*usable_values.values(), existing[0]],
+                )
+            else:
+                names = ", ".join(usable_values)
+                placeholders = ", ".join("?" for _ in usable_values)
+                conn.execute(
+                    f"INSERT INTO live_wallet_state ({names}) VALUES ({placeholders})",
+                    list(usable_values.values()),
+                )
+            conn.commit()
+    except Exception as exc:
+        log.warning("[LIVE_WALLET_SYNC_FALLBACK_FAIL] %s", exc)
+
 def _rpc_get_account_info(address: str, *, encoding: str = "jsonParsed") -> Optional[dict]:
     """Read one account without mutating chain state."""
     try:

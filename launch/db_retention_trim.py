@@ -489,16 +489,16 @@ def run_deep_target_pass(
         if "position" in lower or "order" in lower:
             continue
         if sizes.get(table, 0.0) >= 0.10 and GENERIC_CHURN_RE.search(table):
-            policies[table] = 100
+            policies[table] = 50
             report["warnings"].append(
-                f"deep-target auto-policy applied to {table}: keep 100"
+                f"deep-target auto-policy applied to {table}: keep 50"
             )
 
     for table, keep in sorted(policies.items()):
         if table in PROTECTED_TABLES or not exists(con, table):
             continue
         try:
-            operations[table] = trim_tail(con, arc, table, min(keep, 100))
+            operations[table] = trim_tail(con, arc, table, min(keep, 50))
         except Exception as exc:
             operations[table] = {"error": str(exc)}
             report["warnings"].append(f"deep-target {table}: {exc}")
@@ -508,11 +508,169 @@ def run_deep_target_pass(
             continue
         try:
             operations[table] = trim_tail(
-                con, arc, table, min(keep, 150), active_guard=True
+                con, arc, table, min(keep, 100), active_guard=True
             )
         except Exception as exc:
             operations[table] = {"error": str(exc)}
             report["warnings"].append(f"deep-target {table}: {exc}")
+
+
+def run_adaptive_target_pass(
+    con: sqlite3.Connection,
+    arc: sqlite3.Connection,
+    report: dict[str, Any],
+    target_mb: float,
+) -> None:
+    """Archive-first final target enforcer for the operational hot database.
+
+    This pass is intentionally conservative:
+    * protected/durable tables are never touched;
+    * unknown tables are touched only when their name is clearly high-churn;
+    * open/active position rows remain protected;
+    * every removed row is copied into the archive database first;
+    * the pass stops when the target is reached or no safe progress remains.
+
+    It exists because fixed tail policies cannot anticipate every new telemetry
+    table introduced by later builds.  The previous shutdown could therefore
+    report TARGET_MISSED even when the remaining bulk was disposable churn.
+    """
+    operations = report.setdefault("adaptive_target_operations", {})
+    attempted: set[str] = set()
+    rounds: list[dict[str, Any]] = []
+
+    for round_number in range(1, 9):
+        current_mb = round(size_mb(Path(report["database"])), 3)
+        if current_mb <= float(target_mb):
+            break
+
+        sizes = object_sizes(con)
+        table_names = {
+            str(r[0])
+            for r in con.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+
+        candidates: list[tuple[float, str, int, bool]] = []
+
+        for table in table_names:
+            if table in attempted or table in PROTECTED_TABLES:
+                continue
+
+            lower = table.lower()
+            is_position = table in POSITION_POLICIES or "position" in lower
+            is_known_churn = table in TAIL_POLICIES
+            is_named_churn = bool(GENERIC_CHURN_RE.search(table))
+
+            if not (is_position or is_known_churn or is_named_churn):
+                continue
+
+            object_mb = float(sizes.get(table, 0.0))
+            if object_mb < 0.04:
+                continue
+
+            keep = 100 if is_position else 25
+            candidates.append((object_mb, table, keep, is_position))
+
+        candidates.sort(reverse=True)
+        if not candidates:
+            rounds.append({
+                "round": round_number,
+                "before_mb": current_mb,
+                "result": "no_safe_candidates",
+            })
+            break
+
+        before_round = current_mb
+        touched = 0
+
+        for object_mb, table, keep, is_position in candidates[:8]:
+            attempted.add(table)
+            try:
+                result = trim_tail(
+                    con,
+                    arc,
+                    table,
+                    keep,
+                    active_guard=is_position,
+                )
+                result["object_mb_before"] = round(object_mb, 3)
+                result["adaptive_keep"] = keep
+                operations[table] = result
+                touched += int(result.get("archived_deleted") or 0)
+            except Exception as exc:
+                operations[table] = {"error": str(exc)}
+                report["warnings"].append(
+                    f"adaptive-target {table}: {exc}"
+                )
+
+        con.commit()
+        arc.commit()
+        vacuum(con)
+
+        after_round = round(size_mb(Path(report["database"])), 3)
+        rounds.append({
+            "round": round_number,
+            "before_mb": before_round,
+            "after_mb": after_round,
+            "rows_archived_deleted": touched,
+        })
+
+        if after_round >= before_round - 0.01:
+            report["warnings"].append(
+                "Adaptive target pass made no measurable progress; "
+                "remaining size is protected state, schema/index overhead, "
+                "or an unclassified table."
+            )
+            break
+
+    report["adaptive_target_rounds"] = rounds
+
+
+def classify_target_blockers(
+    con: sqlite3.Connection,
+    limit: int = 30,
+) -> list[dict[str, Any]]:
+    """Explain the largest objects that remain after all safe retention passes."""
+    sizes = object_sizes(con)
+    table_names = {
+        str(r[0])
+        for r in con.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    blockers: list[dict[str, Any]] = []
+
+    for name, mb in sorted(
+        sizes.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    ):
+        base = name
+        if name.startswith("sqlite_autoindex_"):
+            classification = "sqlite_autoindex"
+        elif name not in table_names:
+            classification = "index_or_internal_object"
+        elif name in PROTECTED_TABLES:
+            classification = "protected_durable_state"
+        elif name in POSITION_POLICIES or "position" in name.lower():
+            classification = "position_state_active_rows_protected"
+        elif name in TAIL_POLICIES or GENERIC_CHURN_RE.search(name):
+            classification = "safe_churn_already_minimised"
+        else:
+            classification = "unclassified_not_deleted_fail_closed"
+
+        blockers.append({
+            "name": base,
+            "mb": round(float(mb), 3),
+            "classification": classification,
+        })
+        if len(blockers) >= limit:
+            break
+
+    return blockers
 
 def vacuum(con: sqlite3.Connection) -> None:
     con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -563,7 +721,7 @@ def main() -> int:
         raise SystemExit(f"DB not found: {db}")
 
     report: dict[str, Any] = {
-        "schema_version": "SENTINUITY_RETENTION_V8",
+        "schema_version": "SENTINUITY_RETENTION_V9_SIGNOFF",
         "database": str(db),
         "archive": str(archive_path),
         "before_mb": round(size_mb(db), 3),
@@ -635,6 +793,21 @@ def main() -> int:
             if args.vacuum:
                 vacuum(con)
             report["after_deep_target_pass_mb"] = round(size_mb(db), 3)
+
+        if round(size_mb(db), 3) > args.target_mb:
+            report["warnings"].append(
+                "Deep target pass still missed the target; running adaptive "
+                "archive-first target enforcement over the largest safe churn objects."
+            )
+            run_adaptive_target_pass(
+                con,
+                arc,
+                report,
+                float(args.target_mb),
+            )
+            report["after_adaptive_target_pass_mb"] = round(size_mb(db), 3)
+
+        report["target_blockers"] = classify_target_blockers(con)
 
         quick_after = con.execute("PRAGMA quick_check").fetchone()[0]
         if quick_after != "ok":

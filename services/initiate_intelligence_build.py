@@ -16,7 +16,7 @@ The agents will:
 - Build their own Intelligence Tab sections
 - Self-test parameter changes via replay engine
 
-Run: python initiate_intelligence_build.py
+Run (from the repo root): python -m services.initiate_intelligence_build
 """
 import sqlite3, time, json
 from pathlib import Path

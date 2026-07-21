@@ -3264,6 +3264,21 @@ def scan_for_entries() -> int:
             # show UNAVAILABLE, which is correct, rather than an invented state.
             try:
                 _ldc_lane_armed = bool(_LIVE_TRADING_AVAILABLE and _live_lane_armed())
+                # SIZING_GATE_V2_20260721: resolve the operator notional BEFORE the
+                # verdict is derived, so FIRE_PATH_OPEN can never be published
+                # with zero or missing live size / exposure cap (V2 review
+                # blocker 2). Mirrors the fail-closed check at the live-mirror
+                # boundary; parallel caps (pattern multiplier, curve half-size)
+                # follow the mirror's non-multiplicative doctrine exactly.
+                _ldc_req_size = float(get_config_value("LIVE_POSITION_SIZE_USD", 0.0) or 0.0)
+                _ldc_exp_cap = float(get_config_value("LIVE_MAX_TOTAL_EXPOSURE_USD", 0.0) or 0.0)
+                _ldc_sizing_ok = _ldc_req_size > 0.0 and _ldc_exp_cap > 0.0
+                _ldc_mult = 1.0
+                if _pattern_required:
+                    _ldc_mult = min(_ldc_mult, max(0.0, min(1.0, float(_pattern_size_multiplier))))
+                if _mb_half_size:
+                    _ldc_mult = min(_ldc_mult, 0.5)
+                _ldc_would_fire = (min(_ldc_req_size, _ldc_exp_cap) * _ldc_mult) if _ldc_sizing_ok else 0.0
                 _ldc_gates = [
                     {"name": "LIVE_LANE_ARMED", "state": "PASS" if _ldc_lane_armed else "BLOCK",
                      "current": ("armed" if _ldc_lane_armed else
@@ -3279,6 +3294,14 @@ def scan_for_entries() -> int:
                                  f"{_pattern_size_multiplier:.2f}x" if _pattern_perm
                                  else ("not required" if not _pattern_required else "unavailable")),
                      "contract": "capital authority: 2 independent SIM closes arm; 0.5x until 3 verified positive-net live canaries earn 1.0x"},
+                    {"name": "SIZING", "state": ("PASS" if _ldc_sizing_ok else "BLOCK"),
+                     "current": (f"would fire ${_ldc_would_fire:.2f} "
+                                 f"(size=${_ldc_req_size:.2f} cap=${_ldc_exp_cap:.2f} mult={_ldc_mult:.2f}x)"
+                                 if _ldc_sizing_ok else
+                                 f"live size/exposure cap unresolved "
+                                 f"(size={_ldc_req_size} cap={_ldc_exp_cap}); rerun launcher interview"),
+                     "contract": "LIVE_POSITION_SIZE_USD>0 and LIVE_MAX_TOTAL_EXPOSURE_USD>0, "
+                                 "stamped by the launcher interview"},
                 ]
                 _ldc_verdict, _ldc_blocker = _derive_live_verdict(
                     lane_armed=_ldc_lane_armed,
@@ -3299,6 +3322,8 @@ def scan_for_entries() -> int:
                     pattern_armed=bool(_pattern_live_pass),
                     pattern_multiplier=float(_pattern_size_multiplier),
                     pattern_reason=(_pattern_perm.reason if _pattern_perm else None),
+                    size_multiplier=_ldc_mult,
+                    would_fire_usd=_ldc_would_fire,
                     candidate_mint=mint,
                     position_id=position_id,
                     authored_by="execution_engine.scan_for_entries",
@@ -3472,6 +3497,26 @@ def scan_for_entries() -> int:
                 except Exception as _le:
                     log.error("[LIVE_BUY_ERROR] SIM pos=%d: %s; paper remains OPEN, no REAL row",
                               position_id, _le)
+                    # SIZING_GATE_V2_20260721: a candidate must never disappear after
+                    # FIRE_PATH_OPEN. Republish the executor contract as
+                    # BLOCKED with the exact mirror error so the UI shows a
+                    # visible, actionable reason instead of a stale verdict.
+                    try:
+                        _publish_decision_contract(
+                            verdict="BLOCKED",
+                            gates=[{"name": "LIVE_MIRROR", "state": "BLOCK",
+                                    "current": str(_le)[:200],
+                                    "contract": "resolved notional -> preflight -> "
+                                                "execute_live_buy must complete or report"}],
+                            blocker=f"LIVE_MIRROR: {str(_le)[:160]}",
+                            next_event="resolve the live-mirror error above",
+                            lane_armed=True,
+                            candidate_mint=mint,
+                            position_id=position_id,
+                            authored_by="execution_engine.live_mirror_exception",
+                        )
+                    except Exception:
+                        pass
 
             # IMMEDIATE ORACLE SUBSCRIPTION - fired AFTER commit so the position
             # row exists in paper_positions when the oracle's _get_open_mints()

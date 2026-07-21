@@ -290,6 +290,8 @@ class WorkerSpec:
         self.status: str = "PENDING"
         self.last_error: str = ""
         self.started_at: float = 0.0
+        self.restart_count: int = 0        # V3_HONESTY_ROUTING_20260721
+        self.next_restart_at: float = 0.0  # bounded-backoff gate
 
 
 WORKERS: Dict[str, WorkerSpec] = {}
@@ -346,9 +348,12 @@ def _worker_runner(spec: WorkerSpec) -> None:
     try:
         module = _load_module(spec.module_name)
     except ModuleNotFoundError as e:
-        spec.status = "SKIPPED"
+        # V3_HONESTY_ROUTING_20260721: the honest state for a module that does not exist
+        # in this build is NOT_INSTALLED. It is named in the heartbeat and
+        # never restarted — a restart of a nonexistent module cannot succeed.
+        spec.status = "NOT_INSTALLED"
         log.warning(
-            "Auxiliary worker %s not found — skipping (non-critical cognition lane): %s",
+            "Auxiliary worker %s is not installed in this build: %s",
             spec.module_name, e,
         )
         return
@@ -442,6 +447,7 @@ def _summarise_workers() -> str:
     running = []
     failed = []
     pending = []
+    not_installed = []  # V3_HONESTY_ROUTING_20260721
 
     for spec in WORKERS.values():
         alive = bool(spec.thread and spec.thread.is_alive())
@@ -449,33 +455,51 @@ def _summarise_workers() -> str:
             running.append(spec.module_name.split(".")[-1])
         elif spec.status == "ERROR":
             failed.append(spec.module_name.split(".")[-1])
-        elif spec.status == "SKIPPED":
-            pass  # Not installed — silently omit from status
+        elif spec.status == "NOT_INSTALLED":
+            not_installed.append(spec.module_name.split(".")[-1])
         else:
             pending.append(spec.module_name.split(".")[-1])
 
+    # V3_HONESTY_ROUTING_20260721: the summary is telemetry truth. A lane that is not
+    # installed is reported as exactly that; "all auxiliary lanes active"
+    # is only ever emitted when every configured lane is RUNNING.
     parts = [f"running={len(running)}"]
     if failed:
         parts.append("failed=" + ",".join(failed[:3]))
-    elif pending:
+    if pending:
         parts.append("warming=" + ",".join(pending[:3]))
-    else:
+    if not_installed:
+        parts.append(f"not_installed={len(not_installed)} ("
+                     + ",".join(not_installed[:6]) + ")")
+    if running and not (failed or pending or not_installed):
         parts.append("all auxiliary lanes active")
+    elif not running and not_installed and not (failed or pending):
+        parts.append("no auxiliary lane modules present in this build")
     return " | ".join(parts)
 
 
 def _restart_dead_workers_if_any() -> None:
+    # V3_HONESTY_ROUTING_20260721: ERROR/STOPPED workers restart under a bounded
+    # exponential backoff (30s doubling to a 1h ceiling) instead of on
+    # every supervisor pulse. NOT_INSTALLED is never restarted.
+    now = time.time()
     for spec in WORKERS.values():
         alive = bool(spec.thread and spec.thread.is_alive())
         if alive:
             continue
         if spec.status in {"ERROR", "STOPPED"}:
-            log.warning("Restarting auxiliary worker: %s", spec.module_name)
+            if now < spec.next_restart_at:
+                continue
+            spec.restart_count += 1
+            backoff = min(3600.0, 30.0 * (2 ** min(spec.restart_count, 7)))
+            spec.next_restart_at = now + backoff
+            log.warning("Restarting auxiliary worker: %s (attempt %d, "
+                        "next retry no sooner than %.0fs)",
+                        spec.module_name, spec.restart_count, backoff)
             spec.status = "RESTARTING"
             spec.last_error = ""
             _start_worker(spec)
-        # SKIPPED = module not found — do not restart, it will never succeed
-        # elif spec.status == "SKIPPED": pass
+        # NOT_INSTALLED: module absent from build — never restarted
 
 
 def run() -> None:

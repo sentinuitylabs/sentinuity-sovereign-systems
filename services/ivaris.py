@@ -67,6 +67,15 @@ def _try_nim(system: str, user: str) -> Optional[str]:
         except Exception:
             model = IVARIS_NIM_MODEL_DEFAULT
 
+        if str(model).lower().startswith("claude"):
+            # V3_HONESTY_ROUTING_20260721: never send an Anthropic model id to the NIM
+            # endpoint — guaranteed 400. Fall back to the NIM default and log
+            # a sanitised diagnostic (model name only; no keys).
+            log.error("IVARIS routing guard: refusing Anthropic model %r on the "
+                      "NIM endpoint; using NIM default %r",
+                      str(model)[:48], IVARIS_NIM_MODEL_DEFAULT)
+            model = IVARIS_NIM_MODEL_DEFAULT
+
         payload = json.dumps({
             "model": model,
             "messages": [

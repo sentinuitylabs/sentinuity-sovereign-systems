@@ -842,6 +842,16 @@ class Polaris:
         model    = str(get_config_value("IVARIS_MODEL",    "claude-haiku-4-5-20251001")).strip()
 
         if provider == "anthropic":
+            if "/" in model:
+                # V3_HONESTY_ROUTING_20260721: an org/model id (NIM/OpenAI style) must never
+                # be sent to the Anthropic endpoint — that is a guaranteed 400.
+                return {
+                    "configured": True, "status": "error",
+                    "detail": (f"routing guard: model '{model[:48]}' is not an "
+                               "Anthropic id; fix IVARIS_MODEL or set "
+                               "IVARIS_PROVIDER=nim"),
+                    "provider": "anthropic", "model": model,
+                }
             _key = os.getenv("ANTHROPIC_API_KEY", "").strip()
             if not _key:
                 return {
@@ -860,7 +870,10 @@ class Polaris:
                     },
                     json={
                         "model":      model,
-                        "max_completion_tokens": 10,
+                        # V3_HONESTY_ROUTING_20260721: the Anthropic Messages API requires
+                        # max_tokens; max_completion_tokens is an OpenAI field and
+                        # produced the recurring "Anthropic HTTP 400" brief errors.
+                        "max_tokens": 10,
                         "messages":   [{"role": "user", "content": "Reply with OK."}],
                     },
                     timeout=12,
@@ -869,8 +882,15 @@ class Polaris:
                     return {"configured": True, "status": "ok",
                             "detail": "Anthropic API reachable",
                             "provider": "anthropic", "model": model}
+                _safe = ""
+                try:
+                    _err = (resp.json() or {}).get("error") or {}
+                    _safe = (str(_err.get("type") or "") + ": "
+                             + str(_err.get("message") or ""))[:140].strip(": ")
+                except Exception:
+                    _safe = ""
                 return {"configured": True, "status": "error",
-                        "detail": f"Anthropic HTTP {resp.status_code}",
+                        "detail": f"Anthropic HTTP {resp.status_code} {_safe}".strip(),
                         "provider": "anthropic", "model": model}
             except Exception as e:
                 return {"configured": True, "status": "error",
