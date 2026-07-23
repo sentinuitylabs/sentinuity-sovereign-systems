@@ -27,7 +27,13 @@ classification + the gate decide that. If models are unavailable it marks the
 task BLOCKED with the real reason — it NEVER fabricates debate output or patches.
 """
 from __future__ import annotations
-import time, json, logging, sqlite3, traceback
+import os, time, json, logging, sqlite3, traceback
+from pathlib import Path
+
+# WIRING_FIX_20260723: os/BASE_DIR were referenced on the NO_API_KEY retry
+# path (dotenv reload + key re-check) but never imported/defined, raising
+# NameError and silently killing standing-task retries once keys were added.
+BASE_DIR = Path(__file__).resolve().parent.parent
 from typing import Optional
 
 log = logging.getLogger("council_execution_spine")

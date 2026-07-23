@@ -454,7 +454,90 @@ def _diagnostics_html(meta):
 
 
 def render_glass_cadence(db_path, table="paper_positions", key_prefix="sol",
-                         st=None, empty_label="No closed trades in window yet"):
+                         st=None, empty_label="No closed trades in window yet",
+                         records=None):
+    """COUNCIL_AUTOBUILD_20260723_R2 records-mode: when `records` (normalized
+    adapter contract) is supplied, the chart consumes it as the sole data
+    authority — no re-query, so UI PnL cannot diverge from the adapter."""
+    if records is not None:
+        return _render_glass_cadence_records(records, key_prefix, st,
+                                             empty_label)
+    return _render_glass_cadence_table(db_path, table, key_prefix, st,
+                                       empty_label)
+
+
+def _fmt_ts(ts):
+    import time as _t
+    try:
+        return _t.strftime("%d %H:%M", _t.localtime(float(ts)))
+    except Exception:
+        return "?"
+
+
+def _render_glass_cadence_records(records, key_prefix, st, empty_label):
+    if st is None:
+        import streamlit as st
+    pos = list(records.get("positions", []))
+    quar = list(records.get("quarantined", []))
+    closed = [p for p in pos if str(p.get("status")) != "OPEN" and p.get("exit_ts")]
+    opens = [p for p in pos if str(p.get("status")) == "OPEN"]
+    if not pos:
+        st.caption(empty_label)
+    G, R, C, M, Y = "#14F195", "#E2384D", "#8ef9ff", "#5a7c8f", "#FFD166"
+    rows = []
+    tot = records.get("realised_pnl_usd", 0.0)
+    unr = records.get("unrealised_pnl_usd", 0.0)
+    rows.append("<div style='font-size:10px;color:#9fd8ff;letter-spacing:1px'>"
+                "CANONICAL REALISED ${:+.2f} · UNREALISED ${:+.2f} · src={}"
+                "</div>".format(tot, unr, records.get("table")))
+    for p in sorted(closed, key=lambda x: float(x.get("exit_ts") or 0)):
+        pnl = float(p.get("pnl_usd") or 0)
+        pct = float(p.get("pnl_pct") or 0)
+        col = G if pnl >= 0 else R
+        extra = " · STALE-GAP" if p.get("stale_gap") else ""
+        rows.append(
+            "<div style='display:flex;gap:8px;align-items:center;"
+            "font-size:11px;margin:2px 0'>"
+            "<span style='color:{c};min-width:52px'>{sym}</span>"
+            "<span style='color:{m}'>{a}→{b}</span>"
+            "<span style='color:{pc}'>{pnl:+.2f} ({pct:+.1f}%)</span>"
+            "<span style='color:#9fd8ff'>{strat}</span>"
+            "<span style='color:{m};font-size:9px'>{src}{extra} · {ets}</span>"
+            "</div>".format(c=C, m=M, pc=col, sym=p.get("symbol"),
+                            a=_fmt_ts(p.get("entry_ts")),
+                            b=_fmt_ts(p.get("exit_ts")), pnl=pnl, pct=pct,
+                            strat=p.get("strategy") or "",
+                            src=p.get("source") or "", extra=extra,
+                            ets=p.get("entry_truth_status")))
+    for p in opens:
+        pnl = float(p.get("pnl_usd") or 0)
+        col = G if pnl >= 0 else R
+        gap = (" · STALE-GAP last={}".format(p.get("last_mark_px"))
+               if p.get("stale_gap") else "")
+        rows.append(
+            "<div style='display:flex;gap:8px;font-size:11px;margin:2px 0;"
+            "opacity:.9'>"
+            "<span style='color:{c};min-width:52px'>{sym}</span>"
+            "<span style='color:{y}'>OPEN</span>"
+            "<span style='color:{pc}'>unreal {pnl:+.2f}</span>"
+            "<span style='color:{m};font-size:9px'>peak {pk} · stop {sp} · "
+            "tgt {tg}{gap}</span></div>".format(
+                c=C, y=Y, pc=col, m=M, sym=p.get("symbol"), pnl=pnl,
+                pk=p.get("peak_px") or "—", sp=p.get("stop_px") or "—",
+                tg=p.get("target_px") or "—", gap=gap))
+    if quar:
+        rows.append("<div style='font-size:9px;color:{r};margin-top:4px'>"
+                    "{n} quarantined record(s) excluded from canonical PnL "
+                    "(visible in audit)</div>".format(r=R, n=len(quar)))
+    st.markdown("<div class='sw-cadence-wrap'>" + "".join(rows) + "</div>",
+                unsafe_allow_html=True)
+    return {"closed": len(closed), "open": len(opens),
+            "quarantined": len(quar), "realised": tot}
+
+
+def _render_glass_cadence_table(db_path, table="paper_positions",
+                                key_prefix="sol", st=None,
+                                empty_label="No closed trades in window yet"):
     """Streamlit entry: window radio + glass SVG + diagnostics. Mobile-aware."""
     if st is None:
         import streamlit as st

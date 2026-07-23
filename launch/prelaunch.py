@@ -102,6 +102,25 @@ if missing:
 else:
     ok(f"All {len(CRITICAL)} critical files present")
 
+# Canonical World UI is optional for trading, but its path must be unambiguous.
+_world_canonical = BASE_DIR / "ui" / "sovereign_world.html"
+_world_legacy_candidates = [
+    BASE_DIR / "ui" / "world_os.py",
+    BASE_DIR / "world_os.py",
+    BASE_DIR / "ui" / "world_scene.py",
+    BASE_DIR / "ui" / "world_scene.html",
+]
+if _world_canonical.exists():
+    ok(f"Canonical World UI present: {_world_canonical.relative_to(BASE_DIR)}")
+else:
+    warn(f"Canonical World UI missing (non-fatal): {_world_canonical}")
+_world_legacy_present = [x for x in _world_legacy_candidates if x.exists()]
+if _world_legacy_present:
+    warn(
+        "Ignored legacy World candidates: "
+        + ", ".join(str(x.relative_to(BASE_DIR)) for x in _world_legacy_present)
+    )
+
 if not DB_PATH.exists():
     print(f"\n  DB does not exist — skipping DB checks")
     print(f"  Launch normally, schema will be created on first run.\n")
@@ -315,8 +334,8 @@ config_fixes = [
     # Listed here for visibility and future configurability only.
     # Engine now reads HARD_STOP_LOSS_PCT directly; this is enforced at boot.
     ("HARD_STOP_LOSS_PCT",             "4.0",    "Sign-off risk guard: hard stop below -4% — fires before all other exits"),
-    ("PATTERN_LIVE_ARMING_MODE",     "required", "Pattern authority required before funded live execution"),
-    ("PATTERN_LIVE_ARMING_REQUIRED", "1",        "Strict causal hard-veto enabled for funded live execution"),
+    ("PATTERN_LIVE_ARMING_MODE",     "advisory", "Operator sign-off: patterns remain telemetry/advisory; Mode B remains live authority"),
+    ("PATTERN_LIVE_ARMING_REQUIRED", "0",        "Operator sign-off: pattern confirmation does not hard-veto otherwise-valid mirroring"),
     ("STOP_LOSS_PCT",                  "4.0",    "Position metadata stop-loss aligned with hard guard"),
     ("RUNNER_ACTIVATE_PCT",            "20.0",   "V3: runner mode activates at +20% unrealized"),
     ("RUNNER_TRAIL_PCT",               "10.0",   "V3: trailing stop 10% from peak in runner mode"),
@@ -388,6 +407,7 @@ _FORCE_CONFIG_KEYS = {
     "PAPER_MAX_OPEN_POSITIONS", "LIVE_PAPER_SHADOW_ON_BLOCK",
     "LIVE_POSITION_SIZE_USD", "PAPER_POSITION_SIZE_USD",
     "MAX_LIVE_POSITION_USD", "POSITION_SIZE_USD",
+    "PATTERN_LIVE_ARMING_MODE", "PATTERN_LIVE_ARMING_REQUIRED",
 }
 
 for _cfg in config_fixes:
@@ -447,6 +467,7 @@ else:
 
 _ui_modules = [
     ("ui/substrate_tab.py",         "Substrate Lane 2 tab"),
+    ("ui/sovereign_health_tab.py",  "Biological Intelligence Lane 3 tab"),
 ]
 for _path, _desc in _ui_modules:
     if Path(_path).exists():

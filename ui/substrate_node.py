@@ -539,7 +539,7 @@ def _render_macro_trade_book() -> None:
         from ui.glass_cadence_chart import render_glass_cadence as _render_glass_cadence
         _render_glass_cadence(
             str(DB_PATH),
-            table="substrate_paper_positions" if _table_exists("substrate_paper_positions") else "substrate_positions",
+            records=__import__('wallets.substrate_history_adapter', fromlist=['load_substrate_position_history']).load_substrate_position_history(str(DB_PATH)),  # COUNCIL_AUTOBUILD_20260723_R2: normalized adapter contract IS the chart authority
             key_prefix="sub",
             st=st,
             empty_label="No closed Substrate paper trades yet",

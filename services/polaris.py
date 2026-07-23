@@ -6,7 +6,14 @@ try:
 except Exception:
     pass
 # /SENTINUITY_BIRDEYE_QUOTA_GUARD_V2
-import io, json, sys, time, logging, os
+import io, json, sys, time, logging, os, sqlite3
+
+# WIRING_FIX_20260723: sqlite3 (except-clause at morning-brief dup check),
+# module logger, and _nim_assignment (NUGGET NIM health path, including its
+# own except handler) were all referenced but never defined here — each one
+# converted a recoverable condition into a NameError crash.
+log = logging.getLogger("polaris")
+_nim_assignment = lambda role, default: os.getenv(f"{role}_NIM_MODEL", default)
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path

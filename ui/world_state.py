@@ -450,3 +450,19 @@ if __name__ == "__main__":
     import json, sys
     db = sys.argv[1] if len(sys.argv) > 1 else "sentinuity_matrix.db"
     print(json.dumps(load_world_state(db), indent=2)[:4000])
+
+
+# SOVEREIGN_WORLD_UPGRADE_20260723 — canonical world layer merge.
+# Additive: wraps load_world_state so every consumer receives the persistent
+# Sanctuary Tech Town layer (buildings, agents, chronicle, chapter) alongside
+# the original telemetry payload. Read-only against world_* tables.
+_orig_load_world_state = load_world_state
+
+def load_world_state(db_path) -> Dict[str, Any]:  # noqa: F811
+    state = _orig_load_world_state(db_path)
+    try:
+        from services.world_build_state import load_world_layer
+        state["world"] = load_world_layer(Path(db_path) if db_path else None)
+    except Exception as _wl_exc:
+        state["world"] = {"error": str(_wl_exc)[:120]}
+    return state

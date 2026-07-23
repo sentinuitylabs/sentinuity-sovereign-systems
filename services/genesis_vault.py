@@ -15,6 +15,10 @@ import re
 import pandas as pd
 from pathlib import Path
 
+# WIRING_FIX_20260723: vault export referenced BASE_DIR without defining it,
+# so every genesis vault zip build died with NameError inside its try block.
+BASE_DIR = Path(__file__).resolve().parent.parent
+
 ROOT    = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "sentinuity_matrix.db"
 

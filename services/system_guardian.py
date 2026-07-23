@@ -566,7 +566,7 @@ def detect_loop_stalls() -> Optional[Dict[str, Any]]:
 
 def detect_stale_positions() -> List[Dict[str, Any]]:
     """
-    Find open positions older than EXECUTOR_MAX_HOLD_SECONDS.
+    Find orphaned open positions older than the Guardian recovery horizon.
     These survived a restart with no price monitoring.
 
     PROTECTION 2026-05-24: positions that reached a >=3x peak are skipped
@@ -578,8 +578,17 @@ def detect_stale_positions() -> List[Dict[str, Any]]:
     Pure read. Returns list of stale position dicts.
     """
     try:
-        max_hold   = float(get_config_value("EXECUTOR_MAX_HOLD_SECONDS", 900))  # aligned with execution_engine default
-        cutoff     = time.time() - max_hold
+        max_hold = float(get_config_value("EXECUTOR_MAX_HOLD_SECONDS", 900))
+        # EDGE_RESTORE_GUARDIAN_RECOVERY_ONLY_20260723:
+        # Guardian is a restart/orphan recovery authority, not the normal paper
+        # MAX_HOLD engine.  At 1.0x max_hold it raced the executor and produced
+        # 15/15 GUARDIAN_STALE closes while runner/SL logic was still recoverable.
+        # Give the canonical executor a full additional hold window.
+        recovery_age = max(
+            max_hold * 2.0,
+            float(get_config_value("GUARDIAN_STALE_POSITION_SECONDS", 1800.0)),
+        )
+        cutoff = time.time() - recovery_age
         # Runner protection threshold: never stale-close a position that
         # reached this peak multiplier (operator-tunable via system_config)
         runner_protect_mult = float(get_config_value("GUARDIAN_STALE_RUNNER_PROTECT_MULT", 3.0))
@@ -884,22 +893,79 @@ def safe_close_position(
             _exit_price = get_last_known_price(mint)
             if not _exit_price or _exit_price <= 0:
                 _exit_price = get_last_known_price_unscoped(mint)
+            # GUARDIAN_COVERAGE_CONTRACT_20260722 (Phase 8):
+            # Missing price coverage must never be silently booked as a normal
+            # economic flat result. When no trusted mark exists anywhere:
+            #   * the close is explicitly labelled PRICE_COVERAGE_LOST;
+            #   * SIM rows close as force_scratch (SCRATCH accounting class,
+            #     excluded from W/L and market-quality statistics);
+            #   * REAL rows are NEVER force-scratched - chain settlement truth
+            #     is owned by close_position_canonical's live-sell contract;
+            #   * durable evidence is persisted to system_health_events.
+            _coverage_lost = False
+            _row_is_real = False
+            try:
+                with get_connection() as _fm_conn:
+                    _fm_row = _fm_conn.execute(
+                        "SELECT UPPER(COALESCE(funding_mode,'SIM')) AS fm "
+                        "FROM paper_positions WHERE id=?", (pos_id,)
+                    ).fetchone()
+                _row_is_real = bool(_fm_row and str(_fm_row["fm"]) == "REAL")
+            except Exception:
+                _row_is_real = False
             if not _exit_price or _exit_price <= 0:
-                _exit_price = entry_price   # genuine scratch - no price ever available
-                log.warning(
-                    "safe_close_position: no MTM price for %s pos=%d - "
-                    "closing at scratch (entry_price=%.10f)",
-                    mint[:16], pos_id, entry_price,
+                _coverage_lost = True
+                _exit_price = entry_price   # no invented economics: exit==entry
+                if "GUARDIAN_STALE" in str(exit_reason):
+                    exit_reason = str(exit_reason).replace(
+                        "GUARDIAN_STALE", "GUARDIAN_PRICE_COVERAGE_LOST"
+                    )
+                else:
+                    exit_reason = f"GUARDIAN_PRICE_COVERAGE_LOST|{exit_reason}"
+                log.critical(
+                    "safe_close_position: PRICE_COVERAGE_LOST %s pos=%d real=%s - "
+                    "no trusted mark ever available; closing as labelled scratch, "
+                    "NOT market flatness (entry_price=%.10f)",
+                    mint[:16], pos_id, _row_is_real, entry_price,
                 )
+                try:
+                    _log_health_event(
+                        "PRICE_COVERAGE_LOST", SERVICE_NAME,
+                        f"pos={pos_id} mint={mint} zero trusted marks over full hold; "
+                        f"closed as scratch with explicit coverage-loss label",
+                        "CRITICAL",
+                    )
+                except Exception:
+                    pass
             return close_position_canonical(
                 pos_id, _exit_price, exit_reason,
-                closure_mode="guardian", notes_prefix="GUARDIAN_CLOSE",
+                closure_mode="guardian",
+                force_scratch=bool(_coverage_lost and not _row_is_real),
+                notes_prefix=("GUARDIAN_COVERAGE_LOST" if _coverage_lost
+                              else "GUARDIAN_CLOSE"),
             )
         except ImportError:
             pass
 
         # Fallback: atomic close with claim guard (used when execution_engine not importable)
         with get_connection() as conn:
+            # GUARDIAN_COVERAGE_CONTRACT_20260722: the fallback writer must never
+            # close a REAL row - chain settlement truth requires the canonical
+            # close path. Keep the row OPEN and surface it loudly instead.
+            try:
+                _fb_fm = conn.execute(
+                    "SELECT UPPER(COALESCE(funding_mode,'SIM')) AS fm "
+                    "FROM paper_positions WHERE id=?", (pos_id,)
+                ).fetchone()
+                if _fb_fm and str(_fb_fm["fm"]) == "REAL":
+                    log.critical(
+                        "safe_close_position fallback: REFUSING direct close of REAL "
+                        "pos=%d %s - execution_engine unavailable; keeping OPEN",
+                        pos_id, mint[:16],
+                    )
+                    return False
+            except Exception:
+                pass
             # Atomic claim -- only one writer can win
             claimed = conn.execute(
                 """
@@ -936,6 +1002,18 @@ def safe_close_position(
                         "safe_close_position fallback: using unscoped price for %s pos=%d",
                         mint[:16], pos_id,
                     )
+            if not pr:
+                # GUARDIAN_COVERAGE_CONTRACT_20260722: label, never invent flatness.
+                if "GUARDIAN_STALE" in str(exit_reason):
+                    exit_reason = str(exit_reason).replace(
+                        "GUARDIAN_STALE", "GUARDIAN_PRICE_COVERAGE_LOST"
+                    )
+                else:
+                    exit_reason = f"GUARDIAN_PRICE_COVERAGE_LOST|{exit_reason}"
+                log.critical(
+                    "safe_close_position fallback: PRICE_COVERAGE_LOST %s pos=%d",
+                    mint[:16], pos_id,
+                )
             exit_price = float(pr["observed_price"]) if pr else float(entry_price)
             pnl_pct    = ((exit_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
             pnl_usd    = pos_size_usd * (pnl_pct / 100)

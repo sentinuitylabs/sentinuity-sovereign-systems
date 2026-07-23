@@ -236,7 +236,43 @@ def classify_row(row_dict, time_cols, reason_cols, cutoff_seconds):
 
     return False, "fresh", age, newest_col, newest_val
 
-def clean_table(con, db_label, table, cutoff_seconds, dry_run=False):
+def load_open_position_mints():
+    """OPEN_POSITION_COVERAGE_GUARD_20260722.
+
+    Returns the set of mint addresses with an active paper/live position, or
+    None when the canonical DB cannot be read. Callers must FAIL CLOSED on
+    None for any table that carries a mint_address column: during a DB-lock
+    storm or outage - exactly when marks stop arriving - deleting a position's
+    last surviving price row destroys the last trusted mark and forces the
+    Guardian into an invented flat close (positions 1869-1872, 2026-07-22).
+    """
+    try:
+        db = ROOT / "sentinuity_matrix.db"
+        if not db.exists():
+            db = ROOT / "data" / "sentinuity_matrix.db"
+        if not db.exists():
+            return set()
+        con = sqlite3.connect(db, timeout=10)
+        try:
+            con.execute("pragma busy_timeout=10000")
+            cols = {r[1] for r in con.execute("pragma table_info(paper_positions)").fetchall()}
+            live_states = ("'BUY_SUBMITTED','BUY_CONFIRMED_UNRESOLVED','OPEN_REAL',"
+                           "'EXIT_INTENT','SELL_TRIGGERED','SELL_SUBMITTED',"
+                           "'SELL_CONFIRMED_UNRESOLVED'")
+            where = "status='OPEN'"
+            if "live_state" in cols:
+                where += f" OR UPPER(COALESCE(live_state,'')) IN ({live_states})"
+            rows = con.execute(
+                f"select distinct mint_address from paper_positions where {where}"
+            ).fetchall()
+            return {str(r[0]) for r in rows if r and r[0]}
+        finally:
+            con.close()
+    except Exception as e:
+        log(f"[OPEN_MINTS_LOAD_FAIL] {e} - mint-bearing tables will be SKIPPED this pass (fail closed)")
+        return None
+
+def clean_table(con, db_label, table, cutoff_seconds, dry_run=False, protected_mints=frozenset()):
     cols = get_cols(con, table)
     if not cols:
         return 0, 0
@@ -256,6 +292,7 @@ def clean_table(con, db_label, table, cutoff_seconds, dry_run=False):
 
     stale = []
     protected_fresh_unscored = 0
+    protected_open_position = 0
     try:
         con.row_factory = sqlite3.Row
         rows = con.execute(f'select rowid as __rowid__, * from "{table}" limit ?', (MAX_SCAN_ROWS,)).fetchall()
@@ -268,6 +305,14 @@ def clean_table(con, db_label, table, cutoff_seconds, dry_run=False):
         rid = d.pop("__rowid__", None)
         if table == "market_snapshots" and is_fresh_unscored(d, DEFAULT_SCORING_GRACE_SECONDS):
             protected_fresh_unscored += 1
+            continue
+        # OPEN_POSITION_COVERAGE_GUARD_20260722: never archive/delete any row
+        # keyed to a mint with an active position. These rows are the position's
+        # price-coverage evidence (last trusted mark, MTM history, resolver and
+        # snapshot lineage). Rows become eligible again after the position
+        # reaches a terminal state.
+        if protected_mints and str(d.get("mint_address") or "") in protected_mints:
+            protected_open_position += 1
             continue
         # HANDOFF_V1: never delete in-flight handoff rows. A latched /
         # execution_ready candidate is the executor's active queue; erasing it
@@ -290,6 +335,8 @@ def clean_table(con, db_label, table, cutoff_seconds, dry_run=False):
 
     if protected_fresh_unscored:
         log(f"[PROTECTED_FRESH_UNSCORED] {db_label}::{table} rows={protected_fresh_unscored}")
+    if protected_open_position:
+        log(f"[PROTECTED_OPEN_POSITION] {db_label}::{table} rows={protected_open_position}")
 
     if not stale:
         return 0, 0
@@ -343,6 +390,8 @@ def clean_once(cutoff_seconds=DEFAULT_CUTOFF_SECONDS, dry_run=False, backup=Fals
 
     log("=" * 80)
     log(f"ACTIVE PIPELINE CLEANER cutoff={cutoff_seconds}s dry_run={dry_run} backup={backup}")
+    _open_mints = load_open_position_mints()
+    log(f"[OPEN_POSITION_GUARD] protected_mints={'FAIL_CLOSED' if _open_mints is None else len(_open_mints)}")
 
     for db in dbs:
         db_label = str(db.relative_to(ROOT))
@@ -359,7 +408,14 @@ def clean_once(cutoff_seconds=DEFAULT_CUTOFF_SECONDS, dry_run=False, backup=Fals
                     continue
                 scanned_tables += 1
                 try:
-                    deleted, archived = clean_table(con, db_label, table, cutoff_seconds, dry_run=dry_run)
+                    _tbl_cols = {x[1] for x in con.execute(f'pragma table_info("{table}")').fetchall()}
+                    if "mint_address" in _tbl_cols and _open_mints is None:
+                        log(f"[SKIP_FAIL_CLOSED] {db_label}::{table} open-position mints unavailable")
+                        continue
+                    deleted, archived = clean_table(
+                        con, db_label, table, cutoff_seconds, dry_run=dry_run,
+                        protected_mints=(_open_mints or frozenset()),
+                    )
                     if deleted or archived:
                         action = "WOULD_ARCHIVE_DELETE" if dry_run else "ARCHIVED_DELETED"
                         log(f"[{action}] {db_label}::{table} rows={archived}")

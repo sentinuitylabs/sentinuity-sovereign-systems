@@ -21,8 +21,27 @@ from pathlib import Path
 
 DB = Path("sentinuity_matrix.db")
 TIERS = {0:"OBSERVE",1:"SUGGEST",2:"SIMULATE",3:"PATCH-QUEUE",4:"APPROVED-APPLY",5:"LIVE-GATED"}
-LOCATIONS = ["council_grove","copytrade_observatory","executor_vault","oracle_bridge",
-             "market_intel_lab","substrate_core","build_foundry"]
+
+# SOVEREIGN_WORLD_UPGRADE_20260723 — canonical registry replaces loose keys.
+# Legacy keys remain accepted on input and are migrated deterministically.
+try:
+    from services.world_build_state import (
+        WORLD_LOCATIONS, LEGACY_LOCATION_MAP, canonical_location)
+except Exception:                                  # standalone fallback
+    WORLD_LOCATIONS = {k: {} for k in (
+        "council_lodge","research_conservatory","archive_grove",
+        "oracle_observatory","forge_workshop","tool_mart","substrate_node",
+        "intelligence_institute","release_gate")}
+    LEGACY_LOCATION_MAP = {
+        "council_grove":"council_lodge","copytrade_observatory":"substrate_node",
+        "executor_vault":"release_gate","oracle_bridge":"oracle_observatory",
+        "market_intel_lab":"intelligence_institute","substrate_core":"substrate_node",
+        "build_foundry":"forge_workshop"}
+    def canonical_location(k):
+        k = str(k or "").strip()
+        return k if k in WORLD_LOCATIONS else LEGACY_LOCATION_MAP.get(k, "council_lodge")
+
+LOCATIONS = list(WORLD_LOCATIONS.keys())
 
 def _con():
     c = sqlite3.connect(str(DB), timeout=10); c.row_factory = sqlite3.Row; return c
@@ -38,7 +57,24 @@ def ensure_schema() -> None:
     CREATE TABLE IF NOT EXISTS world_command_log(
       id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, source TEXT, command TEXT,
       outcome TEXT);
-    """); c.commit(); c.close()
+    """)
+    # SOVEREIGN_WORLD_UPGRADE_20260723 — additive columns + deterministic
+    # legacy-location migration (idempotent).
+    cols = {r[1] for r in c.execute("PRAGMA table_info(council_world_tasks)")}
+    for name, decl in (("building_id","TEXT"),("task_phase","TEXT"),
+                       ("evidence_ref","TEXT"),("progress_weight","REAL DEFAULT 1.0"),
+                       ("blocker_reason","TEXT"),("collaboration_group","TEXT")):
+        if name not in cols:
+            c.execute(f"ALTER TABLE council_world_tasks ADD COLUMN {name} {decl}")
+    for legacy, canon in LEGACY_LOCATION_MAP.items():
+        c.execute("UPDATE council_world_tasks SET building_id=?, world_location=? "
+                  "WHERE world_location=? AND (building_id IS NULL OR building_id='')",
+                  (canon, canon, legacy))
+    for r in c.execute("SELECT task_id, world_location FROM council_world_tasks "
+                       "WHERE building_id IS NULL OR building_id=''").fetchall():
+        c.execute("UPDATE council_world_tasks SET building_id=? WHERE task_id=?",
+                  (canonical_location(r[1]), r[0]))
+    c.commit(); c.close()
 
 STANDING = [
  ("Price integrity restoration", 1, "oracle_bridge", "ORACLE", ["services/ws_price_oracle.py","services/price_integrity_contract.py"], 0),
@@ -47,8 +83,28 @@ STANDING = [
  ("Final overnight pre-live validation", 0, "market_intel_lab", "POLARIS", ["logs/execution_engine.log","logs/ws_price_oracle.log"], 0),
  ("Debate Chamber continuity", 1, "build_foundry", "FORGE", ["services/council_chamber_bridge.py","services/sovereign_hub.py","launch/Launch_Sentinuity.bat"], 1),
  ("Executor freshness watch: stale latch / price age / paper opens", 0, "executor_vault", "AXON", ["services/execution_engine.py"], 0),
- ("Council schedule optimizer: leaner launch/runtime/shutdown plan", 1, "council_grove", "RHIZA", ["launch/Launch_Sentinuity.bat","launch/prelaunch.py"], 1),
+ ("Council schedule optimizer: leaner launch/runtime/shutdown plan", 1, "council_lodge", "RHIZA", ["launch/Launch_Sentinuity.bat","launch/prelaunch.py"], 1),
+ # SOVEREIGN_WORLD_UPGRADE_20260723 — Chapter I + world meaning audit (§17)
+ ("CHAPTER I: Build the Intelligence Institute to paper-ready (LEGAL EVENT-ALPHA)",
+  1, "intelligence_institute", "POLARIS",
+  ["ui/intelligence_tab.py","services/intelligence_orchestrator.py",
+   "services/world_narrative_engine.py"], 1),
+ ("Sovereign World Meaning Audit: assess movement/construction/tool/narrative "
+  "truth; propose one evidence-grounded improvement; never fabricate progress "
+  "or alter trading authority",
+  1, "council_lodge", "RHIZA",
+  ["services/world_build_state.py","services/world_narrative_engine.py",
+   "ui/sovereign_world.html"], 1),
 ]
+
+_WORLD_TASK_PHASES = {
+ "CHAPTER I: Build the Intelligence Institute to paper-ready (LEGAL EVENT-ALPHA)":
+     ("intelligence_institute", "BUILD", "chapter_i"),
+ "Sovereign World Meaning Audit: assess movement/construction/tool/narrative "
+ "truth; propose one evidence-grounded improvement; never fabricate progress "
+ "or alter trading authority":
+     ("council_lodge", "REVIEW", ""),
+}
 
 def seed_standing() -> int:
     ensure_schema(); c = _con(); n = 0
@@ -57,11 +113,17 @@ def seed_standing() -> int:
             c.execute("INSERT INTO council_world_tasks(title,risk_tier,world_location,"
                       "agent_owner,backend_files,commands,requires_user_approval,status,"
                       "result_summary,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                      (title,tier,loc,owner,json.dumps(files),"[]",appr,"queued","",
+                      (title,tier,canonical_location(loc),owner,json.dumps(files),"[]",appr,"queued","",
                        time.time(),time.time())); n += 1
+    # stamp canonical building/phase/collab metadata on the world tasks
+    for title,(bld,phase,grp) in _WORLD_TASK_PHASES.items():
+        c.execute("UPDATE council_world_tasks SET building_id=?, task_phase=?, "
+                  "collaboration_group=? WHERE title=? AND "
+                  "(task_phase IS NULL OR task_phase='')", (bld, phase, grp, title))
     c.commit(); c.close(); return n
 
-def add_task(title:str, tier:int=1, loc:str="council_grove", owner:str="Polaris") -> int:
+def add_task(title:str, tier:int=1, loc:str="council_lodge", owner:str="Polaris") -> int:
+    loc = canonical_location(loc)
     ensure_schema(); c=_con()
     cur = c.execute("INSERT INTO council_world_tasks(title,risk_tier,world_location,"
         "agent_owner,backend_files,commands,requires_user_approval,status,result_summary,"

@@ -1549,6 +1549,34 @@ BRAVE_HOURLY_CAP = max(3, BRAVE_DAILY_CAP // 7)  # ~5/hr at 35/day, ~10/hr at 70
 BRAVE_MONTHLY_CAP = 1000  # hard monthly ceiling — never exceed this
 BRAVE_ALERT_AT_PCT = 0.75  # alert when 75% of daily budget consumed
 
+# WIRING_FIX_20260723: both functions below were called but never defined,
+# so every brave_verify() invocation died at the monthly-cap check with
+# NameError (external evidence verification silently disabled), and the
+# stalled-debate RHIZA synthesis bridge crashed the debate loop.
+def _count_brave_calls(days: int = 30) -> int:
+    """Best-effort call count over the window from the in-process history.
+
+    Conservative by construction: the in-memory list only survives the current
+    process, so this can undercount across restarts — acceptable for a
+    soft monthly ceiling, and strictly better than the previous NameError
+    which disabled Brave verification outright. The 24h daily cap remains
+    the primary, accurate limiter."""
+    _cut = time.time() - float(days) * 86400.0
+    try:
+        return sum(1 for t in _brave_call_times if t >= _cut)
+    except Exception:
+        return 0
+
+def _call_axon_rhiza_synthesis(proposal: dict, current_state: dict,
+                               oracle_result: dict, round_num: int) -> dict:
+    """Adapter to the canonical RHIZA narrative turn (argument order differs
+    at the two debate-bridge call sites). Fails soft with _rhiza_failed so the
+    debate loop continues instead of crashing."""
+    try:
+        return _rhiza_narrative_turn(proposal, oracle_result, current_state or {}, round_num)
+    except Exception as _rz_exc:
+        return {"_rhiza_failed": True, "error": str(_rz_exc)[:200]}
+
 def brave_verify(proposal: dict, debate_log: dict) -> dict:
     global _brave_call_times
     if not BRAVE_KEY:

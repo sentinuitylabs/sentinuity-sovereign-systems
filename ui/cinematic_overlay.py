@@ -604,6 +604,33 @@ def render_cinematic_overlay() -> None:
         pass
 
 
+_EXIT_GEAR_CACHE: dict = {"ts": 0.0, "v": None}
+
+def _exit_gear_cfg() -> dict:
+    """Exit thresholds mirrored from current executor/config, cached 60s.
+    Tight-runner activation is currently a source constant at +50%; the
+    other displayed thresholds are read from system_config."""
+    now = time.time()
+    if _EXIT_GEAR_CACHE["v"] and now - _EXIT_GEAR_CACHE["ts"] < 60:
+        return _EXIT_GEAR_CACHE["v"]
+    v = {"hard_stop": 4.0, "runner_at": 20.0, "trail_pct": 10.0,
+         "tight_at": 50.0, "tight_pct": 8.0}
+    try:
+        rows = _db_read(
+            "SELECT key, value FROM system_config WHERE key IN "
+            "('HARD_STOP_LOSS_PCT','RUNNER_ACTIVATE_PCT','RUNNER_TRAIL_PCT',"
+            "'RUNNER_TRAIL_TIGHT_PCT')", n=8)
+        m = {r["key"]: float(r["value"]) for r in rows if r.get("value") is not None}
+        v["hard_stop"] = abs(m.get("HARD_STOP_LOSS_PCT", v["hard_stop"]))
+        v["runner_at"] = m.get("RUNNER_ACTIVATE_PCT", v["runner_at"])
+        v["trail_pct"] = m.get("RUNNER_TRAIL_PCT", v["trail_pct"])
+        v["tight_pct"] = m.get("RUNNER_TRAIL_TIGHT_PCT", v["tight_pct"])
+    except Exception:
+        pass
+    _EXIT_GEAR_CACHE.update(ts=now, v=v)
+    return v
+
+
 @st.fragment(run_every=20)
 def render_lifecycle_visual() -> None:
     try:
@@ -665,6 +692,23 @@ def render_lifecycle_visual() -> None:
                 else:
                     lc_action = "HOLD"
 
+            # EXIT_GEAR_TRUTH_20260723 — show which exit governor owns this
+            # trade RIGHT NOW, derived from the SAME system_config thresholds
+            # evaluate_exit_for_position() reads (no invented heuristics).
+            _gcfg = _exit_gear_cfg()
+            if pnl_pct <= -_gcfg["hard_stop"]:
+                gear, gear_fn, gear_col = "HARD_STOP", "hard_stop_floor", "#E2384D"
+            elif pnl_pct >= 100.0:
+                gear, gear_fn, gear_col = "MONSTER", "monster_trailing", "#9945FF"
+            elif pnl_pct >= _gcfg["tight_at"]:
+                gear, gear_fn, gear_col = "RUNNER·TIGHT", f"runner_trail {_gcfg['tight_pct']:.0f}%", "#FFD700"
+            elif pnl_pct >= _gcfg["runner_at"]:
+                gear, gear_fn, gear_col = "RUNNER", f"runner_trail {_gcfg['trail_pct']:.0f}%", "#FFD700"
+            elif trail:
+                gear, gear_fn, gear_col = "TRAILING", "trail_stop_latched", "#38E1FF"
+            else:
+                gear, gear_fn, gear_col = "BASE", "tp/sl/stagnation watch", "#14F195"
+
             lc_label, lc_col_key, lc_icon = _LC_MAP.get(
                 lc_action, ("RUNNING", "running", "●")
             )
@@ -691,6 +735,12 @@ def render_lifecycle_visual() -> None:
                     font-weight:600;letter-spacing:1px;">{token}</span>
                   <span style="font-size:9px;color:{color};min-width:80px;
                     letter-spacing:1px;">{lc_label}</span>
+                  <span style="font-size:9px;color:{gear_col};min-width:96px;
+                    font-weight:700;letter-spacing:1px;border:1px solid {gear_col}44;
+                    border-radius:4px;padding:1px 5px;
+                    background:rgba(5,2,16,0.7);">⚙ {gear}</span>
+                  <span style="font-size:8px;color:{gear_col}AA;min-width:120px;
+                    font-family:Share Tech Mono,monospace;">{gear_fn}</span>
                   <span style="font-size:10px;color:{pnl_col};min-width:60px;">
                     {pnl_sign}{pnl_usd:.2f}</span>
                   <span style="font-size:9px;color:{pnl_col};">{pnl_pct:+.1f}%</span>

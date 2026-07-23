@@ -418,6 +418,49 @@ def _fetch_state() -> dict:
             "debug":debug,"ts":int(time.time())}
 
 # ── main render (two-slot, unchanged behaviour) ───────────────────────────────
+def _world_layer_attach(state: dict) -> dict:
+    """SOVEREIGN_WORLD_UPGRADE_20260723 — canonical world layer.
+    Runs schema ensure + resume event + one narrative pass ONCE per Streamlit
+    session, then attaches the persistent layer to every state push. All world
+    writes stay inside world_* tables; trading tables are read-only."""
+    try:
+        from services import world_build_state as wbs
+        from services import world_narrative_engine as wne
+        if not st.session_state.get("_sw_world_persist_init"):
+            wbs.ensure_schema()
+            try:
+                from launch.world_schema_migrate import migrate as _wsm
+                _wsm()
+            except Exception:
+                pass
+            wbs.append_resume_event()
+            wne.run_world_pass()
+            st.session_state["_sw_world_persist_init"] = True
+        state["world"] = wbs.load_world_layer()
+        state["world"]["ambient_active"] = wne.ambient_signals()
+        state["world"]["agent_intent"] = wne.derive_agent_states()
+        state["world"]["chronicle"] = wne.chronicle()
+    except Exception as exc:
+        state["world"] = {"error": str(exc)[:140]}
+    return state
+
+
+def _render_paper_ready_gate() -> None:
+    """The OPEN INTELLIGENCE INSTITUTE button appears ONLY when the
+    canonical DB row says paper_ready=1 — never from browser state."""
+    try:
+        from services.world_build_state import get_building
+        b = get_building("intelligence_institute")
+        if b and int(b.get("paper_ready") or 0) == 1:
+            st.success("INTELLIGENCE INSTITUTE — PAPER READY FOR OPERATOR TESTING")
+            if st.button("OPEN INTELLIGENCE INSTITUTE",
+                         key="_sw_open_institute", type="primary"):
+                st.session_state["open_intelligence_tab"] = True
+                st.rerun()
+    except Exception:
+        pass
+
+
 def render_sovereign_world(height: int = 680) -> None:
     if "_sw_world_slot" not in st.session_state:
         st.session_state["_sw_world_slot"]     = st.empty()
@@ -435,7 +478,7 @@ def render_sovereign_world(height: int = 680) -> None:
         if not world_html:
             st.warning("sovereign_world.html not found — copy it into the ui/ folder")
             return
-        state = _fetch_state()
+        state = _world_layer_attach(_fetch_state())
         init = (f"<script>window.__SW_STATE_VERSION__={STATE_VERSION};"
                 f"window.__SW_STATE__={json.dumps(state)};"
                 f"if(typeof applySwState==='function')applySwState(window.__SW_STATE__);</script>")
@@ -446,11 +489,12 @@ def render_sovereign_world(height: int = 680) -> None:
         st.session_state["_sw_last_push"] = now
         st.session_state["_sw_state_hash"] = hashlib.md5(
             json.dumps({k:v for k,v in state.items() if k!="ts"}, sort_keys=True, default=str).encode()).hexdigest()[:16]
+        _render_paper_ready_gate()
         return
 
     if now - st.session_state["_sw_last_push"] < _MIN_PUSH_INTERVAL:
         return
-    state = _fetch_state()
+    state = _world_layer_attach(_fetch_state())
     h = hashlib.md5(json.dumps({k:v for k,v in state.items() if k!="ts"}, sort_keys=True, default=str).encode()).hexdigest()[:16]
     if h == st.session_state["_sw_state_hash"]:
         return
@@ -468,3 +512,4 @@ def render_sovereign_world(height: int = 680) -> None:
         components.html(upd, height=0, scrolling=False)
     st.session_state["_sw_state_hash"] = h
     st.session_state["_sw_last_push"]  = now
+    _render_paper_ready_gate()

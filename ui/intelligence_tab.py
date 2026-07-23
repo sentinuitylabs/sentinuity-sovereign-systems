@@ -2405,3 +2405,4 @@ def render_intelligence_tab(query_db) -> None:
         _safe_panel("NIM call log", _render_nim_call_log, query_db)
         _safe_panel("Forensic audit", _render_forensic_audit, debate_df, patch_df)
     _safe_panel("Operator petition membrane", _render_petition_membrane, queue_df)
+

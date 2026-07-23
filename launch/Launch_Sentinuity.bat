@@ -10,7 +10,7 @@ REM which forced every child Python service onto cp1252 for unqualified
 
 REM open() calls and was the systemic source of on-screen mojibake
 
-REM (â€ / Ã / ðŸ sequences). UTF-8 mode is now enforced.
+REM (????? / ?? / ???? sequences). UTF-8 mode is now enforced.
 
 set "PYTHONUTF8=1"
 
@@ -148,7 +148,7 @@ for %%I in ("%CD%\..") do set "CWD_PARENT_DIR=%%~fI"
 
 
 
-set "HARD_ROOT=%PARENT_DIR%"
+set "HARD_ROOT=C:\Users\Polar\.openclaw\workspace\trading-bot"
 
 
 
@@ -1835,4 +1835,5 @@ print("If console was already open, close/reopen it so it rereads the reset bala
 conn.close()
 
 ::END_SOLANA_WALLET_RESET_PY
+start "CouncilAutobuilder" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.council_autobuilder >> ""%LOG_PATH%\council_autobuilder.log"" 2>&1"
 

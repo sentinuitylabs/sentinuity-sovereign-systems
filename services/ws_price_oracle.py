@@ -41,6 +41,36 @@ from typing import Dict, List, Optional, Set
 
 log = logging.getLogger("ws_oracle")
 
+# SENTINUITY_NETWORK_OUTAGE_TRUTH_20260722
+# Rate-limit repeated transport failures and expose recent DNS-failure density
+# to the oracle health classifier. This keeps outages distinct from quiet markets.
+_err_last: Dict[str, float] = {}
+_dns_error_times: List[float] = []
+_dns_error_lock = threading.Lock()
+
+def _log_rl(key: str, level, msg: str, *args, every: float = 60.0) -> None:
+    now = time.time()
+    if now - float(_err_last.get(key, 0.0)) >= every:
+        _err_last[key] = now
+        level(msg, *args)
+
+def _record_dns_error(now: Optional[float] = None) -> None:
+    ts = float(now if now is not None else time.time())
+    with _dns_error_lock:
+        _dns_error_times.append(ts)
+        cutoff = ts - 300.0
+        while _dns_error_times and _dns_error_times[0] < cutoff:
+            _dns_error_times.pop(0)
+
+def _recent_dns_error_count(window_sec: float = 120.0) -> int:
+    now = time.time()
+    cutoff = now - float(window_sec)
+    with _dns_error_lock:
+        while _dns_error_times and _dns_error_times[0] < now - 300.0:
+            _dns_error_times.pop(0)
+        return sum(1 for ts in _dns_error_times if ts >= cutoff)
+# /SENTINUITY_NETWORK_OUTAGE_TRUTH_20260722
+
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 HELIUS_WSS_URL   = os.getenv("HELIUS_WSS_URL", "")
 CHAINSTACK_WSS   = os.getenv("CHAINSTACK_WSS", "").strip()
@@ -928,30 +958,42 @@ class HeliusOracle:
                 break
             except Exception as e:
                 err_str = str(e).lower()
-                is_ssl = any(x in err_str for x in (
+                is_dns = any(x in err_str for x in (
+                    "getaddrinfo", "name resolution", "temporary failure in name",
+                    "nodename nor servname", "no such host"
+                ))
+                is_transport = is_dns or any(x in err_str for x in (
                     "ssl", "eof", "unexpected_eof", "certificate",
                     "handshake", "connection reset", "broken pipe"
                 ))
-                if is_ssl:
+                if is_dns:
+                    _record_dns_error()
+                if is_transport:
                     _ssl_fail_count += 1
-                    # Rotate to next WSS endpoint on SSL failure
+                    # Rotate on DNS and transport failures, not only SSL drops.
                     if len(_wss_candidates) > 1:
                         _wss_idx = (_wss_idx + 1) % len(_wss_candidates)
                         new_url = _wss_candidates[_wss_idx]
-                        log.warning(
-                            "ws_oracle: SSL_DROP rotating to next WSS endpoint: %s (fail #%d)",
-                            new_url[:60], _ssl_fail_count
+                        _log_rl(
+                            "transport_rotate", log.warning,
+                            "ws_oracle: TRANSPORT_DROP rotating WSS endpoint: %s (fail #%d class=%s)",
+                            new_url[:60], _ssl_fail_count, "DNS" if is_dns else "TRANSPORT",
+                            every=15.0,
                         )
                         self._wss_url = new_url
                     else:
-                        log.error("ws_oracle: SSL_DROP no fallback endpoints available")
+                        _log_rl("no_wss_fallback", log.error,
+                                "ws_oracle: TRANSPORT_DROP no fallback endpoints available",
+                                every=60.0)
                 else:
-                    log.error("ws_oracle: CONNECTION_SUPERVISOR_FATAL %s", e)
+                    _log_rl("connection_supervisor_fatal", log.error,
+                            "ws_oracle: CONNECTION_SUPERVISOR_FATAL %s", e, every=60.0)
 
             if not self._stop:
                 jitter = backoff * (0.8 + 0.4 * (os.urandom(1)[0] / 255.0))
-                log.warning("ws_oracle: RECONNECT_SCHEDULED backoff=%.2fs url=%s",
-                            jitter, self._wss_url[:60])
+                _log_rl("reconnect_scheduled", log.warning,
+                        "ws_oracle: RECONNECT_SCHEDULED backoff=%.2fs url=%s",
+                        jitter, self._wss_url[:60], every=15.0)
                 await asyncio.sleep(jitter)
                 backoff = min(backoff * 2.0, 30.0)  # max 30s not 45s
 
@@ -1324,7 +1366,13 @@ class HeliusOracle:
                 _no_hot_mints = len(hot_mints) == 0
                 _price_stale  = any_age > 90.0
 
-                if _no_hot_mints and _price_stale:
+                _dns_recent = _recent_dns_error_count(120.0)
+                if _dns_recent >= 3:
+                    # Infrastructure outage is not a quiet market. Keep the raw
+                    # envelope telemetry, but publish an explicit outage state.
+                    new_state = "NETWORK_OUTAGE"
+                    _stall_consecutive += 1
+                elif _no_hot_mints and _price_stale:
                     # HOT set empty AND prices haven't been written in 90s = stalled
                     new_state = "STALLED"
                     _stall_consecutive += 1
@@ -1388,8 +1436,24 @@ class HeliusOracle:
                     except Exception:
                         pass
 
+                elif new_state == "NETWORK_OUTAGE":
+                    _log_rl(
+                        "oracle_network_outage", log.error,
+                        "[ORACLE_NETWORK_OUTAGE] %s dns_errors_120s=%d",
+                        note, _dns_recent, every=60.0,
+                    )
+                    try:
+                        update_heartbeat(
+                            "ws_price_oracle", "NETWORK_OUTAGE",
+                            f"NETWORK_OUTAGE {note} dns_errors_120s={_dns_recent}",
+                        )
+                    except Exception:
+                        pass
+
                 elif new_state == "STALLED":
-                    log.error("[ORACLE_STALLED] %s - triggering fallback+resub", note)
+                    _log_rl("oracle_stalled", log.error,
+                            "[ORACLE_STALLED] %s - triggering fallback+resub",
+                            note, every=30.0)
                     try:
                         update_heartbeat("ws_price_oracle", "STALLED",
                                          f"STALLED {note}")

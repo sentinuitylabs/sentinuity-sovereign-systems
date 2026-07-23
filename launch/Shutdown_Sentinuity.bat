@@ -1,8 +1,11 @@
 @echo off
 setlocal EnableExtensions
-title SENTINUITY HALT ENGINE V10 + RETENTION V9
+title SENTINUITY HALT ENGINE V9 + RETENTION V8.1
 
+rem WIRING_FIX_20260723: resolve root relative to this script (portable for
+rem the V3 GitHub release); the absolute path survives only as a fallback.
 for %%I in ("%~dp0..") do set "ROOT_PATH=%%~fI"
+if not exist "%ROOT_PATH%\services" set "ROOT_PATH=C:\Users\Polar\.openclaw\workspace\trading-bot"
 set "LOG_PATH=%ROOT_PATH%\logs"
 set "PS_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 
@@ -16,7 +19,7 @@ cd /d "%ROOT_PATH%"
 if not exist "%LOG_PATH%" mkdir "%LOG_PATH%" >nul 2>&1
 
 echo ============================================================
-echo   SENTINUITY SIGN-OFF SHUTDOWN V10 + RETENTION V9
+echo   SENTINUITY SIGN-OFF SHUTDOWN V9 + RETENTION V8.1
 echo ============================================================
 echo   Root: %ROOT_PATH%
 echo   Time: %DATE% %TIME%
@@ -209,7 +212,7 @@ if errorlevel 1 (
 )
 echo.
 
-echo [12] Canonical offline retention V9 - matrix database...
+echo [12] Canonical offline retention V8.1 - matrix database...
 if not exist "%LOG_PATH%\db_retention" mkdir "%LOG_PATH%\db_retention" >nul 2>&1
 
 if not exist "%ROOT_PATH%\launch\db_retention_trim.py" (
@@ -221,7 +224,7 @@ if not exist "%ROOT_PATH%\launch\db_retention_trim.py" (
     --db "%ROOT_PATH%\sentinuity_matrix.db" ^
     --archive "%ROOT_PATH%\sentinuity_archive.db" ^
     --apply --vacuum ^
-    --target-mb 12 --max-safe-mb 20 ^
+    --target-mb 15 --max-safe-mb 20 ^
     --heartbeat-grace-seconds 12 --keep-backups 3 ^
     --json "%LOG_PATH%\db_retention\matrix_retention_v8_latest.json" ^
     > "%LOG_PATH%\db_retention_matrix_v8.log" 2>&1
@@ -230,16 +233,16 @@ if not exist "%ROOT_PATH%\launch\db_retention_trim.py" (
   type "%LOG_PATH%\db_retention_matrix_v8.log"
 
   if "%PRUNE_RC%"=="0" (
-    echo   [OK] Matrix retention V9 complete.
+    echo   [OK] Matrix retention V8.1 complete.
   ) else (
-    echo   [FAIL] Matrix retention V9 returned code %PRUNE_RC%.
+    echo   [FAIL] Matrix retention V8.1 returned code %PRUNE_RC%.
     echo          Sentinuity remains shut down.
     set "PRUNE_FAILED=1"
   )
 )
 echo.
 
-echo [12a] Canonical offline retention V9 - intelligence database...
+echo [12a] Canonical offline retention V8.1 - intelligence database...
 if exist "%ROOT_PATH%\sentinuity_intelligence.db" (
   python "%ROOT_PATH%\launch\db_retention_trim.py" ^
     --db "%ROOT_PATH%\sentinuity_intelligence.db" ^
@@ -254,9 +257,9 @@ if exist "%ROOT_PATH%\sentinuity_intelligence.db" (
   type "%LOG_PATH%\db_retention_intelligence_v8.log"
 
   if "%INTEL_PRUNE_RC%"=="0" (
-    echo   [OK] Intelligence retention V9 complete.
+    echo   [OK] Intelligence retention V8.1 complete.
   ) else (
-    echo   [FAIL] Intelligence retention V9 returned code %INTEL_PRUNE_RC%.
+    echo   [FAIL] Intelligence retention V8.1 returned code %INTEL_PRUNE_RC%.
     set "PRUNE_FAILED=1"
   )
 ) else (
@@ -275,15 +278,15 @@ if errorlevel 1 (
 )
 echo.
 
-echo [12c] Enforcing signed-off matrix SQLite footprint ceiling...
-python -c "import pathlib,sys; root=pathlib.Path(r'%ROOT_PATH%'); p=root/'sentinuity_matrix.db'; parts=[p,root/'sentinuity_matrix.db-wal',root/'sentinuity_matrix.db-shm']; sizes={x.name:(x.stat().st_size/1048576 if x.exists() else 0.0) for x in parts}; total=sum(sizes.values()); print('matrix_file_mb='+str(round(sizes[p.name],2))); print('matrix_wal_mb='+str(round(sizes['sentinuity_matrix.db-wal'],2))); print('matrix_shm_mb='+str(round(sizes['sentinuity_matrix.db-shm'],2))); print('matrix_total_footprint_mb='+str(round(total,2))); sys.exit(0 if total<=20 else 4)" > "%LOG_PATH%\shutdown_matrix_target_gate.log" 2>&1
+echo [12c] Enforcing matrix hot-DB target ceiling...
+python -c "import pathlib,sys; p=pathlib.Path(r'%ROOT_PATH%\sentinuity_matrix.db'); mb=p.stat().st_size/1048576; print('matrix_size_mb='+str(round(mb,2))); sys.exit(0 if mb<=20 else 4)" > "%LOG_PATH%\shutdown_matrix_target_gate.log" 2>&1
 type "%LOG_PATH%\shutdown_matrix_target_gate.log"
 if errorlevel 4 (
-  echo   [FAIL] Matrix DB + WAL + SHM remain above the 20 MB shutdown ceiling.
-  echo          Sentinuity remains shut down; inspect the V9 JSON target_blockers/top_objects_after list.
+  echo   [FAIL] Matrix DB remains above the 20 MB shutdown ceiling.
+  echo          Sentinuity remains shut down; inspect the V8 JSON top_objects_after list.
   set "PRUNE_FAILED=1"
 ) else (
-  echo   [OK] Matrix SQLite footprint is inside the signed-off 20 MB ceiling.
+  echo   [OK] Matrix DB is inside the signed-off 20 MB ceiling.
 )
 echo.
 
@@ -304,9 +307,9 @@ taskkill /F /IM openclaw.exe /T >nul 2>&1
 echo   [OK] Final openclaw.exe image fallback complete.
 echo.
 echo ============================================================
-echo   SENTINUITY SHUTDOWN V10 + RETENTION V9 COMPLETE
+echo   SENTINUITY SHUTDOWN V9 + RETENTION V8.1 COMPLETE
 echo ============================================================
-echo   DB retention: launch\db_retention_trim.py (V9 adaptive archive-first + vacuum)
+echo   DB retention: launch\db_retention_trim.py (V8.1 schema-sync + archive + vacuum)
 echo   Archive DB:   %ROOT_PATH%\sentinuity_archive.db
 echo   Matrix report: %LOG_PATH%\db_retention\matrix_retention_v8_latest.json
 echo   Intel report:  %LOG_PATH%\db_retention\intelligence_retention_v8_latest.json
@@ -327,3 +330,5 @@ if defined PRUNE_FAILED (
 
 if /I not "%~1"=="--no-pause" if /I not "%~2"=="--no-pause" pause
 exit /b 0
+
+

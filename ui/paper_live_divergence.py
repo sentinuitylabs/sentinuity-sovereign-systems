@@ -419,3 +419,4 @@ def _render_inner(st, db_path: str | Path, limit: int) -> None:
                 f"<table style='border-collapse:collapse'>{body}</table>",
                 unsafe_allow_html=True,
             )
+

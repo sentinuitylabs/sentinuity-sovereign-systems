@@ -714,20 +714,52 @@ def _resolve_transactions() -> tuple[int, int, int]:
 
     max_workers = int(os.getenv("RESOLVER_MAX_WORKERS", "3"))
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_resolve_one_safe, row): row for row in claimed}
-        for future in as_completed(futures, timeout=90):
-            try:
-                _, outcome, count = future.result()
-                if outcome == "resolved":
-                    resolved += count
-                else:
-                    failed += 1
-            except Exception as exc:
-                failed += 1
-                log.warning("Resolver future failed: %s", exc)
+    # RESOLVER_LANE_RESILIENCE_20260723:
+    # Root cause of "resolver lane failed / TimeoutError: N of N futures
+    # unfinished" (live incident 2026-07-21→22): host DNS instability makes
+    # getaddrinfo hang BEFORE requests' socket timeout can apply, so workers
+    # stall past the 90s batch deadline and as_completed() raises, killing the
+    # whole lane every cycle (resolved=0 → qualification starves → the 600s
+    # birth-age enforcer vetoes the entire pipeline).
+    # Contract now: a slow batch DEGRADES (partial results, claims released by
+    # _heal_stuck_claims TTL) — it never kills the lane.
+    _deadline = float(get_config_value("RESOLVER_BATCH_DEADLINE_SEC", 90.0)) \
+        if "get_config_value" in globals() else 90.0
 
-    note = f"resolved={resolved} failed={failed} released={released} workers={max_workers}"
+    pool = ThreadPoolExecutor(max_workers=max_workers)
+    timed_out = 0
+    try:
+        futures = {pool.submit(_resolve_one_safe, row): row for row in claimed}
+        try:
+            for future in as_completed(futures, timeout=_deadline):
+                try:
+                    _, outcome, count = future.result()
+                    if outcome == "resolved":
+                        resolved += count
+                    else:
+                        failed += 1
+                except Exception as exc:
+                    failed += 1
+                    log.warning("Resolver future failed: %s", exc)
+        except TimeoutError:
+            for future in futures:
+                if not future.done():
+                    future.cancel()
+                    timed_out += 1
+                    failed += 1
+            log.warning(
+                "Resolver batch deadline %.0fs hit — %d/%d futures unfinished "
+                "(RPC/DNS stall). Harvested partial results; claims self-heal "
+                "via claim_until TTL. Lane continues.",
+                _deadline, timed_out, len(futures),
+            )
+    finally:
+        # Never block the ingest loop waiting on threads stuck in a DNS hang.
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    note = (f"resolved={resolved} failed={failed} released={released} "
+            f"workers={max_workers}"
+            + (f" DEADLINE_TIMEOUTS={timed_out}" if timed_out else ""))
     update_heartbeat(
         HB_RESOLVER, "ALIVE", note,
         work_processed=resolved,

@@ -273,10 +273,73 @@ def deploy_pass(db):
               f"{t['asset_symbol']} @ {px:.6g} size=${size:.2f} conv={t['conviction']:.2f}")
 
 
+def _ensure_writeoff_columns(db):
+    """Idempotent: audit columns for system-inactivity write-offs."""
+    try:
+        cols = {r[1] for r in db.execute(
+            "PRAGMA table_info(substrate_paper_positions)").fetchall()}
+        if "writeoff" not in cols:
+            db.execute("ALTER TABLE substrate_paper_positions "
+                       "ADD COLUMN writeoff INTEGER DEFAULT 0")
+        if "writeoff_market_pnl_usd" not in cols:
+            db.execute("ALTER TABLE substrate_paper_positions "
+                       "ADD COLUMN writeoff_market_pnl_usd REAL")
+    except Exception:
+        pass
+
+
 def mark_and_exit_pass(db):
+    # SYSTEM_INACTIVITY_WRITEOFF_20260723 — same doctrine as the Solana
+    # Guardian's PRICE_COVERAGE_LOST scratch: a close forced by *our* absence
+    # is an operational artifact, not strategy evidence, and must never
+    # poison PnL, win-rate or strategy scores.
+    #
+    #   window still alive at restart  -> trade resumes, counts normally.
+    #   window expired during blackout -> close as labelled scratch
+    #                                     (exit==entry, pnl 0), real market
+    #                                     PnL preserved in audit columns.
     now = time.time()
+    _ensure_writeoff_columns(db)
+    _last_pass = cfg(db, "SUBSTRATE_TRADER_LAST_PASS_TS", 0.0, float)
+    _grace = cfg(db, "SUBSTRATE_INACTIVITY_GRACE_SEC",
+                 max(3 * LOOP_S, 180.0), float)
+    _blackout = bool(_last_pass > 0 and (now - _last_pass) > _grace)
+    set_cfg(db, "SUBSTRATE_TRADER_LAST_PASS_TS", f"{now:.3f}")
     for p in db.execute("SELECT * FROM substrate_paper_positions "
                         "WHERE status='OPEN'").fetchall():
+        # Deadline that fell inside a blackout: intended capture window is
+        # gone; the desk never had the chance to sell inside it.
+        _deadline = float(p["opened_at"]) + float(p["max_hold_sec"] or 1e12)
+        if _blackout and _last_pass < _deadline <= now:
+            entry = float(p["entry_price"]); qty = float(p["qty"])
+            _mkt_px = resolve_price(
+                db, p["price_source"],
+                db.execute("SELECT mint_address FROM substrate_targets "
+                           "WHERE id=?", (p["target_id"],)).fetchone()["mint_address"]
+                if p["target_id"] else None)
+            _mkt_pnl = ((_mkt_px - entry) * qty) if (_mkt_px and _mkt_px > 0) else None
+            proceeds = float(p["size_usd"])          # scratch: capital back at entry
+            cash = cfg(db, "SUBSTRATE_PAPER_CASH_USD", 0.0, float) + proceeds
+            set_cfg(db, "SUBSTRATE_PAPER_CASH_USD", f"{cash:.4f}")
+            db.execute("UPDATE substrate_paper_positions SET status='CLOSED', "
+                       "closed_at=?, exit_price=?, exit_reason=?, pnl_usd=0, "
+                       "pnl_pct=0, writeoff=1, writeoff_market_pnl_usd=? "
+                       "WHERE id=?",
+                       (now, entry, "TIME_EXIT_SYSTEM_INACTIVE", _mkt_pnl, p["id"]))
+            db.execute("INSERT INTO substrate_ledger (ts,event,amount_usd,"
+                       "balance_after,ref) VALUES (?,?,?,?,?)",
+                       (now, "CLOSE_WRITEOFF", proceeds, cash,
+                        f"pos:{p['id']}:{p['asset_symbol']}:SYSTEM_INACTIVE"))
+            if p["target_id"]:
+                db.execute("UPDATE substrate_targets SET status='closed', "
+                           "updated_at=? WHERE id=?", (now, p["target_id"]))
+            trace(db, "paper_writeoff",
+                  f"SUBSTRATE_INACTIVITY_WRITEOFF pos={p['id']} "
+                  f"{p['asset_symbol']} window ended during "
+                  f"{(now - _last_pass)/60:.0f}min blackout — scratch close, "
+                  f"market pnl ${(_mkt_pnl if _mkt_pnl is not None else 0):+.2f} "
+                  f"quarantined (not counted)")
+            continue
         px = resolve_price(db, p["price_source"],
                            db.execute("SELECT mint_address FROM substrate_targets "
                                       "WHERE id=?", (p["target_id"],)

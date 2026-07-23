@@ -427,7 +427,7 @@ def run() -> None:
             try:
                 import sqlite3 as _ib_sq
                 _ib_db = _ib_sq.connect("sentinuity_matrix.db", timeout=5)
-                _ib_db.row_factory = sqlite3.Row
+                _ib_db.row_factory = _ib_sq.Row  # WIRING_FIX_20260723: was unaliased sqlite3 (never imported here)
                 _open_pos = _ib_db.execute(
                     "SELECT COUNT(*) FROM paper_positions WHERE status='OPEN'"
                 ).fetchone()[0]

@@ -156,16 +156,15 @@ patch_history_df = pd.DataFrame()
 autopsy_df = pd.DataFrame()
 cognition_df = pd.DataFrame()
 
-_TERMINAL_DISPLAY_NAME = os.getenv("TERMINAL_DISPLAY_NAME", "Sentinuity").strip() or "Sentinuity"
-st.set_page_config(page_title=f"{_TERMINAL_DISPLAY_NAME.upper()} SOVEREIGN HUB", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="SENTINUITY SOVEREIGN HUB", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown('\n<style>\n/* SIGNOFF_STATUS_HIERARCHY_20260716:\n   Healthy/warning telemetry is static. Motion is reserved for critical,\n   operator-confirmation and real-money events. */\n.next-up,\n.arena-msg-polaris,\n.arena-msg-ivaris,\n.arena-msg-oracle,\n.arena-msg-nugget,\n.arena-patch,\n.crail-sigil i,\n.crail-synapse::after,\n.asc-conn.active {\n    animation: none !important;\n}\n.snty-debate-stage [style*="animation:"],\n.snty-crystal-panel [style*="thermalAlive"],\n.snty-crystal-panel [style*="thermalWarm"] {\n    animation: none !important;\n}\n</style>\n', unsafe_allow_html=True)
 
 st.markdown(r"""
 <style id="sentinuity-paired-solana-doctrine-v2">
 :root{
-  --snty-cyan-hi:#38E1FF;
-  --snty-cyan-mid:#28B8D7;
+  --snty-cyan-hi:#8EF9FF;  /* SIGNOFF_DOCTRINE_CYAN_UNIFY_20260718: ramp anchored on doctrine cyan */
+  --snty-cyan-mid:#38E1FF;
   --snty-cyan-deep:#12677C;
   --snty-green-hi:#14F195;
   --snty-green-deep:#0B7650;
@@ -262,10 +261,14 @@ try:
 except Exception:
     pass
 
-# SIGNOFF_HOLOGRAPHIC_SUBSTRATE_20260717
-# Visual-only substrate: fixed allow-listed contract vocabulary, browser-side
-# animation, no DB/log/source/env reads and no trading authority. Installed as
-# a singleton so Streamlit reruns cannot multiply canvases or animation loops.
+# SIGNOFF_MATRIX_LIVE_TELEMETRY_20260718 (supersedes HOLOGRAPHIC_SUBSTRATE_20260717)
+# Visual-only Truth Fabric rain. Now streams SANITISED live operating telemetry
+# (recent cognition-log lines, heartbeat ages, gate counters, executor contract
+# state) merged with the fixed contract vocabulary — read-only DB access with a
+# hard sanitiser: key/secret/token lines dropped, base58/hex masked, URLs
+# stripped, config VALUES never read. Browser-side animation, no trading
+# authority. Installed as a singleton so Streamlit reruns cannot multiply
+# canvases or animation loops; each rerun refreshes the telemetry payload.
 try:
     from ui.cinematic_overlay import inject_holographic_substrate_rain as _inject_substrate_rain
     _inject_substrate_rain()
@@ -358,16 +361,19 @@ st.markdown("""
 <style>
 :root{
   --snty-void:#050210;--snty-panel:rgba(9,6,24,.78);--snty-line:rgba(142,249,255,.18);
-  --snty-cyan:#38E1FF; /* SIGNOFF_DOCTRINE_CYAN_20260715: approved truth cyan */--snty-green:#14F195;--snty-purple:#9945FF;--snty-gold:#FFD700;
+  --snty-cyan:#8EF9FF; /* SIGNOFF_DOCTRINE_CYAN_UNIFY_20260718: single doctrine cyan (was #38E1FF) */--snty-green:#14F195;--snty-purple:#9945FF;--snty-gold:#FFD700;
   --snty-red:#FF073A;--snty-muted:rgba(207,233,255,.60);
 }
 /* The official services/sovereign_hub.py owns the visual shell. */
-.snty-hero-wrap{padding:34px 18px 22px!important;margin:4px 0 8px!important;border:1px solid rgba(142,249,255,.12)!important;
+/* SIGNOFF_HERO_UNIFY_20260718: this block owns ONLY the hero WRAP panel.
+   The hero WORD + SUB are defined once, in the crystalline-glass block below.
+   The former .snty-hero-word override here (font-size/letter-spacing/text-shadow
+   !important) double-defined the heading and its text-shadow rendered a blurry
+   halo behind the transparent chroma-clip glyphs. Removed — one heading, one rule. */
+.snty-hero-wrap{text-align:center!important;padding:34px 18px 22px!important;margin:4px 0 8px!important;border:1px solid rgba(142,249,255,.12)!important;
  background:radial-gradient(circle at 50% 0%,rgba(153,69,255,.18),transparent 58%),linear-gradient(180deg,rgba(7,3,20,.92),rgba(5,2,16,.55))!important;
  border-radius:22px!important;box-shadow:inset 0 0 55px rgba(153,69,255,.07),0 18px 60px rgba(0,0,0,.20)!important}
-.snty-hero-word{font-size:clamp(2.35rem,7vw,5.2rem)!important;line-height:.95!important;letter-spacing:clamp(8px,2.2vw,24px)!important;
- text-shadow:0 0 14px rgba(142,249,255,.55),0 0 46px rgba(153,69,255,.38)!important}
-.snty-hero-sub{max-width:820px;margin:14px auto 8px!important;font-size:clamp(.72rem,1.7vw,.98rem)!important;color:rgba(235,244,255,.78)!important}
+.snty-hero-sub{max-width:820px;margin:14px auto 8px!important}
 .snty-legal{opacity:.48!important;font-size:0.66rem!important;letter-spacing:1.7px!important;margin-top:12px!important}
 .snty-command-deck{border:1px solid rgba(142,249,255,.22);border-radius:18px;padding:14px;margin:10px 0 16px;
  background:linear-gradient(135deg,rgba(153,69,255,.10),rgba(5,2,16,.86) 45%,rgba(20,241,149,.045));
@@ -502,7 +508,7 @@ html, body, .stApp, [class*="css"]{font-family:var(--font-ui);}
 .snty-label{font-family:var(--font-mono);font-size:var(--fs-label);letter-spacing:.20em;text-transform:uppercase;color:rgba(233,213,138,.92);}
 .snty-stat-value{font-family:var(--font-hero);font-size:clamp(1.05rem,3.5vw,1.34rem);font-weight:900;letter-spacing:.04em;line-height:1.18;color:var(--gold);font-variant-numeric:tabular-nums;text-shadow:0 0 11px rgba(255,215,0,.25);}
 .snty-sub{font-family:var(--font-ui);font-size:var(--fs-body);font-weight:600;color:var(--cyan);line-height:1.15;}
-.snty-hero-wrap{text-align:center;padding:10px 0 8px;width:100%;}
+/* SIGNOFF_HERO_UNIFY_20260718: wrap panel is owned by the council block above; word+sub live here only. */
 .snty-hero-word{margin:0;font-family:var(--font-hero);font-size:clamp(2.2rem,9vw,4.1rem);letter-spacing:clamp(6px,2vw,14px);white-space:nowrap;background:linear-gradient(90deg,#9945FF 0%,#8EF9FF 23%,#14F195 46%,#FFD700 61%,#E879F9 78%,#9945FF 100%);background-size:300% 100%;-webkit-background-clip:text;-webkit-text-fill-color:transparent;animation:chromaShift 5.5s linear infinite;text-shadow:none;filter:drop-shadow(0 0 9px rgba(142,249,255,.20));}
 .snty-hero-sub{margin-top:8px;margin-bottom:4px;color:var(--cyan);font-family:var(--font-ui);font-weight:600;font-size:1rem;letter-spacing:.12em;font-style:italic;text-align:center;}
 .snty-legal{font-family:var(--font-mono);font-size:0.66rem;letter-spacing:.25em;color:var(--danger);opacity:.86;text-align:center;width:100%;text-shadow:0 0 10px rgba(255,7,58,.24);}
@@ -626,7 +632,11 @@ def _get_service_health(query_db_fn=None):
             note  = str(r["note"] or "")[:60]
             is_core  = svc in CORE_SERVICES
             is_scout = svc in SCOUT_SERVICES
-            threshold = 120 if is_core else 420
+            try:
+                from ui.theme import service_heartbeat_thresholds
+                _fresh_sec, threshold = service_heartbeat_thresholds(svc)
+            except Exception:
+                threshold = 120 if is_core else 420
             is_stale = age > threshold
             if svc not in result or age < result[svc]["age_s"]:
                 result[svc] = {
@@ -757,7 +767,7 @@ C_GREEN  = "#14F195"
 C_GOLD   = "#FFD700"
 C_RED    = "#FF073A"
 C_PURPLE = "#9945FF"
-C_CYAN   = "#38E1FF"  # SIGNOFF_DOCTRINE_CYAN_20260715: approved truth cyan
+C_CYAN   = SENTINUITY_COLORS["cyan"]  # SIGNOFF_DOCTRINE_CYAN_UNIFY_20260718: doctrine map is the single cyan; supersedes 20260715 #38E1FF variant
 C_IVY    = "#FFB347"
 C_NUGGET = "#C19A6B" # Boxer Fawn / Bronze
 
@@ -1277,7 +1287,7 @@ def render_top_command_nav() -> None:
     except Exception:
         _active = ""
 
-    secs = [("FOREST", "forest"), ("SUBSTRATE NODE", "substrate"), ("INTEL", "intel"),
+    secs = [("FOREST", "forest"), ("SUBSTRATE NODE", "substrate"), ("INTEL", "intel"), ("BIO·3", "bio"),
             ("README", "readme"), ("LAB", "lab"), ("VAULT", "vault"),
             ("POLARIS", "polaris"), ("IVARIS", "ivy")]
     jumps = [("PULSE", "#lore-modules"), ("GLASSBOX", "#glassbox-anchor")]
@@ -1730,8 +1740,8 @@ def _render_agent_heartbeat_cards() -> None:
         # outlive the truth. Only sent-heartbeat-fresh animates; aging is static
         # and desaturated; stale freezes amber (or red if genuinely failed).
         try:
-            from ui.theme import heartbeat_class as _sent_hb_class
-            _hb_cls = _sent_hb_class(d.get("age", 9999))
+            from ui.theme import service_heartbeat_class as _sent_hb_class
+            _hb_cls = _sent_hb_class(name, d.get("age", 9999))
         except Exception:
             _hb_cls = "sent-heartbeat-stale"
         if not is_active:
@@ -2915,11 +2925,11 @@ def render_intelligence_scouts() -> None:
 
 
 @st.fragment(run_every=43)
-def render_mycelial_signal_wilds():
+def render_intelligence_substrate_panel():
     """
-    MYCELIAL SIGNAL WILDS — Sovereign intelligence ecology with real wallet, channel and enrichment telemetry.
+    SMART MONEY OBSERVATORY{_holoq("hunting_grounds")} - Smart money substrate with real wallet data. (renamed from Hunting Grounds, SIGNOFF_OBSERVATORY_RENAME_20260718; help key unchanged for wiring)
     Reads from watched_wallets, telegram_channel_trust, and symbiotic_candidates.
-    Shows living wallet constellations, channel pulses and oracle nutrient health.
+    Shows archetype badges, tier classification, and enrichment health.
     """
     import time as _t, html as _h
     now = _t.time()
@@ -2946,7 +2956,7 @@ def render_mycelial_signal_wilds():
                 f'<span style="font-family:Share Tech Mono;font-size:0.66rem;color:{nc};">'
                 f'{label}{(" ×"+str(count)) if active and count>1 else ""}</span></span>')
 
-    _lamps = _lmp("WALLET NODES", _wn>0, _wn) + _lmp("ELITE NODES", _hwn>0, _hwn) + _lmp("CHANNEL PULSES", _tn>0, _tn)
+    _lamps = _lmp("APEX WALLETS", _wn>0, _wn) + _lmp("HIGH-WR", _hwn>0, _hwn) + _lmp("TG SIGNAL", _tn>0, _tn)
 
     # SENTINUITY_RUNNER_GOLD_20260621_V3: visual-only runner colour override.
 
@@ -2978,19 +2988,17 @@ def render_mycelial_signal_wilds():
 
 
     st.markdown(
-        f'''<div class="msw-shell">
-        <div style="position:absolute;inset:0 0 auto;height:1px;background:linear-gradient(90deg,transparent,#8EF9FF,#9945FF,#FFD700,transparent);opacity:.76;"></div>
-        <div style="font-family:Share Tech Mono,monospace;font-size:.54rem;letter-spacing:.24em;color:#8EF9FF;opacity:.58;margin-bottom:6px;">SOVEREIGN SENSORIUM · EXTERNAL INTELLIGENCE BIOME</div>
-        <div class="msw-title">⬡ MYCELIAL SIGNAL WILDS</div>
-        <div style="font-family:Share Tech Mono,monospace;font-size:.64rem;line-height:1.55;color:#78928C;margin-top:7px;max-width:920px;">A living sovereign intelligence ecology where wallet behaviour, trusted-channel pulse and oracle nourishment become traceable memory for the Council. Green marks verified life, cyan marks sensed flow, violet marks cognition, gold marks earned apex and doctrine red #FF073A marks failed provenance or dead signal tissue.</div>
-        <div style="margin-top:10px;">{_lamps}</div>
+        f'''<div class="substrate-wrap">
+        <div class="substrate-title">⬡ SMART MONEY OBSERVATORY - WALLET INTELLIGENCE SUBSTRATE</div>
+        <div class="substrate-sub">Apex wallet register · Telegram signal array · Enrichment health · Shared infra with Council forge.</div>
+        <div style="margin-top:6px;">{_lamps}</div>
         </div>''',
         unsafe_allow_html=True
     )
 
     _sc1, _sc2, _sc3 = st.columns(3, gap="large")
 
-    # ── COL 1: SMART-WALLET CONSTELLATION ──────────────────────────────────────
+    # ── COL 1: APEX WALLET REGISTER ──────────────────────────────────────
     with _sc1:
         wallets = []
         try:
@@ -3024,17 +3032,17 @@ def render_mycelial_signal_wilds():
                 pass
 
         st.markdown(
-            f'<div class="msw-card" style="border-color:#14F19588;">',
+            f'<div class="substrate-card" style="border-color:#14F19588;">',
             unsafe_allow_html=True
         )
         st.markdown(
-            f'<div class="msw-head" style="color:#14F195;">◉ SMART-WALLET CONSTELLATION ({len(wallets)})</div>',
+            f'<div class="substrate-head" style="color:#14F195;">👁️ APEX WALLET CONSTELLATION ({len(wallets)})</div>',
             unsafe_allow_html=True
         )
 
         if not wallets:
             st.markdown(
-                '<div class="msw-muted">// BIOME AWAITING FIRST VERIFIED WALLET NODE //<br>The sensory mycelium activates once wallets are profiled. Run: python -m services.initiate_intelligence_build</div>',
+                '<div class="substrate-muted">// CONSTELLATION AWAITING FIRST APEX WALLET //<br>Tracking activates once wallets are profiled. Run: python initiate_intelligence_build.py</div>',
                 unsafe_allow_html=True
             )
         else:
@@ -3093,7 +3101,7 @@ def render_mycelial_signal_wilds():
                 )
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── COL 2: CHANNEL PULSE CONSTELLATION ──────────────────────────────────────────
+    # ── COL 2: TELEGRAM SIGNAL ARRAY ──────────────────────────────────────────
     with _sc2:
         tg_rows = []
         try:
@@ -3109,17 +3117,17 @@ def render_mycelial_signal_wilds():
             pass
 
         st.markdown(
-            '<div class="msw-card" style="border-color:#8EF9FF88;">',
+            '<div class="substrate-card" style="border-color:#8EF9FF88;">',
             unsafe_allow_html=True
         )
         st.markdown(
-            '<div class="msw-head" style="color:#8EF9FF;">◈ CHANNEL PULSE CONSTELLATION</div>',
+            '<div class="substrate-head" style="color:#8EF9FF;">📡 SIGNAL ARRAY - TELEGRAM</div>',
             unsafe_allow_html=True
         )
 
         if not tg_rows:
             st.markdown(
-                '<div class="msw-muted">// CHANNEL SENSORS ARMED — AWAITING FIRST TRUSTED PULSE //<br>Signal provenance begins when the channel scout is started.</div>',
+                '<div class="substrate-muted">// SIGNAL ARRAY ARMED - AWAITING TELEGRAM SCOUT //<br>Channel scoring begins when telegram_scout is started.</div>',
                 unsafe_allow_html=True
             )
         else:
@@ -3203,8 +3211,8 @@ def render_mycelial_signal_wilds():
 
 
         st.markdown(
-            f'''<div class="msw-card" style="border-color:{bc}88;">
-            <div class="msw-head" style="color:{bc};">✦ ORACLE NUTRIENT FORGE</div>
+            f'''<div class="substrate-card" style="border-color:{bc}88;">
+            <div class="substrate-head" style="color:{bc};">⚒ ORACLE ENRICHMENT FORGE</div>
             <div style="font-family:Share Tech Mono;font-size:0.66rem;color:{bc};margin-bottom:8px;">{btext}</div>''',
             unsafe_allow_html=True
         )
@@ -3417,7 +3425,25 @@ def _fetch_all_dashboard_data():
         conn.row_factory = sqlite3.Row
 
         _wallet_df      = pd.read_sql_query("SELECT COALESCE((SELECT CAST(value AS REAL) FROM system_config WHERE key='PAPER_WALLET_EQUITY_USD'),(SELECT CAST(value AS REAL) FROM system_config WHERE key='SOLANA_PAPER_WALLET_EQUITY_USD'),(SELECT CAST(value AS REAL) FROM system_config WHERE key='PAPER_EQUITY_USD'),(SELECT CAST(value AS REAL) FROM system_config WHERE key='PAPER_TRADING_BALANCE_USD'),wallet_balance) AS wallet_balance, COALESCE((SELECT CAST(value AS REAL) FROM system_config WHERE key='PAPER_INITIAL_CAPITAL_USD'),(SELECT CAST(value AS REAL) FROM system_config WHERE key='SOLANA_PAPER_INITIAL_CAPITAL_USD'),(SELECT CAST(value AS REAL) FROM system_config WHERE key='PAPER_EQUITY_BASELINE_USD'),(SELECT CAST(value AS REAL) FROM system_config WHERE key='PAPER_STARTING_BALANCE_USD'),initial_capital) AS initial_capital FROM system_state WHERE id=1 LIMIT 1", conn)
-        _raw_dna_df     = pd.read_sql_query("SELECT COUNT(*) AS count FROM raw_dna WHERE processed_state=1", conn)
+        # INGEST_IDENTITY_TRUTH_20260718: raw_dna is a short-lived queue and is
+        # deliberately pruned after resolution.  Counting only processed_state=1
+        # therefore reports zero even while the ingest organism is healthy.  The
+        # identity card now uses durable pipeline lineage, while retaining live
+        # queue and recent-intake telemetry as separate fields.
+        _raw_dna_df = pd.read_sql_query("""
+            SELECT
+              MAX(
+                (SELECT COUNT(*) FROM raw_dna),
+                (SELECT COUNT(*) FROM market_snapshots),
+                (SELECT COUNT(*) FROM resolved_transactions)
+              ) AS count,
+              (SELECT COUNT(*) FROM raw_dna) AS raw_active,
+              (SELECT COUNT(*) FROM raw_dna
+                 WHERE COALESCE(first_seen_at, timestamp, 0) >= unixepoch() - 600
+              ) AS raw_recent_10m,
+              (SELECT COUNT(*) FROM market_snapshots) AS snapshots_total,
+              (SELECT COUNT(*) FROM resolved_transactions) AS resolved_total
+        """, conn)
         _snapshots_df   = pd.read_sql_query("""
             SELECT id, token_name, mint_address, mint_confidence, candidate_state, quality_status, price_status, latched
             FROM market_snapshots
@@ -3583,7 +3609,7 @@ def get_dominant_state(halted, latency, open_pos, recent_heal_count, win_r):
     if recent_heal_count>0: return "SELF-HEALING", "Actively repairing pipeline blockages and restoring flow.", C_PURPLE
     if open_pos > 0:        return "EXECUTING",    "Exposed to the market. Managing active live capital.", C_GOLD
     if win_r > 60:          return "ASCENDING",    "Highly calibrated, profitable, and scanning for prime entry.", C_PURPLE
-    return "SCOUTING", "Stable, selective, and surveying the signal wilds with strict restraint.", C_PURPLE
+    return "HUNTING", "Stable, selective, and hunting with strict restraint.", C_PURPLE
 
 def write_organism_state(dom_state, dom_col, cog_df, auto_df):
     def safe_int(v):
@@ -3963,14 +3989,12 @@ def build_dynamic_css(dom_col="#9945FF"):
     }}
 
     /* ── INTELLIGENCE SUBSTRATE STRIP ── */
-    .msw-shell {{ position:relative; margin-top:24px; padding:20px 20px 14px; border:1px solid rgba(153,69,255,.34); border-radius:22px 8px 22px 8px; background:radial-gradient(circle at 8% 0%,rgba(142,249,255,.10),transparent 36%),radial-gradient(circle at 94% 12%,rgba(153,69,255,.12),transparent 40%),linear-gradient(135deg,rgba(6,4,18,.94),rgba(4,2,13,.82)); box-shadow:0 22px 70px rgba(0,0,0,.32),inset 0 0 30px rgba(153,69,255,.035); overflow:hidden; }}
-    .msw-shell:after {{ content:'MYCELIAL SIGNAL WILDS'; position:absolute; right:18px; bottom:9px; font-family:'Share Tech Mono',monospace; font-size:.44rem; letter-spacing:.24em; color:rgba(153,69,255,.20); pointer-events:none; }}
-    .msw-title {{ color:#EAFEF9; font-family:'Orbitron',sans-serif; font-size:.92rem; font-weight:700; letter-spacing:.20em; text-shadow:0 0 18px rgba(142,249,255,.26); }}
+    .substrate-wrap {{ margin-top: 22px; padding: 16px 18px 10px 18px; border:1px solid rgba(255,215,0,0.28); border-radius:16px; background:rgba(5,2,16,0.42); box-shadow:0 0 24px rgba(153,69,255,0.18); }}
+    .substrate-title {{ color:#FFD700; font-family:'Share Tech Mono',monospace; font-size:0.82rem; letter-spacing:4px; }}
     .substrate-sub {{ color:#8EF9FF99; font-family:'Share Tech Mono',monospace; font-size:0.66rem; margin-top:5px; letter-spacing:1.2px; }}
-    .msw-card {{ position:relative; min-height:202px; border:1px solid; border-radius:16px 5px 16px 5px; padding:15px 15px; background:linear-gradient(145deg,rgba(9,7,24,.72),rgba(3,3,12,.88)); margin-top:12px; box-shadow:inset 0 0 20px rgba(142,249,255,.025),0 10px 28px rgba(0,0,0,.22); overflow:hidden; }}
-    .msw-card:before {{ content:''; position:absolute; left:0; right:0; top:0; height:1px; background:linear-gradient(90deg,currentColor,transparent 72%); opacity:.42; }}
-    .msw-head {{ font-family:'Orbitron',sans-serif; font-size:.68rem; font-weight:700; letter-spacing:.17em; margin-bottom:10px; text-transform:uppercase; }}
-    .msw-muted {{ color:#61716D; font-family:'Share Tech Mono',monospace; font-size:.64rem; line-height:1.55; letter-spacing:.04em; padding:14px 2px; }}
+    .substrate-card {{ min-height: 188px; border:1px solid; border-radius:14px; padding:14px 14px; background:rgba(255,255,255,0.025); margin-top:12px; }}
+    .substrate-head {{ font-family:'Share Tech Mono',monospace; font-size:0.74rem; letter-spacing:3px; margin-bottom:8px; }}
+    .substrate-muted {{ color:#888; font-size:0.68rem; font-style:italic; padding:12px 0; }}
     .substrate-source {{ color:#777; font-size:0.66rem; letter-spacing:1px; margin-bottom:8px; }}
     .substrate-row {{ border-left:3px solid rgba(255,215,0,0.35); background:rgba(255,255,255,0.025); border-radius:0 8px 8px 0; padding:8px 10px; margin-bottom:7px; font-family:'Share Tech Mono',monospace; font-size:0.66rem; }}
     .substrate-status {{ float:right; color:#FFD70099; font-size:0.66rem; }}
@@ -5708,7 +5732,7 @@ def render_unified_execution_lanes() -> None:
             "background:#ffffff11;transform:translateX(-50%);'></div></div>"
             "<div style='display:flex;justify-content:space-between;margin-top:4px;"
             "font-family:Share Tech Mono,monospace;font-size:0.66rem;color:#2a2a2a;'>"
-            "<span>◄ SL</span><span>SCOUTING · AWAITING LATCH</span><span>TP ►</span>"
+            "<span>◄ SL</span><span>HUNTING - AWAITING LATCH</span><span>TP ►</span>"
             "</div></div>",
             unsafe_allow_html=True,
         )
@@ -5779,7 +5803,7 @@ def render_sovereign_flow_engine(snapshots_df=None, open_pos_df=None, reviews_df
     _qual_rate=(_latched_n/max(_total_snap,1))*100
     _rug_rate=(_vetoed_n/max(_total_snap,1))*100
     if _total_snap==0: _tide_state="🌑 DORMANT";_tide_color=_DIM;_tide_score=0
-    elif _qual_rate>=15 and _rug_rate<40: _tide_state="🔥 SCOUTING";_tide_color=_G;_tide_score=min(100,int(_qual_rate*4))
+    elif _qual_rate>=15 and _rug_rate<40: _tide_state="🔥 HUNTING";_tide_color=_G;_tide_score=min(100,int(_qual_rate*4))
     elif _qual_rate>=5: _tide_state="🧪 LEARNING";_tide_color=_GO;_tide_score=min(80,int(_qual_rate*3))
     elif _rug_rate>60: _tide_state="⚡ CHAOTIC";_tide_color=_R;_tide_score=15
     else: _tide_state="🛡 DEFENSIVE";_tide_color=_C;_tide_score=30
@@ -5789,7 +5813,7 @@ def render_sovereign_flow_engine(snapshots_df=None, open_pos_df=None, reviews_df
         _configured_tide = str(query_db("SELECT value FROM system_config WHERE key='MARKET_TIDE_STATE' LIMIT 1").iloc[0, 0] or '').strip().upper()
     except Exception:
         _configured_tide = ''
-    _tide_palette = {'FLOOD': ('FLOOD', _G, 85), 'HUNTING': ('SCOUTING', _G, 75), 'NORMAL': ('NORMAL', _C, 55), 'DROUGHT': ('DROUGHT', _GO, 25), 'LEARNING': ('LEARNING', _GO, 45), 'DEFENSIVE': ('DEFENSIVE', _C, 30), 'CHAOTIC': ('CHAOTIC', _R, 15), 'DORMANT': ('DORMANT', _DIM, 0), 'EXTREME': ('EXTREME', _R, 10)}
+    _tide_palette = {'FLOOD': ('FLOOD', _G, 85), 'HUNTING': ('HUNTING', _G, 75), 'NORMAL': ('NORMAL', _C, 55), 'DROUGHT': ('DROUGHT', _GO, 25), 'LEARNING': ('LEARNING', _GO, 45), 'DEFENSIVE': ('DEFENSIVE', _C, 30), 'CHAOTIC': ('CHAOTIC', _R, 15), 'DORMANT': ('DORMANT', _DIM, 0), 'EXTREME': ('EXTREME', _R, 10)}
     if _configured_tide in _tide_palette:
         _tv, _tide_color, _tide_score = _tide_palette[_configured_tide]
         _tide_state = _tv
@@ -6119,7 +6143,11 @@ def render_api_status_bar() -> None:
         # Special handling for BRAVE - show daily usage counter
         if name == "BRAVE" and ok:
             try:
-                _brave_used = int(get_config_value("BRAVE_SEARCHES_TODAY", 0) or 0)
+                # BUGFIX_20260718: get_config_value was never imported in this
+                # module, so this block always raised NameError and the daily
+                # BRAVE quota counter silently never displayed.
+                from services.schema import get_config_value as _gcv_brave
+                _brave_used = int(_gcv_brave("BRAVE_SEARCHES_TODAY", 0) or 0)
                 _brave_hit = _brave_used >= 900
                 dot = "#FF073A" if _brave_hit else col
                 _blink = "animation:pulse 1s infinite;" if _brave_hit else ""
@@ -6769,6 +6797,13 @@ def render_living_cortex():
     # fed the old metric row. Balance truth now comes solely from
     # ui/state_contract.get_balance_truth() - one source, no name-shadowed twin.
     total_dna     = int(val(raw_dna_df,"count",0))
+    raw_active    = int(val(raw_dna_df,"raw_active",0))
+    raw_recent_10m = int(val(raw_dna_df,"raw_recent_10m",0))
+    ingest_lineage = max(
+        total_dna,
+        int(val(raw_dna_df,"snapshots_total",0)),
+        int(val(raw_dna_df,"resolved_total",0)),
+    )
     latency_ms    = _measure_live_latency()
     # AUTHORITATIVE_HEADLINE_WINRATE_20260714
     # One source of truth shared with services/winrate_truth.py.
@@ -7037,9 +7072,9 @@ def render_living_cortex():
       </div>
       <div class="snty-stat-grid">
         <div class="snty-stat-cell">
-          <div class="snty-label" style="color:rgba(207,233,255,.72);">DNA NODES</div>
-          <div class="snty-stat-big" style="color:{C_CYAN};">{total_dna:,}</div>
-          <div class="snty-sub" style="color:rgba(207,233,255,.55);">RAW SIGNALS INGESTED</div>
+          <div class="snty-label" style="color:rgba(207,233,255,.72);">INGEST NODES</div>
+          <div class="snty-stat-big" style="color:{C_CYAN};">{ingest_lineage:,}</div>
+          <div class="snty-sub" style="color:rgba(207,233,255,.55);">{raw_active:,} RAW ACTIVE · {raw_recent_10m:,} NEW / 10M</div>
         </div>
         <div class="snty-stat-cell">
           <div class="snty-label" style="color:rgba(207,233,255,.72);">WIN RATE</div>
@@ -8017,52 +8052,16 @@ def render_living_cortex():
                     is_consensus = "consensus" in think.lower() or "harmonic" in think.lower() or "consensus" in verd.lower()
                     is_patch = any(kw in msg.lower() for kw in ("applied patch", "file edited", "file created", "integrated", "patch absorbed"))
                     _msg_class = f"arena-msg-{spk.lower()}" if spk in ("POLARIS","IVARIS","ORACLE","NUGGET") else ""
-                    # COUNCIL_READABLE_TRANSCRIPT_20260720: show a useful brief by
-                    # default and preserve the complete stored turn in an expandable
-                    # disclosure. This keeps the chamber conversational without hiding
-                    # the evidence or reducing every message to internal abbreviations.
-                    _plain_for_len = _sanitize_exception_text(str(_raw_verdict or ''))
-                    _brief_limit = 360
-                    _brief_raw = _plain_for_len[:_brief_limit].strip()
-                    if len(_plain_for_len) > _brief_limit:
-                        _brief_raw = _brief_raw.rstrip(' ,;:-') + '…'
-                    _brief = purify_links(_brief_raw)
-                    _details = ''
-                    if len(_plain_for_len) > _brief_limit:
-                        _details = (
-                            "<details style='margin-top:7px;border-top:1px solid rgba(255,255,255,.08);padding-top:6px;'>"
-                            "<summary style='cursor:pointer;color:#8EF9FF;font-size:.72rem;letter-spacing:.7px;'>"
-                            "EXPAND FULL MESSAGE</summary>"
-                            f"<div style='margin-top:7px;color:#d8e5ef;font-size:.82rem;line-height:1.45;'>{msg}</div></details>"
-                        )
-                    _narrative = (
-                        f"<div style='color:{col};font-family:Rajdhani,sans-serif;font-size:0.95rem;font-style:italic;margin-bottom:6px;opacity:0.92;word-wrap:break-word;overflow-wrap:break-word;'>{_grok_narr}</div>"
-                        if _grok_narr else ''
-                    )
-                    _rich_body = (
-                        f"{_narrative}<div class='{text_class} {_msg_class}' style='font-size:0.9rem;line-height:1.42;word-wrap:break-word;overflow-wrap:break-word;white-space:normal;'>{_brief or msg}</div>{_details}"
-                    )
+                    if _grok_narr:
+                        _rich_body = f"<div style='color:{col};font-family:Rajdhani,sans-serif;font-size:0.95rem;font-style:italic;margin-bottom:6px;opacity:0.92;word-wrap:break-word;overflow-wrap:break-word;'>{_grok_narr}</div><div class='clinical-text {text_class} {_msg_class}' style='word-wrap:break-word;overflow-wrap:break-word;white-space:normal;'>{msg}</div>"
+                    else:
+                        _rich_body = f"<div class='{text_class} {_msg_class}' style='font-size:0.9rem;word-wrap:break-word;overflow-wrap:break-word;white-space:normal;'>{msg}</div>"
                     if spk == "ORACLE":
                         _oq  = html.escape(str(row.get('oracle_query', '') or ''))
                         _oc  = str(row.get('oracle_confirmed', '') or '')
-                        _os  = html.escape(_sanitize_exception_text(str(row.get('oracle_snippets', '') or '')))
                         _cc  = "#14F195" if str(_oc).lower() == "true" else ("#FF073A" if str(_oc).lower() == "false" else "#888")
                         _cl  = "CONFIRMED" if str(_oc).lower() == "true" else ("NOT CONFIRMED" if str(_oc).lower() == "false" else "INCONCLUSIVE")
-                        _evidence = ''
-                        if _os and _os not in ('[]', "''", 'None'):
-                            _evidence = (
-                                "<details style='margin-top:7px;'>"
-                                "<summary style='cursor:pointer;color:#14F195;font-size:.72rem;letter-spacing:.7px;'>"
-                                "EXPAND ORACLE EVIDENCE</summary>"
-                                f"<div style='margin-top:7px;color:#cfe9dd;font-size:.8rem;line-height:1.4;'>{_os}</div></details>"
-                            )
-                        _rich_body = (
-                            "<div style='color:#14F195;font-size:0.72rem;letter-spacing:1px;margin-bottom:4px;'>ACTUAL SEARCH</div>"
-                            f"<div style='color:#FFF;font-family:Share Tech Mono,monospace;font-size:0.8rem;background:rgba(20,241,149,0.07);padding:7px 10px;border-radius:6px;margin-bottom:8px;word-break:break-word;'>{_oq or 'No external query recorded'}</div>"
-                            f"<div style='display:inline-block;padding:2px 10px;border-radius:4px;font-size:0.7rem;font-weight:700;background:{_cc}22;color:{_cc};border:1px solid {_cc};margin-bottom:7px;'>{_cl}</div>"
-                            "<div style='color:#8EF9FF;font-size:.7rem;letter-spacing:.8px;margin:2px 0 4px;'>ORACLE MESSAGE</div>"
-                            f"<div style='font-size:.9rem;line-height:1.42;'>{_brief or msg}</div>{_details}{_evidence}"
-                        )
+                        _rich_body = f"<div style='color:#14F195;font-size:0.75rem;letter-spacing:1px;margin-bottom:4px;'>SEARCH QUERY</div><div style='color:#FFF;font-family:Share Tech Mono,monospace;font-size:0.8rem;background:rgba(20,241,149,0.07);padding:6px 10px;border-radius:6px;margin-bottom:8px;'>{_oq or '-'}</div><div style='display:inline-block;padding:2px 10px;border-radius:4px;font-size:0.7rem;font-weight:700;background:{_cc}22;color:{_cc};border:1px solid {_cc};margin-bottom:8px;'>{_cl}</div>"
                     elif spk == "NUGGET":
                         _nw = str(row.get('nugget_winner', '') or '-')
                         _nr = html.escape(str(row.get('nugget_reason', '') or '-'))
@@ -8118,10 +8117,16 @@ def render_living_cortex():
                                 # the real exception, and only ERROR/BLOCKED/DEAD/
                                 # FAILED stay red.
                                 _ch_stale.append((_svc, 0.0, _hnote))
-                            elif _age > 180:
-                                _ch_stale.append((_svc, _age))
                             else:
-                                _ch_alive.append(_svc)
+                                try:
+                                    from ui.theme import service_heartbeat_thresholds as _hb_thresholds
+                                    _fresh_s, _aging_s = _hb_thresholds(_svc)
+                                except Exception:
+                                    _aging_s = 180.0
+                                if _age > _aging_s:
+                                    _ch_stale.append((_svc, _age))
+                                else:
+                                    _ch_alive.append(_svc)
                     if _ch_blocked:
                         _svc, _hst, _hnote = _ch_blocked[0]
                         _chamber_state = f"COUNCIL BLOCKED — {html.escape(_svc)} {html.escape(_hst)}"
@@ -8822,6 +8827,10 @@ def render_sovereign_command_bar() -> None:
         return label, "#14F195", f"{int(a)}s"
 
     mode_label, mode_col, _mode_detail = _snty_effective_mode(cfg)
+    # BUGFIX_20260718: mode_raw was referenced below but never defined, so this
+    # entire command bar died with a NameError that its fail-silent caller
+    # swallowed — the strip simply never rendered. Derived here from config.
+    mode_raw = str(cfg.get("TRADING_MODE", "paper") or "paper").strip().lower()
     if mode_label == "LIVE":
         mode_label, mode_col = "LIVE-GATED", "#FF073A"
 
@@ -9224,10 +9233,14 @@ def _render_final_gate_glassbox() -> None:
     Council · Copytrade Outpost. All panels read real DB/log telemetry through
     ui/data_sources.py (read-only, short TTL caches); every tile prints its
     backend source; missing sources render "not wired" - nothing is faked."""
+    # DEDUP_20260718: render_glassbox() paints its own full "🜂 SOVEREIGN
+    # GLASSBOX" hero header, so the duplicate title strip here is removed —
+    # one truth, one heading. This divider now carries id="glassbox-anchor",
+    # which the crystalline command rail's GLASSBOX pill links to but which
+    # previously existed nowhere on the page (dead jump).
     st.markdown(
-        "<div style='margin:20px 0 10px;padding:8px 0;border-top:1px solid rgba(20,241,149,0.25);"
-        "font-family:Share Tech Mono,monospace;font-size:0.66rem;letter-spacing:4px;color:#14F195;'>"
-        "🜂 SOVEREIGN GLASSBOX - FINAL GATE · PULSE · TWIN RAILS</div>",
+        "<div id='glassbox-anchor' style='margin:20px 0 10px;"
+        "border-top:1px solid rgba(20,241,149,0.25);'></div>",
         unsafe_allow_html=True
     )
     try:
@@ -9366,18 +9379,6 @@ def _render_diagnostics_bay() -> None:
                     for r in _cp] or "no council producer heartbeat rows"
             except Exception as _e:
                 _diag["council_producers"] = f"unavailable ({type(_e).__name__})"
-            # Durable audit/task memory. Reports live once under audits/; the
-            # AI-handoff surface reads references from SQLite and never creates
-            # a second canonical copy.
-            try:
-                try:
-                    from services.audit_artifact_store import build_handoff_payload
-                except ImportError:
-                    from audit_artifact_store import build_handoff_payload
-                _diag["audit_memory"] = build_handoff_payload(_dc, limit=15)
-            except Exception as _e:
-                _diag["audit_memory"] = f"unavailable ({type(_e).__name__})"
-
             # copytrade ingestion state - absence stated as absence, never "noise"
             try:
                 _ct_hb = _dc.execute(
@@ -9426,12 +9427,7 @@ def _render_diagnostics_bay() -> None:
                 f"</div>",
                 unsafe_allow_html=True,
             )
-            with st.expander("AI HANDOFF · CURRENT TRUTH + AUDIT MEMORY", expanded=False):
-                st.caption(
-                    "Canonical reports: audits/YYYY/MM/DD/<producer>/. "
-                    "Task state and report paths: SQLite audit_artifacts. "
-                    "diagnostics/ai_handoff contains generated manifests only."
-                )
+            with st.expander("AI HANDOFF JSON · COPY ONLY WHEN NEEDED", expanded=False):
                 st.code(json.dumps(_diag, indent=2, default=str), language="json")
         except Exception as _e:
             st.caption(f"Handoff export unavailable: {type(_e).__name__}")
@@ -9456,7 +9452,7 @@ _GV_DOCTRINE_CSS = r"""
   --snty-void:#050210;
   --snty-surface:rgba(10,13,20,.88);
   --snty-surface-2:rgba(28,20,50,.34);
-  --snty-cyan:#38E1FF;
+  --snty-cyan:#8EF9FF; /* SIGNOFF_DOCTRINE_CYAN_UNIFY_20260718: duplicate :root previously re-declared the deprecated cyan and, loading later, won the cascade */
   --snty-green:#14F195;
   --snty-purple:#9945FF;
   --snty-red:#FF073A;
@@ -9512,22 +9508,22 @@ button:hover,[role="button"]:hover {transform:translateY(-1px)}
 .snty-gv-metrics {position:relative;display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:7px;padding:0 12px 12px}
 .snty-gv-metric {min-height:64px;padding:9px 10px;border-radius:10px;border:1px solid var(--snty-line);
  background:linear-gradient(155deg,rgba(255,255,255,.028),rgba(255,255,255,.009));min-width:0}
-.snty-gv-label {font:700 0.66remrem 'Share Tech Mono',monospace;letter-spacing:.13em;color:#718198;text-transform:uppercase;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.snty-gv-label {font:700 0.66rem 'Share Tech Mono',monospace;letter-spacing:.13em;color:#718198;text-transform:uppercase;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .snty-gv-value {font:800 clamp(.78rem,1.5vw,1.02rem) 'Share Tech Mono',monospace;color:#eaf8ff;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.snty-gv-detail {font:600 0.66remrem Rajdhani,sans-serif;color:#73839a;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.snty-gv-detail {font:600 0.66rem Rajdhani,sans-serif;color:#73839a;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .snty-gv-rail {display:flex;align-items:center;gap:5px;overflow-x:auto;padding:7px 10px;margin:0 0 9px;
  border:1px solid rgba(153,69,255,.14);border-radius:12px;background:rgba(5,2,16,.66);scrollbar-width:none}
 .snty-gv-rail::-webkit-scrollbar{display:none}
-.snty-gv-rail a {flex:0 0 auto;text-decoration:none!important;color:#9aa7b9!important;font:700 0.66remrem 'Share Tech Mono',monospace;
+.snty-gv-rail a {flex:0 0 auto;text-decoration:none!important;color:#9aa7b9!important;font:700 0.66rem 'Share Tech Mono',monospace;
  letter-spacing:.09em;text-transform:uppercase;padding:7px 10px;border-radius:8px;border:1px solid transparent}
 .snty-gv-rail a:hover {color:#eefaff!important;border-color:rgba(56,225,255,.22);background:rgba(56,225,255,.055)}
 .snty-section-head {display:flex;align-items:center;gap:11px;margin:19px 0 7px;padding:0 2px}
-.snty-section-index {font:800 0.66remrem 'Share Tech Mono',monospace;color:var(--snty-cyan);letter-spacing:.12em;border:1px solid rgba(56,225,255,.27);border-radius:6px;padding:4px 6px}
+.snty-section-index {font:800 0.66rem 'Share Tech Mono',monospace;color:var(--snty-cyan);letter-spacing:.12em;border:1px solid rgba(56,225,255,.27);border-radius:6px;padding:4px 6px}
 .snty-section-copy {min-width:0}
 .snty-section-title {font:800 .75rem Orbitron,sans-serif;letter-spacing:.15em;color:#e6f8ff;text-transform:uppercase}
 .snty-section-sub {font:600 .68rem Rajdhani,sans-serif;color:#77869d;letter-spacing:.04em;margin-top:1px}
 .snty-section-line {height:1px;flex:1;background:linear-gradient(90deg,rgba(56,225,255,.28),rgba(153,69,255,.12),transparent)}
-.snty-runtime-stamp {font:600 0.66remrem 'Share Tech Mono',monospace;color:#68768b;letter-spacing:.06em;padding:0 14px 10px;position:relative}
+.snty-runtime-stamp {font:600 0.66rem 'Share Tech Mono',monospace;color:#68768b;letter-spacing:.06em;padding:0 14px 10px;position:relative}
 
 @media (max-width:900px){
  [data-testid="stMainBlockContainer"]{padding-left:.72rem!important;padding-right:.72rem!important}
@@ -9666,8 +9662,8 @@ def _gv_header(db_path: str | Path, canonical_file: str | Path) -> None:
     exec_color, exec_text = status_detail(executor_status, executor_pulse)
     council_color, council_text = status_detail(council_status, council_pulse)
     metrics = [
-        ("PAPER EQUITY", _gv_money(paper_equity), "cumulative wallet truth", "#38E1FF"),
-        ("REALIZED PNL", _gv_money(realized), "cumulative · not one trade", "#38E1FF"),
+        ("PAPER EQUITY", _gv_money(paper_equity), "cumulative wallet truth", "#8EF9FF"),
+        ("REALIZED PNL", _gv_money(realized), "cumulative · not one trade", "#8EF9FF"),
         ("LIVE WALLET", _gv_money(live_wallet), f"{live_open} open", "#9945FF"),
         ("POSITIONS", f"{paper_open} paper · {live_open} live", "current exposure", "#14F195"),
         ("PRICE TRUTH", oracle_text, "oracle heartbeat", oracle_color),
@@ -9752,10 +9748,6 @@ render_top_command_nav()
 # UNIFORM_TYPE_20260612: one type scale site-wide - Orbitron headers, Rajdhani
 # body, Share Tech Mono telemetry - substrate node stops drifting from main.
 st.markdown("""<style>
-/* CHATGPSQUIRT_SIGNOFF_UI_20260721 — crystalline hierarchy and reduced white glare */
-:root{--snty-ink:#B8CCC4;--snty-muted:#60796F;--snty-glass:rgba(7,18,18,.58);--snty-edge:rgba(142,249,255,.14)}
-[data-testid="stAppViewContainer"]{background:radial-gradient(circle at 18% 8%,rgba(153,69,255,.08),transparent 34%),radial-gradient(circle at 82% 22%,rgba(20,241,149,.055),transparent 32%),#03070A}
-[data-testid="stVerticalBlockBorderWrapper"]{background:linear-gradient(145deg,rgba(9,22,22,.62),rgba(7,5,17,.54));border-color:var(--snty-edge)!important;box-shadow:inset 0 1px 0 rgba(255,255,255,.025),0 18px 54px rgba(0,0,0,.22)}
 [data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li
  {font-family:Rajdhani,sans-serif;font-size:.88rem;line-height:1.5;color:#C9D4CC}
 .stTabs [data-baseweb="tab"] p, .stTabs button
@@ -9775,7 +9767,7 @@ h1,h2,h3 {font-family:'Orbitron',sans-serif !important;letter-spacing:.12em}
 # selected, skip the entire home composite below so the section renders alone
 # (it used to render buried under the full home page, which read as "not loading").
 _sec_active = str(st.query_params.get("sec","")).strip().lower() in (
-    "worldos","forest","substrate","intel","readme","polaris","ivy","lab","vault")
+    "worldos","forest","substrate","intel","bio","readme","polaris","ivy","lab","vault")
 if not _sec_active:
     # ── SIGNOFF_CANONICAL_HIERARCHY_20260715 ─────────────────────────────────
     # 1. COMPACT SYSTEM HEADER + MODE/STATUS STRIP + BLOCKERS FIRST.
@@ -9839,23 +9831,9 @@ if not _sec_active:
 
     # 2. EXECUTION TRUTH - per-trade equilibrium meters, full width
     if _GV_UI_AVAILABLE:
-        try: _gv_section("truth", "01", "Trade Truth", "Paper and live rails side by side · exposure, divergence, execution state and realized outcomes")
+        try: _gv_section("truth", "01", "Trade Truth", "Open exposure, execution state and realized outcomes")
         except Exception: pass
     render_unified_execution_lanes()
-
-    # PAPER/LIVE DIVERGENCE INSTRUMENT — SIGNOFF_ACTIVE_INTEGRATION_20260720.
-    # First-class instrument in the Trade Truth section (upper hierarchy, not
-    # diagnostics). Read-only: opens the DB mode=ro; renders NOT RECORDED for
-    # absent telemetry; warns whenever chain truth disagrees with paper.
-    # Error containment mirrors the constellation pattern below: a component
-    # failure renders a readable unavailable state and never crashes the hub.
-    try:
-        from ui.paper_live_divergence import render_paper_live_divergence
-        render_paper_live_divergence(str(DB_PATH))
-    except Exception as _pld_err:
-        st.caption(
-            f"Paper/Live divergence instrument unavailable; backend unaffected: "
-            f"{type(_pld_err).__name__}: {_pld_err}")
 
     # 3. CURRENT POSITIONS + RECENT BUYS/SELLS with real source badges
     st.markdown(
@@ -9891,7 +9869,7 @@ if not _sec_active:
 
     # 5. FINAL GATE · PRICE TRUTH · TWIN RAILS (Sovereign Glassbox)
     if _GV_UI_AVAILABLE:
-        try: _gv_section("gate", "02", "Final Gate & Execution Arena", "Candidate evidence, price freshness, paper/live admission truth and divergence visibility")
+        try: _gv_section("gate", "02", "Final Gate & Execution Arena", "Candidate evidence, price freshness and paper/live admission truth")
         except Exception: pass
     # Moved up from the page tail (SIGNOFF_CANONICAL_HIERARCHY_20260715) so the
     # live-lane admission truth sits with the execution/PnL group. Renderer and
@@ -10356,11 +10334,11 @@ if not _sec_active:
             st.markdown(f'<div style="display:flex;justify-content:space-between;align-items:center;padding:7px 10px;margin-bottom:5px;border-radius:6px;background:rgba(255,255,255,0.02);font-family:Share Tech Mono,monospace;"><span style="color:#FFF;font-size:0.68rem;">{html.escape(ptype)}</span><span style="color:{out_col};font-size:0.7rem;font-weight:700;">{ts_str}</span></div>',unsafe_allow_html=True)
         st.markdown("</div>",unsafe_allow_html=True)
     
-    # Mycelial Signal Wilds — canonical sovereign intelligence ecology render
+    # Convergence Gate and intelligence substrate - single render at bottom
     if _GV_UI_AVAILABLE:
-        try: _gv_section("intelligence", "06", "Mycelial Signal Wilds", "Wallet constellations, channel pulses, oracle nourishment and Council memory ecology")
+        try: _gv_section("intelligence", "06", "Secondary Systems", "Copytrade, Substrate and autonomous research surfaces")
         except Exception: pass
-    render_mycelial_signal_wilds()
+    render_intelligence_substrate_panel()
     st.markdown("<div style='margin-top:20px;padding:14px 16px;border:1px solid rgba(153,69,255,0.25);border-radius:12px;background:rgba(5,2,16,0.5);'>",unsafe_allow_html=True)
     
     # Live conviction score from 5 signals
@@ -10456,20 +10434,34 @@ if not _sec_active:
     # and reads the same backend sources - only the navigation architecture moved.
 st.markdown('<div id="lore-modules"></div>', unsafe_allow_html=True)
 
-# BIO3_REMOVE_20260722: biological intelligence health tab removed.
-_health_tab_available = False
+try:
+    from ui.sovereign_health_tab import render_health_tab as _render_health_tab
+    _health_tab_available = True
+except Exception:
+    _health_tab_available = False
 
-# SUBSTRATE_NODE_CANONICAL_IDENTITY_20260720
-# One product identity, one renderer, one import path.  Backend services retain
-# their substrate_* technical names, but no service-side UI renderer exists.
 try:
     from ui.substrate_node import render_substrate_tab as _render_substrate_tab
     _substrate_node_available = True
-    _substrate_node_import_error = ""
-except Exception as _substrate_import_exc:
-    _render_substrate_tab = None
-    _substrate_node_available = False
-    _substrate_node_import_error = f"{type(_substrate_import_exc).__name__}: {_substrate_import_exc}"
+except Exception:
+    try:
+        from services.substrate_node import render_substrate_tab as _render_substrate_tab
+        _substrate_node_available = True
+    except Exception:
+        try:
+            # Root level fallback
+            import importlib.util as _ilu, os as _os
+            _sn_path = _os.path.join(_os.path.dirname(__file__), 'substrate_node.py')
+            if not _os.path.exists(_sn_path):
+                _sn_path = _os.path.join(_os.path.dirname(__file__), 'services', 'substrate_node.py')
+            _spec = _ilu.spec_from_file_location("substrate_node", _sn_path)
+            _sn_mod = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_sn_mod)
+            render_substrate_tab = _sn_mod.render_substrate_tab
+            _render_substrate_tab = render_substrate_tab
+            _substrate_node_available = True
+        except Exception:
+            _substrate_node_available = False
 
 
 def _lore_card(title: str, accent: str, rgba: str, subtitle: str, body: str,
@@ -10598,19 +10590,30 @@ def _sec_substrate() -> None:
         try:
             _render_substrate_tab(query_db)
         except Exception as _ste:
-            st.error(f"Substrate Node renderer error: {type(_ste).__name__}: {_ste}")
+            st.error(f"Substrate tab error: {_ste}")
         _render_council_build_status_panel()
     else:
-        st.markdown(f"""
+        st.markdown("""
 <div style='text-align:center;padding:40px;font-family:Share Tech Mono,monospace;
     font-size:0.66rem;color:#555;letter-spacing:2px;'>
-    // SUBSTRATE NODE RENDERER UNAVAILABLE //<br>
-    Canonical module: ui/substrate_node.py<br>
-    Import error: {_substrate_node_import_error}
+    // SUBSTRATE NODE MODULE NOT FOUND //<br>
+    Copy ui/substrate_node.py to load Lane 2
 </div>""", unsafe_allow_html=True)
 
 
-# BIO3_REMOVE_20260722: _sec_bio renderer removed with the health tab.
+def _sec_bio() -> None:
+    if _health_tab_available:
+        try:
+            _render_health_tab()
+        except Exception as _he:
+            st.error(f"Health tab error: {_he}")
+    else:
+        st.markdown("""
+<div style='text-align:center;padding:40px;font-family:Share Tech Mono,monospace;
+    font-size:0.66rem;color:#555;letter-spacing:2px;'>
+    // BIOLOGICAL INTELLIGENCE MODULE NOT FOUND //<br>
+    Copy ui/sovereign_health_tab.py to load Lane 3
+</div>""", unsafe_allow_html=True)
 
 
 def _sec_intel() -> None:
@@ -10624,15 +10627,26 @@ def _sec_intel() -> None:
 
 
 def _sec_worldos() -> None:
-    """WORLD_OS_20260612 - autonomous council world over the real codebase."""
+    """Redirect legacy ``?sec=worldos`` links to the canonical HTML World.
+
+    World Mode has one runtime implementation: ``ui/sovereign_world.html``.
+    Older bookmarks used the removed ``ui.world_os`` Python component.  Keep
+    those links compatible without restoring a second World implementation.
+    """
+    st.session_state["active_facet"] = "world"
+    st.session_state["world_mode_enabled"] = True
+    st.session_state["genesis_vault_open"] = False
+    st.session_state["hub_anchor"] = "world"
+    st.session_state["sx_last_npc_tick"] = 0.0
+
     try:
-        try:
-            from ui.world_os import render_world_os
-        except Exception:
-            from world_os import render_world_os
-        render_world_os()
-    except Exception as _w_err:
-        st.caption(f"⬡ World OS not wired - world_os.py/ui.world_os: {type(_w_err).__name__}: {_w_err}")
+        if "sec" in st.query_params:
+            del st.query_params["sec"]
+    except Exception:
+        pass
+
+    st.info("Opening the canonical World interface…")
+    st.rerun()
 
 def _sec_forest() -> None:
     """LIVING EXCHANGE FOREST - operational world map (LIVING_FOREST_20260612).
@@ -10793,6 +10807,7 @@ _HUB_SECTIONS = {
     "forest":    ("🌲 LIVING EXCHANGE FOREST",                   _sec_forest),
     "substrate": ("🌐 SUBSTRATE NODE",                          _sec_substrate),
     "intel":     ("§  INTELLIGENCE - RESEARCH & SELF-EVOLUTION", _sec_intel),
+    "bio":       ("⬡ BIOLOGICAL INTELLIGENCE - LANE 3",         _sec_bio),
     "readme":    ("📋 POLARIZE - README",                        _sec_readme),
     "polaris":   ("❄️ POLARIS — AUTONOMOUS ARCHITECT",          _sec_polaris),
     "ivy":       ("🔥 IVY GENESIS SQUAD",                        _sec_ivy),
