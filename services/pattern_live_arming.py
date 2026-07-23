@@ -11,7 +11,9 @@ Sign-off doctrine (2026-07-17 research validation):
   positive cumulative PnL, at least two profitable closes, no >=10% loss, and
   no unresolved/open real transaction. Qualification is re-evaluated each fire.
 - Confirmations must be distinct by mint, position and discovery cohort.
-- Peak/MFE can never confirm a funded pattern.
+- A trusted persisted paper peak may confirm the historical Gold Runner cycle
+  and permit only the capped half-canary. Full size still requires the current
+  documentary live-canary maturity contract.
 - One L/H/X resets the active sequence (conservative until decay is validated).
 - This module cannot bypass oracle, wallet, route, capacity or executor gates.
 """
@@ -59,10 +61,27 @@ def _cohort_key(row: Any) -> str:
 
 
 def _row_outcome(row: Any) -> str:
+    """Reproduce the post-13-July Gold Runner confirmation contract.
+
+    The profitable pattern-upgrade state classified a completed SIM outcome from
+    the better of realised return and its trusted persisted high-water mark.
+    This restores pattern recognition when a genuine runner was observed but
+    exit leakage reduced the final realised result. Full funded size remains
+    governed separately by `_live_size_stage`.
+    """
     size = abs(_f(row["position_size_usd"], 0.0))
     pnl = _f(row["realized_pnl_usd"], 0.0)
     realised_pct = (pnl / size * 100.0) if size > 1e-12 else 0.0
-    return classify_realised(realised_pct)
+
+    peak_pct = None
+    try:
+        if "pattern_peak_pct" in row.keys() and row["pattern_peak_pct"] is not None:
+            peak_pct = _f(row["pattern_peak_pct"], realised_pct)
+    except Exception:
+        peak_pct = None
+
+    achieved_pct = max(realised_pct, peak_pct if peak_pct is not None else realised_pct)
+    return classify_realised(achieved_pct)
 
 
 
@@ -171,6 +190,14 @@ def evaluate_pattern_permission(
             "AND UPPER(COALESCE(p.funding_mode,'SIM'))='SIM'"
             if "funding_mode" in pp_cols else ""
         )
+        peak_candidates = [
+            name for name in ("held_peak_pct", "peak_pnl_pct", "max_pnl_pct", "final_exec_pct")
+            if name in pp_cols
+        ]
+        peak_expr = (
+            "COALESCE(" + ",".join(f"p.{name}" for name in peak_candidates) + ")"
+            if peak_candidates else "NULL"
+        )
         d_order = "d2.evaluated_at DESC, d2.id DESC" if "evaluated_at" in d_cols else "d2.id DESC"
         cluster_expr = "s.cluster_id" if "cluster_id" in s_cols else "NULL"
         dna_expr = "s.raw_dna_id" if "raw_dna_id" in s_cols else "NULL"
@@ -189,6 +216,7 @@ def evaluate_pattern_permission(
         sql = f"""
             SELECT p.id, p.mint_address, p.opened_at, p.closed_at,
                    p.position_size_usd, p.realized_pnl_usd,
+                   {peak_expr} AS pattern_peak_pct,
                    d.snapshot_id,
                    {cluster_expr} AS cluster_id,
                    {dna_expr} AS raw_dna_id,

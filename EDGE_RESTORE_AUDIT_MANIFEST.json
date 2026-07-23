@@ -1,0 +1,38 @@
+{
+  "base": "claudit 23_07_26(3).zip",
+  "strong_state_archives": [
+    {
+      "archive": "cluadit 14_07_26 (BEST STATE CONFIRMED AND UI UPGRADE)(2).zip",
+      "latest_internal_timestamp": "2026-07-14 00:24:46",
+      "role": "first post-13-July runner-lock proof"
+    },
+    {
+      "archive": "claudit 14_07_26 (123 GOLDEN LIVE TEST)(6).zip",
+      "latest_internal_timestamp": "2026-07-13 19:12:52",
+      "role": "early live-test control"
+    },
+    {
+      "archive": "cluadit 16_07_26 (123 GOLDEN PNL STATE PATTERN UPGRADE).zip",
+      "latest_internal_timestamp": "2026-07-15 22:50:06",
+      "role": "strongest pattern-upgrade spine"
+    },
+    {
+      "archive": "claudit 08_07_26 (GOLDEN MODEST WINNING STATE)(7).zip",
+      "latest_internal_timestamp": "2026-07-08 18:46:30",
+      "role": "pre-profit-lock discovery/Lilypad control"
+    }
+  ],
+  "replacement_files": [
+    "services/execution_engine.py",
+    "services/ingest_pipeline.py",
+    "services/pattern_live_arming.py"
+  ],
+  "restored_contracts": [
+    "bounded resolver ownership; no executor stacking after DNS stalls",
+    "4% paper hard-stop policy output is persisted instead of discarded",
+    "post-13-July 10pp giveback runner lock retained",
+    "trusted peak based pattern confirmation restored",
+    "current documentary live canary maturity retained for full size",
+    "current chain-fill and wallet truth retained"
+  ]
+}

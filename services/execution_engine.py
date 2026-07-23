@@ -4467,7 +4467,22 @@ def evaluate_exit_for_position(position: dict) -> None:
     # Fix: read stale_kill once and use it for the outer gate too.
     stale_kill = float(float(get_config_value("STALE_PRICE_FORCE_CLOSE_SECONDS", 300.0)))
     _stale_warn_threshold = min(stale_kill, 300.0)   # begin warning at 300s max
-    if current_price <= 0 or price_age > _stale_warn_threshold:
+    # EDGE_RESTORE_PAPER_LAST_TRUSTED_MARK_20260723:
+    # A post-entry paper mark does not become economically meaningless merely
+    # because the transport stopped refreshing it at the live-lane freshness
+    # boundary.  The previous unconditional stale branch returned before HARD
+    # STOP, runner-profit-lock, trailing and MAX_HOLD, allowing Guardian to
+    # become the only closer.  Keep REAL strict, but let SIM/PAPER evaluate the
+    # latest post-entry router mark for a bounded recovery window.
+    _paper_last_mark_max_age = max(
+        _stale_warn_threshold,
+        float(get_config_value("PAPER_EXIT_LAST_TRUSTED_MARK_MAX_AGE_SEC", 900.0)),
+    )
+    _paper_bounded_last_mark = bool(
+        (not _is_real_eval) and current_price > 0 and price_age <= _paper_last_mark_max_age
+    )
+
+    if current_price <= 0 or (price_age > _stale_warn_threshold and not _paper_bounded_last_mark):
         hold_s     = time.time() - opened_at
         max_hold_s = float(float(get_config_value("EXECUTOR_MAX_HOLD_SECONDS", 900.0)))
 
@@ -4577,12 +4592,21 @@ def evaluate_exit_for_position(position: dict) -> None:
                         closure_mode="normal",
                     )
                     return
-            log.warning(
-                "[PRICE_ROUTER] %s price stale (%.1fs) - skipping paper TP/SL. Warning: %s",
-                token_name, price_age, _pr_warning,
-            )
-            update_position_mark(position_id, current_price, 0.0, time.time(), source="router-stale")
-            return
+            if _paper_bounded_last_mark:
+                log.warning(
+                    "[PAPER_LAST_TRUSTED_MARK] pos=%d %s age=%.1fs <= %.1fs; "
+                    "evaluating HARD_STOP/RUNNER/TRAIL/MAX_HOLD from post-entry mark",
+                    position_id, token_name, price_age, _paper_last_mark_max_age,
+                )
+                # Fall through.  This mark came from price_router and is scoped
+                # post-entry; it may close PAPER only.  REAL never enters here.
+            else:
+                log.warning(
+                    "[PRICE_ROUTER] %s price stale (%.1fs) - skipping paper TP/SL. Warning: %s",
+                    token_name, price_age, _pr_warning,
+                )
+                update_position_mark(position_id, current_price, 0.0, time.time(), source="router-stale")
+                return
 
     # EXIT PRICE SANITY GUARD: reject if current_price > 1000x entry
     # Catches bad oracle data from ALL price sources before fake TP fires
@@ -4661,8 +4685,10 @@ def evaluate_exit_for_position(position: dict) -> None:
     # Config-driven hard stop. Signed-off operator intent is 4%.
     # Keep this explicit and auditable: system_config wins; 4.0 is the safe default.
     try:
-        _hard_stop_pct = max(0.5, min(20.0, abs(float(get_config_value("HARD_STOP_LOSS_PCT", 4.0)))))
+        _hard_stop_pct = abs(float(get_config_value("HARD_STOP_LOSS_PCT", 4.0)))
     except Exception:
+        _hard_stop_pct = 4.0
+    if not math.isfinite(_hard_stop_pct) or _hard_stop_pct <= 0.0:
         _hard_stop_pct = 4.0
     if pnl_pct <= -_hard_stop_pct:
         # SOURCE_CONSENSUS_HARDSTOP_GUARD (ported from 2026-06-26 infra).
@@ -4671,6 +4697,7 @@ def evaluate_exit_for_position(position: dict) -> None:
         # the next fresh mark confirm - this is what stops a single poison tick
         # closing a position at -37%/-71% unconfirmed. Trusted collapses close.
         _hs_defer = False
+        _stop_policy = None
         try:
             if _is_real_eval:
                 raise RuntimeError("real_position_hard_stop_never_defers")
@@ -4731,8 +4758,40 @@ def evaluate_exit_for_position(position: dict) -> None:
             log.debug("hard-stop consensus guard skipped pos=%d: %s", position_id, _hs_err)
         if _hs_defer:
             return  # do NOT close on this suspect mark; next fresh mark decides
-        close_position_canonical(position_id, current_price,
-            f"HARD_STOP_LOSS_{pnl_pct:.1f}pct", closure_mode="normal")
+        # Paper must consume the price-integrity policy result. The previous
+        # integration calculated a configured stop-floor fill and then discarded
+        # it, persisting a later raw mark such as -24%/-53%. Real positions never
+        # receive a synthetic fill and continue to settle from chain truth.
+        _hard_stop_exit_price = current_price
+        _hard_stop_exit_reason = f"HARD_STOP_LOSS_{pnl_pct:.1f}pct"
+        if not _is_real_eval and isinstance(_stop_policy, dict):
+            try:
+                _candidate_stop_price = float(_stop_policy.get("exit_price") or current_price)
+                if math.isfinite(_candidate_stop_price) and _candidate_stop_price > 0.0:
+                    _hard_stop_exit_price = _candidate_stop_price
+                _hard_stop_exit_reason = str(
+                    _stop_policy.get("exit_reason") or _hard_stop_exit_reason
+                )
+            except Exception:
+                _hard_stop_exit_price = current_price
+
+        close_position_canonical(
+            position_id,
+            _hard_stop_exit_price,
+            _hard_stop_exit_reason,
+            closure_mode="normal",
+        )
+        log.warning(
+            "HARD_STOP_EXECUTED pos=%d real=%s trigger_pct=%.4f threshold_pct=%.4f "
+            "trigger_price=%.12g persisted_exit_price=%.12g reason=%s",
+            position_id,
+            bool(_is_real_eval),
+            pnl_pct,
+            _hard_stop_pct,
+            current_price,
+            _hard_stop_exit_price,
+            _hard_stop_exit_reason,
+        )
         _log_cognition(token_name,
             f"HARD STOP: {token_name} hit -{_hard_stop_pct:.0f}% floor "
             f"at {pnl_pct:.2f}%. Tail risk contained. Capital protected.")

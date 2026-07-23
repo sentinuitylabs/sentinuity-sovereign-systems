@@ -696,40 +696,66 @@ def _resolve_one_safe(row: dict) -> tuple[int, str, int]:
 
 def _resolve_transactions() -> tuple[int, int, int]:
     """
-    Parallel RPC resolver — ThreadPoolExecutor with per-thread sessions.
-    max_workers=6 is safe for Helius free tier without hitting rate limits.
-    Was sequential: 100 rows x 200ms = 20s minimum.
-    Now parallel: 100 rows / 6 workers = ~3-4s.
+    Bounded parallel RPC resolver used by the 14/15/16 July profitable states.
+
+    A cycle owns exactly one executor and cannot create a successor pool until
+    every worker in the current pool has returned. This prevents unresolved DNS
+    workers accumulating across cycles after a network interruption.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 
     resolved = 0
-    failed   = 0
+    failed = 0
+    timed_out = 0
     released = _heal_stuck_claims()
-    claimed  = _claim_resolver_rows()
+    claimed = _claim_resolver_rows()
 
     if not claimed:
         update_heartbeat(HB_RESOLVER, "ALIVE", f"idle released={released}")
         return resolved, failed, released
 
-    max_workers = int(os.getenv("RESOLVER_MAX_WORKERS", "3"))
+    max_workers = max(1, int(os.getenv("RESOLVER_MAX_WORKERS", "3")))
+    try:
+        deadline = float(get_config_value("RESOLVER_BATCH_DEADLINE_SEC", 90.0)) \
+            if "get_config_value" in globals() else 90.0
+    except Exception:
+        deadline = 90.0
+    deadline = max(15.0, deadline)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    # Deliberately use the context-managed lifecycle shared by every supplied
+    # profitable archive. shutdown(wait=True) is the no-leak ownership boundary:
+    # the next cycle cannot stack another executor over unfinished DNS workers.
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="sentinuity-resolver") as pool:
         futures = {pool.submit(_resolve_one_safe, row): row for row in claimed}
-        for future in as_completed(futures, timeout=90):
-            try:
-                _, outcome, count = future.result()
-                if outcome == "resolved":
-                    resolved += count
-                else:
+        try:
+            for future in as_completed(futures, timeout=deadline):
+                try:
+                    _, outcome, count = future.result()
+                    if outcome == "resolved":
+                        resolved += count
+                    else:
+                        failed += 1
+                except Exception as exc:
                     failed += 1
-            except Exception as exc:
-                failed += 1
-                log.warning("Resolver future failed: %s", exc)
+                    log.warning("Resolver future failed: %s", exc)
+        except FuturesTimeoutError:
+            timed_out = sum(1 for future in futures if not future.done())
+            failed += timed_out
+            log.warning(
+                "Resolver deadline %.0fs reached: %d/%d unfinished. "
+                "The bounded executor will drain before another cycle starts.",
+                deadline, timed_out, len(futures),
+            )
 
-    note = f"resolved={resolved} failed={failed} released={released} workers={max_workers}"
+    note = (
+        f"resolved={resolved} failed={failed} released={released} "
+        f"workers={max_workers} bounded=1"
+        + (f" deadline_timeouts={timed_out}" if timed_out else "")
+    )
     update_heartbeat(
-        HB_RESOLVER, "ALIVE", note,
+        HB_RESOLVER,
+        "ALIVE",
+        note,
         work_processed=resolved,
         last_success_at=time.time() if resolved > 0 else None,
     )
