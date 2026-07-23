@@ -1835,5 +1835,3 @@ print("If console was already open, close/reopen it so it rereads the reset bala
 conn.close()
 
 ::END_SOLANA_WALLET_RESET_PY
-start "CouncilAutobuilder" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.council_autobuilder >> ""%LOG_PATH%\council_autobuilder.log"" 2>&1"
-
