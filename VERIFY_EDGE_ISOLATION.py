@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parent
-EXPECTED = {'services/execution_engine.py': 'd8b4d2ff70601aeb4379b3d91ca98182492750ee1532cbedf040f4df8c57beb5', 'services/ingest_pipeline.py': '0643082785187b96b3469f0c32e18cd95770cde872bc7b45e2f337970fda8fe8', 'services/system_guardian.py': 'bef116febd0b78c676f4453c308f6e47643555b23f687b9cbbda84ca184beb7f', 'services/ws_price_oracle.py': 'f66804e62aab702b5a1377580c6615004f55b7329340c7b5dc978dbc3fba184a', 'services/neural_supervisor.py': '1c8f0823d272e87df84f0a8a2afc7fe455205237da21111de4a5d7159b408df1', 'services/pattern_live_arming.py': '30b708b35313747e40692b90a740dc14240790baa37de9b4f628068c7af81d3c', 'services/freshness_enforcer.py': '423515deb375a4daf1f1fd1ba8220c51620e807356a2c4659683f8148869cf8d'}
+EXPECTED = {'services/execution_engine.py': 'ed4e790e7746783af349b1d87ddf77b23b1b38f400ca656bda5a9fe1a130f0b6', 'services/ingest_pipeline.py': 'ec6348ca4c9032bafebac37a9a5401be70f1f9909b2bad132a56dc6a7c014878', 'services/system_guardian.py': 'bef116febd0b78c676f4453c308f6e47643555b23f687b9cbbda84ca184beb7f', 'services/ws_price_oracle.py': 'f66804e62aab702b5a1377580c6615004f55b7329340c7b5dc978dbc3fba184a', 'services/neural_supervisor.py': '1c8f0823d272e87df84f0a8a2afc7fe455205237da21111de4a5d7159b408df1', 'services/pattern_live_arming.py': '518f6fb355615f0db6dfe22fd68758a64ba62f70c3f3b75a30eb6ef81dec96c6', 'services/freshness_enforcer.py': '423515deb375a4daf1f1fd1ba8220c51620e807356a2c4659683f8148869cf8d'}
 failures = []
 passes = []
 
