@@ -452,6 +452,7 @@ def _claim_qualifier_rows(limit: int) -> List[Dict[str, Any]]:
             _db_rows = conn.execute(
                 """
                 SELECT id, mint_address, mint_confidence, candidate_state,
+                       observed_price, price_updated_at,
                        COALESCE(first_seen_at, created_at, 0) AS created_at,
                        MAX(COALESCE(first_seen_at,0), COALESCE(qualified_at,0),
                            COALESCE(created_at,0)) AS operational_ts
@@ -461,11 +462,18 @@ def _claim_qualifier_rows(limit: int) -> List[Dict[str, Any]]:
                   AND (qualify_claimed_until IS NULL OR qualify_claimed_until < ?)
                   AND MAX(COALESCE(first_seen_at,0), COALESCE(qualified_at,0),
                           COALESCE(created_at,0)) >= ?
-                ORDER BY MAX(
-                    COALESCE(first_seen_at,0),
-                    COALESCE(qualified_at,0),
-                    COALESCE(created_at,0)
-                ) DESC LIMIT ?
+                ORDER BY
+                    CASE WHEN COALESCE(observed_price,0)>0
+                               AND COALESCE(price_updated_at,0)>0
+                         THEN 0 ELSE 1 END,
+                    COALESCE(mint_confidence,0) DESC,
+                    MAX(
+                        COALESCE(first_seen_at,0),
+                        COALESCE(qualified_at,0),
+                        COALESCE(created_at,0)
+                    ) DESC,
+                    id DESC
+                LIMIT ?
                 """,
                 # 1200s cutoff - gives signals time to be priced before qualification
                 # Was 600s - too tight when oracle stalls, signals expire before qualifying
@@ -1103,6 +1111,13 @@ def _qualifier_loop() -> None:
                 "QUALIFIER_POLL_INTERVAL", QUALIFIER_POLL_INTERVAL)))
             batch_size = int(int(get_config_value(
                 "QUALIFIER_BATCH_SIZE", QUALIFIER_BATCH_SIZE)))
+            # FLOW SIGN-OFF: qualification performs RPC/HTTP work serially.
+            # A configured batch of 50 allowed one cycle to monopolise the lane
+            # for many minutes. Clamp only the per-cycle claim; total throughput
+            # continues across rapid polls and every gate remains unchanged.
+            _hot_batch_cap = int(float(get_config_value(
+                "QUALIFIER_HOT_BATCH_CAP", 8)))
+            batch_size = max(1, min(batch_size, max(1, _hot_batch_cap), 16))
 
             # ── STALE BACKLOG PURGE (every 60s) ──────────────────────────────
             # Expire pending/qualified rows older than 15 min so they don't
@@ -1111,6 +1126,22 @@ def _qualifier_loop() -> None:
             if _now - _last_purge > 60:
                 try:
                     with get_connection() as _pc:
+                        # Flow sign-off: non-pump rows are rejected in one cheap
+                        # local statement instead of consuming curve/RPC cycles.
+                        _pc.execute("""
+                            UPDATE market_snapshots
+                            SET candidate_state='vetoed',
+                                quality_status='rejected',
+                                quality_reason='NOT_PUMP_TOKEN',
+                                execution_ready=0,
+                                latched=0,
+                                qualify_claimed_until=NULL
+                            WHERE candidate_state='pending'
+                              AND COALESCE(quality_status,'') NOT IN
+                                  ('qualified','rejected','error')
+                              AND LOWER(COALESCE(mint_address,'')) NOT LIKE '%pump'
+                        """)
+
                         # Phase A: DEAD threshold = 900s. Purge pending/qualified rows
                         # older than 900s - they cannot be fresh by definition.
                         _purged = _pc.execute("""

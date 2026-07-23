@@ -39,7 +39,17 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
+
 log = logging.getLogger("ws_oracle")
+
+# SENTINUITY_PROVIDER_FAILOVER_SIGNOFF_20260723
+# Provider variables are read at module import time, so load the repository .env
+# before constructing the RPC/WSS and API-key pools.
+try:
+    from dotenv import load_dotenv as _provider_load_dotenv
+    _provider_load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
+except Exception:
+    pass
 
 # SENTINUITY_NETWORK_OUTAGE_TRUTH_20260722
 # Rate-limit repeated transport failures and expose recent DNS-failure density
@@ -72,25 +82,71 @@ def _recent_dns_error_count(window_sec: float = 120.0) -> int:
 # /SENTINUITY_NETWORK_OUTAGE_TRUTH_20260722
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-HELIUS_WSS_URL   = os.getenv("HELIUS_WSS_URL", "")
-CHAINSTACK_WSS   = os.getenv("CHAINSTACK_WSS", "").strip()
-CHAINSTACK_RPC   = os.getenv("CHAINSTACK_RPC", "").strip()
-QUICKNODE_WSS    = os.getenv("QUICKNODE_WSS", "")
+HELIUS_RPC_URL          = os.getenv("HELIUS_RPC_URL", "").strip()
+HELIUS_RPC_URL_BACKUP   = os.getenv("HELIUS_RPC_URL_BACKUP", "").strip()
+HELIUS_WSS_URL          = os.getenv("HELIUS_WSS_URL", "").strip()
+HELIUS_WSS_URL_BACKUP   = os.getenv("HELIUS_WSS_URL_BACKUP", "").strip()
 
-# WSS provider priority - updated May 14 2026:
-# Chainstack SSL drops silently on long-lived connections (UNEXPECTED_EOF).
-# Helius promoted to primary - stable, Solana-native, free tier.
-# Chainstack demoted to fallback for HTTP RPC only.
-_PREFERRED_WSS = (
-    QUICKNODE_WSS
-    or HELIUS_WSS_URL
-    or os.getenv("SOLANA_WSS_URL", "")
-    or CHAINSTACK_WSS
-    or "wss://api.mainnet-beta.solana.com"
-)
-# QuickNode primary: 80M credits/month - original stable baseline
-# Helius second: Solana-native, reliable WSS
-# Chainstack third: HTTP OK but WSS SSL drops on long-lived connections
+CHAINSTACK_RPC          = os.getenv("CHAINSTACK_RPC", "").strip()
+CHAINSTACK_RPC_BACKUP   = os.getenv("CHAINSTACK_RPC_BACKUP", "").strip()
+CHAINSTACK_WSS          = os.getenv("CHAINSTACK_WSS", "").strip()
+CHAINSTACK_WSS_BACKUP   = os.getenv("CHAINSTACK_WSS_BACKUP", "").strip()
+
+QUICKNODE_RPC           = os.getenv("QUICKNODE_RPC", "").strip()
+QUICKNODE_WSS           = os.getenv("QUICKNODE_WSS", "").strip()
+SOLANA_RPC_URL          = os.getenv("SOLANA_RPC_URL", "").strip()
+SOLANA_WSS_URL          = os.getenv("SOLANA_WSS_URL", "").strip()
+
+def _provider_identity(url: str) -> str:
+    """Secret-safe endpoint identity used only for de-duplication."""
+    try:
+        from urllib.parse import urlsplit
+        p = urlsplit(str(url or "").strip())
+        # Include the path because Chainstack/QuickNode credentials commonly live
+        # there. Exclude query strings so Helius API keys are never logged.
+        return f"{p.scheme.lower()}://{(p.hostname or '').lower()}:{p.port or ''}{p.path or '/'}"
+    except Exception:
+        return str(url or "").strip().split("?", 1)[0].lower()
+
+def _dedupe_provider_urls(values) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        url = str(raw or "").strip()
+        if not url:
+            continue
+        ident = _provider_identity(url)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append(url)
+    return out
+
+# Prefer Helius, then a genuinely independent QuickNode, then the generic Solana
+# alias, then Chainstack. Duplicate aliases are collapsed instead of being
+# mistaken for independent failover.
+_WSS_CANDIDATES = _dedupe_provider_urls([
+    HELIUS_WSS_URL,
+    HELIUS_WSS_URL_BACKUP,
+    QUICKNODE_WSS,
+    SOLANA_WSS_URL,
+    CHAINSTACK_WSS,
+    CHAINSTACK_WSS_BACKUP,
+    "wss://api.mainnet-beta.solana.com",
+])
+_PREFERRED_WSS = _WSS_CANDIDATES[0] if _WSS_CANDIDATES else ""
+
+_RPC_CANDIDATES = _dedupe_provider_urls([
+    HELIUS_RPC_URL,
+    HELIUS_RPC_URL_BACKUP,
+    QUICKNODE_RPC,
+    SOLANA_RPC_URL,
+    CHAINSTACK_RPC,
+    CHAINSTACK_RPC_BACKUP,
+    os.getenv("HELIUS_RPC", "").strip(),  # legacy compatibility only
+])
+_RPC_FAIL_UNTIL: Dict[str, float] = {}
+_RPC_FAIL_LOCK = threading.Lock()
 
 POLL_OPEN_MINTS_SEC  = 1.0
 PING_INTERVAL_SEC    = 15.0
@@ -178,42 +234,131 @@ _stall_lock = threading.Lock()
 
 
 def _refresh_hot_set() -> None:
-    """Rebuild in-memory HOT_SET from DB. Runs every 10s via oracle loop.
+    """Rebuild the bounded oracle hot set in execution priority order.
 
-    Fix 1 (freshness continuity): includes recently-qualified rows
-    (first_seen_at/created_at within 120s) even if price_updated_at predates
-    the 45s HOT window. This ensures the oracle immediately fast-refreshes
-    newly qualified tokens so their price is current before the executor gate
-    fires - closing the launch-vs-runtime freshness gap.
+    Flow restore contract:
+      1. open positions are never dropped;
+      2. latched/execution-ready rows are next;
+      3. newest high-confidence pending/qualified candidates are warmed before
+         qualification, closing the pending-without-price starvation loop;
+      4. synthetic MTM rows are fallback-only and never displace real candidates.
+
+    This changes pricing allocation only. It does not qualify, latch, arm, size,
+    execute or alter any exit/runner contract.
     """
     global _hot_set, _hot_set_last_refresh
     now = time.time()
     if now - _hot_set_last_refresh < _HOT_SET_REFRESH_INTERVAL:
         return
+
     try:
         with _db_connect() as conn:
-            rows = conn.execute("""
-                SELECT mint_address FROM market_snapshots
-                WHERE price_status = 'priced'
-                  AND candidate_state IN ('qualified','latched','pending')
-                  AND latched = 0
-                  AND is_tradeable = 1
-                  AND (
-                      COALESCE(price_updated_at, 0) > ?
-                      OR COALESCE(first_seen_at, created_at, 0) > ?
-                  )
-                LIMIT 50
-            """, (now - 45, now - 120)).fetchall()
-            # Always include open position mints (HOT regardless of age)
-            open_rows = conn.execute(
-                "SELECT DISTINCT mint_address FROM paper_positions WHERE status='OPEN'"
-            ).fetchall()
-        new_hot = {r[0] for r in rows if r[0]} | {r[0] for r in open_rows if r[0]}
+            try:
+                cap = int(float(os.getenv("WS_ORACLE_HOT_SET_CAP", "40")))
+            except Exception:
+                cap = 40
+            cap = max(8, min(cap, 60))
+
+            ordered: list[str] = []
+            seen: set[str] = set()
+
+            def add_rows(rows) -> None:
+                for row in rows:
+                    try:
+                        mint = str(row["mint_address"]).strip()
+                    except Exception:
+                        mint = str(row[0]).strip() if row and row[0] else ""
+                    if mint and mint not in seen:
+                        seen.add(mint)
+                        ordered.append(mint)
+
+            # Tier 1: open positions — protected regardless of cap.
+            try:
+                add_rows(conn.execute("""
+                    SELECT DISTINCT mint_address
+                    FROM paper_positions
+                    WHERE UPPER(COALESCE(status,''))='OPEN'
+                      AND mint_address IS NOT NULL
+                      AND TRIM(mint_address)!=''
+                    ORDER BY COALESCE(opened_at,0) DESC
+                """).fetchall())
+            except Exception as exc:
+                log.debug("ws_oracle: hot open-position query skipped: %s", exc)
+            protected_floor = len(ordered)
+
+            # Tier 2: rows already handed to execution.
+            try:
+                add_rows(conn.execute("""
+                    SELECT mint_address
+                    FROM market_snapshots
+                    WHERE mint_address IS NOT NULL
+                      AND TRIM(mint_address)!=''
+                      AND COALESCE(latched,0)=1
+                      AND COALESCE(execution_ready,0) IN (1,2)
+                      AND LOWER(COALESCE(candidate_state,''))='latched'
+                    ORDER BY COALESCE(price_updated_at,created_at,timestamp,0) DESC,
+                             id DESC
+                    LIMIT 30
+                """).fetchall())
+            except Exception as exc:
+                log.debug("ws_oracle: hot latched query skipped: %s", exc)
+
+            # Tier 3: fresh real candidates. Confidence and recency are used only
+            # to allocate oracle coverage; all qualification and safety gates stay
+            # unchanged in market_intelligence.
+            try:
+                add_rows(conn.execute("""
+                    SELECT mint_address
+                    FROM market_snapshots
+                    WHERE mint_address IS NOT NULL
+                      AND TRIM(mint_address)!=''
+                      AND LOWER(COALESCE(candidate_state,'pending'))
+                          IN ('pending','qualified')
+                      AND LOWER(COALESCE(quality_status,'pending'))
+                          NOT IN ('rejected','error')
+                      AND COALESCE(latched,0)=0
+                      AND COALESCE(execution_ready,0)=0
+                      AND COALESCE(first_seen_at,created_at,timestamp,0) >= ?
+                    ORDER BY
+                      CASE WHEN COALESCE(observed_price,0)>0
+                                 AND COALESCE(price_updated_at,0)>0
+                           THEN 0 ELSE 1 END,
+                      COALESCE(mint_confidence,confidence_score,0) DESC,
+                      COALESCE(first_seen_at,created_at,timestamp,0) DESC,
+                      id DESC
+                    LIMIT 50
+                """, (now - 300.0,)).fetchall())
+            except Exception as exc:
+                log.debug("ws_oracle: hot pre-latch query skipped: %s", exc)
+
+            # Tier 4: only when the real hot path is otherwise empty.
+            if len(ordered) <= protected_floor:
+                try:
+                    add_rows(conn.execute("""
+                        SELECT mint_address
+                        FROM market_snapshots
+                        WHERE candidate_state='mtm'
+                          AND mint_address IS NOT NULL
+                          AND TRIM(mint_address)!=''
+                          AND COALESCE(price_updated_at,0)>?
+                        ORDER BY price_updated_at DESC, id DESC
+                        LIMIT 8
+                    """, (now - 120.0,)).fetchall())
+                except Exception:
+                    pass
+
+            keep_n = max(cap, protected_floor)
+            selected = ordered[:keep_n]
+
         with _hot_set_lock:
-            _hot_set = new_hot
+            _hot_set = set(selected)
         _hot_set_last_refresh = now
-    except Exception:
-        pass
+        log.info(
+            "[ORACLE_HOTSET_FLOW] total=%d cap=%d open_protected=%d",
+            len(selected), cap, protected_floor,
+        )
+    except Exception as exc:
+        log.debug("ws_oracle: hot_set flow refresh skipped: %s", exc)
 
 
 def _get_tier_write_interval(mint: str, price_updated_at: float) -> float:
@@ -285,63 +430,116 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> Set[str]:
 
 
 def _get_open_mints() -> List[str]:
-    """
-    HARD FIX V2: oracle tracks open positions + latched signals.
-    Prevents oracle going blind between trades, which caused mtm_ticks to go
-    stale and triggered the entry scan blocked gate permanently.
-    No fallback to historical mints - that caused 1011 WSS floods.
-    """
+    """Return the bounded subscription set in edge-safe priority order."""
     conn = None
     try:
         conn = _db_connect()
-        mints: set = set()
-
-        # Priority 1: OPEN positions (must always be tracked)
+        now = time.time()
         try:
-            rows = conn.execute(
-                "SELECT DISTINCT mint_address FROM paper_positions "
-                "WHERE mint_address IS NOT NULL AND TRIM(mint_address) != '' "
-                "AND UPPER(COALESCE(status, 'OPEN')) = 'OPEN'"
-            ).fetchall()
-            mints.update(str(r["mint_address"]).strip() for r in rows if str(r["mint_address"] or "").strip())
-        except Exception as e:
-            log.debug("ws_oracle: open positions query error: %s", e)
+            cap = int(float(os.getenv("WS_ORACLE_HOT_SET_CAP", "40")))
+        except Exception:
+            cap = 40
+        cap = max(8, min(cap, 60))
 
-        # Priority 2: latched signals ready for execution (keep oracle warm)
+        ordered: list[str] = []
+        seen: set[str] = set()
+
+        def add_rows(rows) -> None:
+            for row in rows:
+                try:
+                    mint = str(row["mint_address"]).strip()
+                except Exception:
+                    mint = str(row[0]).strip() if row and row[0] else ""
+                if mint and mint not in seen:
+                    seen.add(mint)
+                    ordered.append(mint)
+
+        # Open positions are protected.
         try:
-            rows = conn.execute(
-                "SELECT DISTINCT mint_address FROM market_snapshots "
-                "WHERE latched=1 AND COALESCE(execution_ready,0) IN (1,2) "
-                "AND mint_address IS NOT NULL AND TRIM(mint_address) != ''"
-            ).fetchall()
-            mints.update(str(r["mint_address"]).strip() for r in rows if str(r["mint_address"] or "").strip())
-        except Exception as e:
-            log.debug("ws_oracle: latched mints query error: %s", e)
+            add_rows(conn.execute("""
+                SELECT DISTINCT mint_address
+                FROM paper_positions
+                WHERE UPPER(COALESCE(status,''))='OPEN'
+                  AND mint_address IS NOT NULL
+                  AND TRIM(mint_address)!=''
+                ORDER BY COALESCE(opened_at,0) DESC
+            """).fetchall())
+        except Exception as exc:
+            log.debug("ws_oracle: open positions query error: %s", exc)
+        protected_floor = len(ordered)
 
-        # Priority 3: recent MTM candidates (keeps oracle warm during idle periods
-        # so mtm_ticks age stays low and the liveness gate never fires spuriously)
-        if not mints:
+        # Execution handoff rows.
+        try:
+            add_rows(conn.execute("""
+                SELECT mint_address
+                FROM market_snapshots
+                WHERE COALESCE(latched,0)=1
+                  AND COALESCE(execution_ready,0) IN (1,2)
+                  AND LOWER(COALESCE(candidate_state,''))='latched'
+                  AND mint_address IS NOT NULL
+                  AND TRIM(mint_address)!=''
+                ORDER BY COALESCE(price_updated_at,created_at,timestamp,0) DESC,
+                         id DESC
+                LIMIT 30
+            """).fetchall())
+        except Exception as exc:
+            log.debug("ws_oracle: latched mints query error: %s", exc)
+
+        # Fresh pending/qualified candidates. This is the missing bridge in the
+        # latest runtime: it only subscribes and writes real price truth.
+        try:
+            add_rows(conn.execute("""
+                SELECT mint_address
+                FROM market_snapshots
+                WHERE mint_address IS NOT NULL
+                  AND TRIM(mint_address)!=''
+                  AND LOWER(COALESCE(candidate_state,'pending'))
+                      IN ('pending','qualified')
+                  AND LOWER(COALESCE(quality_status,'pending'))
+                      NOT IN ('rejected','error')
+                  AND COALESCE(latched,0)=0
+                  AND COALESCE(execution_ready,0)=0
+                  AND COALESCE(first_seen_at,created_at,timestamp,0) >= ?
+                ORDER BY
+                  CASE WHEN COALESCE(observed_price,0)>0
+                             AND COALESCE(price_updated_at,0)>0
+                       THEN 0 ELSE 1 END,
+                  COALESCE(mint_confidence,confidence_score,0) DESC,
+                  COALESCE(first_seen_at,created_at,timestamp,0) DESC,
+                  id DESC
+                LIMIT 50
+            """, (now - 300.0,)).fetchall())
+        except Exception as exc:
+            log.debug("ws_oracle: pre-latch mints query error: %s", exc)
+
+        # MTM liveness filler only when no real work exists.
+        if len(ordered) <= protected_floor:
             try:
-                rows = conn.execute(
-                    "SELECT DISTINCT mint_address FROM market_snapshots "
-                    "WHERE candidate_state='mtm' "
-                    "AND mint_address IS NOT NULL AND TRIM(mint_address) != '' "
-                    "AND price_updated_at > 0 "
-                    "ORDER BY price_updated_at DESC LIMIT 20"
-                ).fetchall()
-                mints.update(str(r["mint_address"]).strip() for r in rows if str(r["mint_address"] or "").strip())
-            except Exception as e:
-                log.debug("ws_oracle: mtm mints query error: %s", e)
+                add_rows(conn.execute("""
+                    SELECT mint_address
+                    FROM market_snapshots
+                    WHERE candidate_state='mtm'
+                      AND mint_address IS NOT NULL
+                      AND TRIM(mint_address)!=''
+                      AND COALESCE(price_updated_at,0)>?
+                    ORDER BY price_updated_at DESC, id DESC
+                    LIMIT 8
+                """, (now - 120.0,)).fetchall())
+            except Exception:
+                pass
 
-        if mints:
-            log.debug("ws_oracle: tracking %d mints (open+latched+mtm)", len(mints))
-            return sorted(mints)
+        selected = ordered[:max(cap, protected_floor)]
+        if selected:
+            log.info(
+                "[ORACLE_SUBSCRIPTION_FLOW] total=%d cap=%d open_protected=%d",
+                len(selected), cap, protected_floor,
+            )
+            return selected
 
         log.warning("ws_oracle: no trackable mints - oracle idle")
         return []
-
-    except Exception as e:
-        log.warning("ws_oracle: get_open_mints error: %s", e)
+    except Exception as exc:
+        log.warning("ws_oracle: get_open_mints error: %s", exc)
         return []
     finally:
         try:
@@ -351,6 +549,7 @@ def _get_open_mints() -> List[str]:
             pass
 
 
+# ── LIVENESS TRACKING ─────────────────────────────────────────────────────────
 # ── LIVENESS TRACKING ─────────────────────────────────────────────────────────
 _oracle_last_write_ts: float = 0.0
 _oracle_last_write_lock = threading.Lock()
@@ -404,23 +603,87 @@ def _b58encode(b: bytes) -> str:
 
 
 def _rpc_call(method: str, params: list) -> Optional[dict]:
-    rpc_url = (os.getenv("CHAINSTACK_RPC", "").strip()
-               or os.getenv("QUICKNODE_RPC", "")
-               or os.getenv("HELIUS_RPC", ""))
-    if not rpc_url:
+    """Bounded, health-aware RPC failover.
+
+    Known-failed endpoints are quarantined temporarily so a 403/429/transport
+    failure cannot add a full timeout to every mint. Secrets are never logged.
+    """
+    if not _RPC_CANDIDATES:
         return None
+
+    now = time.time()
     try:
         import requests as _req
-        r = _req.post(
-            rpc_url,
-            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-            headers={"Content-Type": "application/json"},
-            timeout=10,
-        )
-        return r.json().get("result")
-    except Exception as e:
-        log.debug("ws_oracle: _rpc_call %s error: %s", method, e)
+    except Exception:
         return None
+
+    attempted = 0
+    for rpc_url in _RPC_CANDIDATES:
+        ident = _provider_identity(rpc_url)
+        with _RPC_FAIL_LOCK:
+            blocked_until = float(_RPC_FAIL_UNTIL.get(ident, 0.0))
+        if blocked_until > now:
+            continue
+
+        attempted += 1
+        try:
+            r = _req.post(
+                rpc_url,
+                json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "Sentinuity-Oracle/2026.07",
+                },
+                timeout=(2.5, 4.0),
+            )
+            if r.status_code == 200:
+                payload = r.json() or {}
+                if payload.get("error") is None:
+                    return payload.get("result")
+                cooldown = 30.0
+            elif r.status_code in (401, 403):
+                cooldown = 1800.0
+            elif r.status_code == 429:
+                cooldown = 300.0
+            elif 500 <= r.status_code < 600:
+                cooldown = 45.0
+            else:
+                cooldown = 90.0
+
+            with _RPC_FAIL_LOCK:
+                _RPC_FAIL_UNTIL[ident] = time.time() + cooldown
+            _log_rl(
+                f"rpc_http_{ident}",
+                log.warning,
+                "ws_oracle: RPC_PROVIDER_DEMOTED endpoint=%s status=%s cooldown=%.0fs",
+                ident,
+                r.status_code,
+                cooldown,
+                every=60.0,
+            )
+        except Exception as e:
+            err = str(e).lower()
+            cooldown = 90.0 if any(x in err for x in (
+                "getaddrinfo", "name resolution", "ssl", "eof",
+                "timeout", "connection", "reset",
+            )) else 45.0
+            with _RPC_FAIL_LOCK:
+                _RPC_FAIL_UNTIL[ident] = time.time() + cooldown
+            _log_rl(
+                f"rpc_transport_{ident}",
+                log.warning,
+                "ws_oracle: RPC_PROVIDER_TRANSPORT_FAIL endpoint=%s cooldown=%.0fs error=%s",
+                ident,
+                cooldown,
+                type(e).__name__,
+                every=60.0,
+            )
+
+        # Do not serially wait through an unbounded provider list.
+        if attempted >= 4:
+            break
+
+    return None
 
 
 def get_bonding_curve_pda(mint: str) -> Optional[str]:
@@ -560,65 +823,191 @@ try:
 except Exception:
     pass
 
-_BIRDEYE_KEY  = os.getenv("BIRDEYE_API_KEY", "").strip()
-_JUPITER_KEY  = os.getenv("JUPITER_PRICE_API_KEY", "").strip()
-_JUPITER_DNS_FAIL_UNTIL = 0.0  # epoch - retry Jupiter after cooldown expires (not permanent)
-if _BIRDEYE_KEY:
-    log.info("[API_KEYS] Birdeye key loaded (%s...)", _BIRDEYE_KEY[:8])
-if _JUPITER_KEY:
-    log.info("[API_KEYS] Jupiter key loaded (%s...)", _JUPITER_KEY[:8])
+_BIRDEYE_KEYS = [
+    value for value in (
+        os.getenv("BIRDEYE_API_KEY", "").strip(),
+        os.getenv("BIRDEYE_API_KEY_BACKUP", "").strip(),
+        os.getenv("BIRDEYE_API_KEY_BACKUP_TWO", "").strip(),
+    )
+    if value
+]
+# Remove accidentally duplicated keys without exposing their values.
+_BIRDEYE_KEYS = list(dict.fromkeys(_BIRDEYE_KEYS))
+_BIRDEYE_FAIL_UNTIL: Dict[str, float] = {}
+_BIRDEYE_ACTIVE_INDEX = 0
+_BIRDEYE_LOCK = threading.Lock()
+
+_JUPITER_KEY = (
+    os.getenv("JUPITER_PRICE_API_KEY", "").strip()
+    or os.getenv("JUPITER_API_KEY", "").strip()
+)
+_JUPITER_DNS_FAIL_UNTIL = 0.0
+_JUPITER_HTTP_FAIL_UNTIL = 0.0
+
+log.info(
+    "[API_KEYS] provider shape birdeye_keys=%d jupiter=%s rpc_endpoints=%d wss_endpoints=%d",
+    len(_BIRDEYE_KEYS),
+    bool(_JUPITER_KEY),
+    len(_RPC_CANDIDATES),
+    len(_WSS_CANDIDATES),
+)
 
 def _fetch_birdeye_price(mint: str) -> Optional[float]:
-    """Birdeye /defi/price - covers ALL pump.fun tokens including bonding curve phase.
-    Best source for pre-graduation tokens (<$69k mcap). 60 rpm free tier."""
-    if not _BIRDEYE_KEY:
+    """Birdeye price with primary -> backup -> backup-two rotation.
+
+    400 compute-unit exhaustion, 401/403 authentication failures and 429 rate
+    limits quarantine only the failing key. The first healthy key becomes the
+    preferred key for subsequent requests.
+    """
+    global _BIRDEYE_ACTIVE_INDEX
+    if not _BIRDEYE_KEYS:
         return None
+
     try:
         import requests as _req
-        r = _req.get(
-            "https://public-api.birdeye.so/defi/price",
-            params={"address": mint},
-            headers={"X-API-KEY": _BIRDEYE_KEY, "x-chain": "solana"},
-            timeout=4,
-        )
-        if r.status_code != 200:
-            return None
-        data = r.json().get("data") or {}
-        price = float(data.get("value") or 0)
-        return price if price > 0 else None
-    except Exception as e:
-        log.debug("_fetch_birdeye_price error mint=%s: %s", mint[:16], e)
+    except Exception:
         return None
+
+    now = time.time()
+    with _BIRDEYE_LOCK:
+        start = _BIRDEYE_ACTIVE_INDEX % len(_BIRDEYE_KEYS)
+
+    for offset in range(len(_BIRDEYE_KEYS)):
+        idx = (start + offset) % len(_BIRDEYE_KEYS)
+        key = _BIRDEYE_KEYS[idx]
+        key_id = hashlib.sha256(key.encode("utf-8")).hexdigest()[:10]
+
+        with _BIRDEYE_LOCK:
+            if float(_BIRDEYE_FAIL_UNTIL.get(key_id, 0.0)) > now:
+                continue
+
+        try:
+            r = _req.get(
+                "https://public-api.birdeye.so/defi/price",
+                params={"address": mint},
+                headers={
+                    "X-API-KEY": key,
+                    "x-chain": "solana",
+                    "User-Agent": "Sentinuity-Oracle/2026.07",
+                },
+                timeout=(2.5, 4.0),
+            )
+            body = r.text[:1000].lower()
+            if r.status_code == 200:
+                data = r.json().get("data") or {}
+                price = float(data.get("value") or 0)
+                if price > 0:
+                    with _BIRDEYE_LOCK:
+                        if _BIRDEYE_ACTIVE_INDEX != idx:
+                            log.warning(
+                                "[BIRDEYE_FAILOVER_ACTIVE] selected_slot=%d configured=%d",
+                                idx + 1,
+                                len(_BIRDEYE_KEYS),
+                            )
+                        _BIRDEYE_ACTIVE_INDEX = idx
+                    return price
+                # Valid response but no price: try the next provider/key.
+                continue
+
+            quota = (
+                "compute units usage limit exceeded" in body
+                or "usage limit exceeded" in body
+                or "quota" in body
+            )
+            if quota:
+                cooldown = 6 * 3600.0
+                reason = "quota"
+            elif r.status_code in (401, 403):
+                cooldown = 1800.0
+                reason = "auth"
+            elif r.status_code == 429:
+                cooldown = 300.0
+                reason = "rate_limit"
+            else:
+                cooldown = 90.0
+                reason = f"http_{r.status_code}"
+
+            with _BIRDEYE_LOCK:
+                _BIRDEYE_FAIL_UNTIL[key_id] = time.time() + cooldown
+            _log_rl(
+                f"birdeye_{key_id}_{reason}",
+                log.warning,
+                "[BIRDEYE_KEY_DEMOTED] slot=%d reason=%s cooldown=%.0fs",
+                idx + 1,
+                reason,
+                cooldown,
+                every=300.0,
+            )
+        except Exception as e:
+            with _BIRDEYE_LOCK:
+                _BIRDEYE_FAIL_UNTIL[key_id] = time.time() + 90.0
+            _log_rl(
+                f"birdeye_transport_{key_id}",
+                log.warning,
+                "[BIRDEYE_KEY_TRANSPORT_FAIL] slot=%d error=%s cooldown=90s",
+                idx + 1,
+                type(e).__name__,
+                every=120.0,
+            )
+
+    return None
 
 
 def _fetch_jupiter_price(mint: str) -> Optional[float]:
-    """Jupiter /price/v3 - best for post-graduation tokens (PumpSwap/Raydium).
-    Returns None for pre-graduation bonding curve tokens (not indexed by Jupiter).
-    Sets _JUPITER_DNS_FAIL_UNTIL to 5-minute cooldown on DNS failure - auto-retried after cooldown."""
-    global _JUPITER_DNS_FAIL_UNTIL
+    """Jupiter price with DNS/HTTP cooldown and env-alias compatibility."""
+    global _JUPITER_DNS_FAIL_UNTIL, _JUPITER_HTTP_FAIL_UNTIL
     if not _JUPITER_KEY:
         return None
+    if time.time() < max(_JUPITER_DNS_FAIL_UNTIL, _JUPITER_HTTP_FAIL_UNTIL):
+        return None
+
     try:
         import requests as _req
         r = _req.get(
             "https://api.jup.ag/price/v3",
             params={"ids": mint},
-            headers={"x-api-key": _JUPITER_KEY},
-            timeout=4,
+            headers={
+                "x-api-key": _JUPITER_KEY,
+                "User-Agent": "Sentinuity-Oracle/2026.07",
+                "Accept": "application/json",
+            },
+            timeout=(2.5, 4.0),
         )
         if r.status_code != 200:
+            if r.status_code in (401, 403):
+                _JUPITER_HTTP_FAIL_UNTIL = time.time() + 1800.0
+            elif r.status_code == 429:
+                _JUPITER_HTTP_FAIL_UNTIL = time.time() + 300.0
+            else:
+                _JUPITER_HTTP_FAIL_UNTIL = time.time() + 90.0
+            _log_rl(
+                f"jupiter_http_{r.status_code}",
+                log.warning,
+                "[JUPITER_PRICE_DEMOTED] status=%s cooldown_until=%.0f",
+                r.status_code,
+                _JUPITER_HTTP_FAIL_UNTIL,
+                every=300.0,
+            )
             return None
+
         data = r.json() or {}
         item = data.get(mint) or {}
         price = float(item.get("usdPrice") or 0)
         return price if price > 0 else None
     except Exception as e:
-        _err = str(e)
-        if "getaddrinfo" in _err or "NameResolution" in _err or "Failed to resolve" in _err:
-            _JUPITER_DNS_FAIL_UNTIL = time.time() + 300  # 5-min cooldown, not permanent
-            log.warning("_fetch_jupiter_price: DNS failure - Jupiter cooldown 300s (will retry)")
+        err = str(e)
+        if any(x in err for x in ("getaddrinfo", "NameResolution", "Failed to resolve")):
+            _JUPITER_DNS_FAIL_UNTIL = time.time() + 300.0
+            _record_dns_error()
+            _log_rl(
+                "jupiter_dns",
+                log.warning,
+                "_fetch_jupiter_price: DNS failure - cooldown 300s",
+                every=120.0,
+            )
         else:
-            log.debug("_fetch_jupiter_price error mint=%s: %s", mint[:16], e)
+            _JUPITER_HTTP_FAIL_UNTIL = time.time() + 90.0
+            log.debug("_fetch_jupiter_price error mint=%s: %s", mint[:16], type(e).__name__)
         return None
 
 
@@ -645,7 +1034,7 @@ def _fetch_best_fallback_price(mint: str) -> tuple[Optional[float], str]:
             return p, "jupiter"
 
     # ── 3. Birdeye - only if not CU-exhausted ───────────────────────────
-    _birdeye_ok = bool(_BIRDEYE_KEY)
+    _birdeye_ok = bool(_BIRDEYE_KEYS)
     if _birdeye_ok:
         try:
             from schema import get_config_value as _gcv
@@ -939,13 +1328,9 @@ class HeliusOracle:
     async def run(self) -> None:
         backoff = RECONNECT_DELAY_SEC
         # WSS fallback list - rotate on SSL errors (Chainstack drops silently)
-        _wss_candidates = [u for u in [
-            QUICKNODE_WSS,
-            HELIUS_WSS_URL,
-            os.getenv("SOLANA_WSS_URL",""),
-            CHAINSTACK_WSS,
-            "wss://api.mainnet-beta.solana.com",
-        ] if u and u.startswith("wss")]
+        _wss_candidates = [
+            u for u in _WSS_CANDIDATES if u and u.startswith("wss")
+        ]
         _wss_idx = 0
         _ssl_fail_count = 0
 
@@ -1649,7 +2034,7 @@ def start_ws_oracle() -> None:
 
     wss_url = _PREFERRED_WSS or HELIUS_WSS_URL or QUICKNODE_WSS
     if not wss_url:
-        log.error("ws_oracle: no WSS URL configured - set HELIUS_WSS_URL or QUICKNODE_WSS")
+        log.error("ws_oracle: no WSS URL configured - configure a Helius/QuickNode/Chainstack WSS endpoint")
         return
 
     def _run():
