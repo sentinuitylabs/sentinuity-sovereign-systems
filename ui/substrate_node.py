@@ -300,12 +300,7 @@ def _inject_css() -> None:
         .sn-balance-bar{{display:flex;gap:10px;flex-wrap:wrap;padding:8px 12px;
             border:1px solid rgba(153,69,255,0.2);border-radius:10px;
             background:rgba(5,2,16,0.6);margin-bottom:10px;}}
-        .sn-meter-wrap{{border:1px solid rgba(142,249,255,.24);border-radius:12px;padding:10px 12px;
-            background:linear-gradient(135deg,rgba(142,249,255,.055),rgba(153,69,255,.075));margin:8px 0;}}
-        .sn-meter-track{{height:8px;border-radius:999px;background:rgba(255,255,255,.055);overflow:hidden;
-            border:1px solid rgba(255,255,255,.08);}}
-        .sn-meter-fill{{height:100%;border-radius:999px;background:linear-gradient(90deg,{C_PURPLE},{C_CYAN},{C_GREEN});
-            box-shadow:0 0 16px rgba(142,249,255,.25);}}
+        /* sn-meter gradient track REMOVED — substrate lattice from ui.theme */
         .sn-feed-title{{display:flex;align-items:center;justify-content:space-between;gap:8px;
             font-family:Share Tech Mono,monospace;color:{C_CYAN};font-size:.68rem;letter-spacing:2px;
             text-transform:uppercase;margin:9px 0 5px;}}
@@ -394,6 +389,7 @@ def _load_position_table(conn: sqlite3.Connection, table: str, source_label: str
     return open_rows, closed_rows
 
 def _render_substrate_execution_meter(sd: dict, n_paper: int, n_live: int) -> None:
+    """Substrate-native execution lattice — discrete consensus cells, not a gradient bar."""
     prices = sd.get("prices", {})
     nodes = sd.get("nodes", {})
     now = _now()
@@ -418,22 +414,48 @@ def _render_substrate_execution_meter(sd: dict, n_paper: int, n_live: int) -> No
         edge_scores.append(_num(node.get("edge_score"), 0))
     readiness = min(100, int((fresh / max(1, len(SUBSTRATE_ASSETS))) * 45 + min(2, compressing + expanding) * 18 + min(2, ranked) * 9 + min(1, max(edge_scores or [0])) * 10))
     status = "PAPER SCANNING" if readiness < 60 else ("PAPER READY" if n_live == 0 else "LIVE SHADOWING")
-    chips = [
-        _metric_chip("fresh prices", f"{fresh}/{len(SUBSTRATE_ASSETS)}", C_GREEN if fresh >= 4 else C_GOLD),
-        _metric_chip("compression", str(compressing), C_PURPLE),
-        _metric_chip("expanding", str(expanding), C_GOLD if expanding else C_DIM),
-        _metric_chip("ranked", str(ranked), C_CYAN),
-        _metric_chip("open paper", str(n_paper), C_CYAN),
+    status_col = C_GREEN if readiness >= 60 else C_GOLD
+
+    cells = [
+        {"label": "FRESH PRICES", "value": f"{fresh}/{len(SUBSTRATE_ASSETS)}",
+         "state": "ok" if fresh >= 4 else ("warn" if fresh >= 2 else "bad")},
+        {"label": "COMPRESSION", "value": str(compressing),
+         "state": "ok" if compressing else "idle"},
+        {"label": "EXPANDING", "value": str(expanding),
+         "state": "ok" if expanding else "idle"},
+        {"label": "COUNCIL RANK", "value": str(ranked),
+         "state": "ok" if ranked else "idle"},
+        {"label": "OPEN PAPER", "value": str(n_paper),
+         "state": "ok" if n_paper else "idle"},
+        {"label": "LIVE SHADOW", "value": str(n_live),
+         "state": "ok" if n_live else "idle"},
     ]
-    st.markdown(
-        f"<div class='sn-meter-wrap'>"
-        f"<div class='sn-feed-title'><span>SUBSTRATE EXECUTION METER</span><span style='color:{C_GREEN if readiness >= 60 else C_GOLD};'>{status} · {readiness}%</span></div>"
-        f"<div class='sn-meter-track'><div class='sn-meter-fill' style='width:{max(4, readiness)}%;'></div></div>"
-        f"<div style='display:flex;flex-wrap:wrap;gap:4px;margin-top:8px;'>" + "".join(chips) + "</div>"
-        f"<div class='sn-muted' style='margin-top:5px;'>Meter is display-only: fresh macro prices + compression/expansion + council ranking + current paper slot usage.</div>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
+
+    try:
+        from ui.theme import substrate_lattice_html, substrate_lattice_css
+        html = substrate_lattice_css() + substrate_lattice_html(cells, status=f"{status} · {readiness}%", status_color=status_col)
+        st.markdown(html, unsafe_allow_html=True)
+    except Exception:
+        # Contract-safe fallback: still no gradient bar
+        bits = "".join(
+            f"<div style='flex:1;min-width:70px;border:1px solid rgba(142,249,255,.15);border-radius:8px;"
+            f"padding:8px 6px;text-align:center;background:rgba(5,2,16,.6)'>"
+            f"<div style='font:600 0.60rem Share Tech Mono;color:#9DB5A8;letter-spacing:.08em'>{c['label']}</div>"
+            f"<div style='font:700 0.82rem Orbitron;color:#14F195'>{c['value']}</div></div>"
+            for c in cells
+        )
+        st.markdown(
+            f"<div style='margin:8px 0;padding:12px;border:1px solid rgba(153,69,255,.22);border-radius:12px;"
+            f"background:rgba(9,2,18,.85)'>"
+            f"<div style='display:flex;justify-content:space-between;font:600 0.66rem Share Tech Mono;"
+            f"letter-spacing:.12em;color:#9945FF;margin-bottom:8px'>"
+            f"<span>SUBSTRATE EXECUTION LATTICE · DOCTRINE R2</span>"
+            f"<span style='color:{status_col}'>{status} · {readiness}%</span></div>"
+            f"<div style='display:flex;flex-wrap:wrap;gap:6px'>{bits}</div>"
+            f"<div style='margin-top:6px;font:500 0.60rem Share Tech Mono;color:#5A6B70'>"
+            f"Lattice is display-only: fresh macro prices + compression/expansion + council ranking + slot usage.</div></div>",
+            unsafe_allow_html=True,
+        )
 
 def _render_substrate_execution_feed(sd: dict) -> None:
     open_pos = sd.get("positions", []) or []

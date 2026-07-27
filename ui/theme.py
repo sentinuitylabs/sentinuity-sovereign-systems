@@ -310,3 +310,212 @@ def gate_rail_svg(gates: list[dict], paper_open: bool, live_open: bool,
                      f'{_html.escape(live_reason[:42])}</text>')
     parts.append("</svg>")
     return "".join(parts)
+
+
+# ── TIER-1 EXTENDED SEMANTIC ALIASES (UI_DOCTRINE_20260725) ───────────────────
+# Single source of truth. Callers MUST prefer these over ad-hoc hex.
+ANTIQUE_GOLD   = GOLD          # command / authority only
+EXEC_GREEN     = SOL_GREEN     # verified execution / healthy truth
+INTEL_CYAN     = CYAN          # observation / price truth (lower luminosity)
+COUNCIL_VIOLET = SOL_PURPLE    # cognition / council
+RISK_CRIMSON   = "#FF073A"     # real blockers, losses, broken services
+NEUTRAL_SMOKE  = "#5A6B70"     # waiting / unknown / not-wired
+GRAPHITE       = "#2A3038"
+MUTED_LAVENDER = "#7A6B8A"
+IVORY          = "#E8E0D0"
+OBSIDIAN       = "#05020F"
+
+# Geometry tokens (eliminate radius drift)
+RADIUS_CRYSTAL = "12px"
+RADIUS_CHIP    = "999px"
+RADIUS_NODE    = "50%"
+BORDER_FINE    = "1px"
+GLOW_AUTHORITY = "0 0 14px rgba(255,215,0,.22)"
+GLOW_EXEC      = "0 0 12px rgba(20,241,149,.28)"
+GLOW_INTEL     = "0 0 10px rgba(56,225,255,.22)"
+
+# Mobile breakpoint (shared)
+MOBILE_BP = "760px"
+
+
+def constellation_instrument_css() -> str:
+    """Shared CSS for the true constellation instrument (no commodity progress bar)."""
+    return f"""
+<style>
+/* CONSTELLATION INSTRUMENT — discrete celestial nodes + luminous path.
+   States: verified | pending | blocked | unavailable. Coherence, not fill %. */
+.sent-constellation {{
+  position:relative; margin:12px 0 18px; padding:16px 14px 14px;
+  border:{BORDER_FINE} solid rgba(20,241,149,.18); border-radius:{RADIUS_CRYSTAL};
+  background:radial-gradient(ellipse at 50% -30%,rgba(20,241,149,.07),transparent 55%),
+             linear-gradient(155deg,rgba(5,2,16,.88),rgba(3,8,12,.82));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.06);
+  backdrop-filter:blur(12px);
+}}
+.sent-constellation .sc-label {{
+  font:600 {SENT_MICRO}/1 'Share Tech Mono',monospace;
+  letter-spacing:.16em; color:{INTEL_CYAN}; text-transform:uppercase; margin-bottom:10px;
+}}
+.sent-constellation .sc-coherence {{
+  font:700 {SENT_LABEL}/1 'Orbitron',sans-serif; letter-spacing:.12em;
+  color:{EXEC_GREEN}; float:right;
+}}
+.sent-constellation .sc-path {{
+  display:flex; align-items:center; justify-content:space-between;
+  gap:0; overflow-x:auto; padding:8px 4px 12px; scrollbar-width:thin;
+}}
+.sent-constellation .sc-node {{
+  flex:0 0 auto; width:52px; text-align:center; position:relative;
+}}
+.sent-constellation .sc-core {{
+  width:36px; height:36px; margin:0 auto 6px; border-radius:{RADIUS_NODE};
+  border:1.5px solid {NEUTRAL_SMOKE}; background:rgba(8,10,14,.75);
+  display:grid; place-items:center; font-size:14px; color:{NEUTRAL_SMOKE};
+  transition:border-color .35s, box-shadow .35s, color .35s;
+}}
+.sent-constellation .sc-node.verified .sc-core {{
+  border-color:{EXEC_GREEN}; color:{EXEC_GREEN};
+  box-shadow:0 0 16px rgba(20,241,149,.35), inset 0 0 10px rgba(20,241,149,.12);
+}}
+.sent-constellation .sc-node.pending .sc-core {{
+  border-color:{INTEL_CYAN}; color:{INTEL_CYAN};
+  box-shadow:0 0 10px rgba(56,225,255,.2);
+}}
+.sent-constellation .sc-node.blocked .sc-core {{
+  border-color:{RISK_CRIMSON}; color:{RISK_CRIMSON};
+  box-shadow:0 0 14px rgba(255,7,58,.3);
+}}
+.sent-constellation .sc-node.unavailable .sc-core {{
+  border-color:{GRAPHITE}; color:{GRAPHITE}; opacity:.55;
+}}
+.sent-constellation .sc-cap {{
+  font:500 {SENT_MICRO}/1.25 'Share Tech Mono',monospace;
+  color:{MIST}; letter-spacing:.04em; max-width:64px; margin:0 auto;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}}
+.sent-constellation .sc-link {{
+  flex:1 1 12px; height:2px; min-width:8px; max-width:28px;
+  background:linear-gradient(90deg,rgba(20,241,149,.15),rgba(56,225,255,.25),rgba(20,241,149,.15));
+  opacity:.55;
+}}
+.sent-constellation .sc-link.on {{
+  background:linear-gradient(90deg,{EXEC_GREEN},{INTEL_CYAN});
+  opacity:.9; box-shadow:0 0 8px rgba(20,241,149,.4);
+}}
+.sent-constellation .sc-link.off {{
+  background:repeating-linear-gradient(90deg,{RISK_CRIMSON}66 0 4px,transparent 4px 8px);
+  opacity:.7;
+}}
+@media (max-width:{MOBILE_BP}) {{
+  .sent-constellation .sc-node {{ width:44px; }}
+  .sent-constellation .sc-core {{ width:30px; height:30px; font-size:12px; }}
+  .sent-constellation .sc-cap {{ font-size:0.60rem; max-width:48px; }}
+}}
+</style>
+"""
+
+
+def substrate_lattice_css() -> str:
+    """Shared CSS for Substrate-native execution lattice (not a progress bar)."""
+    return f"""
+<style>
+/* SUBSTRATE EXECUTION LATTICE — ledger rails + consensus cells.
+   Distinct from constellation. No rainbow fill bar. */
+.sent-lattice {{
+  position:relative; margin:10px 0 14px; padding:12px 12px 10px;
+  border:{BORDER_FINE} solid rgba(153,69,255,.22); border-radius:{RADIUS_CRYSTAL};
+  background:linear-gradient(145deg,rgba(9,2,18,.88),rgba(5,3,16,.9));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.05);
+}}
+.sent-lattice .sl-head {{
+  display:flex; justify-content:space-between; align-items:baseline;
+  font:600 {SENT_MICRO}/1 'Share Tech Mono',monospace;
+  letter-spacing:.14em; color:{COUNCIL_VIOLET}; text-transform:uppercase; margin-bottom:10px;
+}}
+.sent-lattice .sl-status {{
+  font:700 {SENT_LABEL}/1 'Orbitron',sans-serif; letter-spacing:.1em;
+}}
+.sent-lattice .sl-rails {{
+  display:grid; grid-template-columns:repeat(auto-fit,minmax(72px,1fr)); gap:6px;
+}}
+.sent-lattice .sl-cell {{
+  border:1px solid rgba(142,249,255,.12); border-radius:8px; padding:8px 6px;
+  background:rgba(3,6,12,.55); text-align:center; min-height:52px;
+}}
+.sent-lattice .sl-cell.ok {{
+  border-color:rgba(20,241,149,.45); background:rgba(20,241,149,.06);
+}}
+.sent-lattice .sl-cell.warn {{
+  border-color:rgba(255,179,71,.45); background:rgba(255,179,71,.05);
+}}
+.sent-lattice .sl-cell.bad {{
+  border-color:rgba(255,7,58,.5); background:rgba(255,7,58,.06);
+}}
+.sent-lattice .sl-cell.idle {{
+  border-color:rgba(90,107,112,.35); opacity:.65;
+}}
+.sent-lattice .sl-cell b {{
+  display:block; font:700 {SENT_MICRO}/1.2 'Share Tech Mono',monospace;
+  letter-spacing:.08em; color:{MIST}; margin-bottom:3px;
+}}
+.sent-lattice .sl-cell span {{
+  font:600 {SENT_BODY}/1 'Orbitron',sans-serif; color:{INTEL_CYAN};
+}}
+.sent-lattice .sl-cell.ok span {{ color:{EXEC_GREEN}; }}
+.sent-lattice .sl-cell.bad span {{ color:{RISK_CRIMSON}; }}
+@media (max-width:{MOBILE_BP}) {{
+  .sent-lattice .sl-rails {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
+  .sent-lattice .sl-cell {{ min-height:48px; padding:7px 5px; }}
+}}
+</style>
+"""
+
+
+def constellation_html(nodes: list[dict], coherence_label: str = "") -> str:
+    """
+    nodes: list of {{name, state}} where state in
+      verified | pending | blocked | unavailable
+    """
+    parts = ['<div class="sent-constellation">',
+             f'<div class="sc-label">CAPITAL ALIGNMENT'
+             f'<span class="sc-coherence">{_html.escape(coherence_label)}</span></div>',
+             '<div class="sc-path">']
+    for i, n in enumerate(nodes):
+        st = str(n.get("state", "unavailable")).lower()
+        if st not in ("verified", "pending", "blocked", "unavailable"):
+            st = "unavailable"
+        glyph = {"verified": "✦", "pending": "✧", "blocked": "✕", "unavailable": "·"}.get(st, "·")
+        parts.append(
+            f'<div class="sc-node {st}"><div class="sc-core">{glyph}</div>'
+            f'<div class="sc-cap">{_html.escape(str(n.get("name",""))[:10])}</div></div>'
+        )
+        if i < len(nodes) - 1:
+            nxt = str(nodes[i + 1].get("state", "")).lower()
+            link_cls = "on" if st == "verified" and nxt == "verified" else (
+                "off" if st == "blocked" or nxt == "blocked" else ""
+            )
+            parts.append(f'<div class="sc-link {link_cls}"></div>')
+    parts.append("</div></div>")
+    return "".join(parts)
+
+
+def substrate_lattice_html(cells: list[dict], status: str = "", status_color: str = EXEC_GREEN) -> str:
+    """
+    cells: list of {{label, value, state}} state in ok|warn|bad|idle
+    """
+    parts = [
+        '<div class="sent-lattice">',
+        f'<div class="sl-head"><span>SUBSTRATE EXECUTION LATTICE</span>'
+        f'<span class="sl-status" style="color:{status_color}">{_html.escape(status)}</span></div>',
+        '<div class="sl-rails">',
+    ]
+    for c in cells:
+        st = str(c.get("state", "idle")).lower()
+        if st not in ("ok", "warn", "bad", "idle"):
+            st = "idle"
+        parts.append(
+            f'<div class="sl-cell {st}"><b>{_html.escape(str(c.get("label",""))[:14])}</b>'
+            f'<span>{_html.escape(str(c.get("value","—")))}</span></div>'
+        )
+    parts.append("</div></div>")
+    return "".join(parts)

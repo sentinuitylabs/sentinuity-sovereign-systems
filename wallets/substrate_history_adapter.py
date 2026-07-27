@@ -152,7 +152,8 @@ def load_substrate_position_history(db_path: str,
                     continue
                 seen.add(key)
                 quarantined = (n["pnl_eligible"] == 0 or n["is_test"] == 1
-                               or n["is_legacy"] == 1)
+                               or n["is_legacy"] == 1
+                               or n["entry_truth_status"].upper() != "VERIFIED")
                 (out["quarantined"] if quarantined
                  else out["positions"]).append(n)
         for n in out["positions"]:

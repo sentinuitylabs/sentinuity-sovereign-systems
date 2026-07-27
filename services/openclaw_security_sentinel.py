@@ -59,10 +59,8 @@ DEFAULT_PORTS = "8501,8502,8000,8080,3000,5000,7860,11434"
 TUNNEL_PROCESS_KEYWORDS = ["ngrok", "cloudflared", "localtunnel", "lt.exe", "tailscale"]
 SCRIPT_EXTS = {".py", ".bat", ".ps1", ".cmd"}
 ROOT_SCRIPT_ALLOWLIST = {
-    "INSTALL_PUBLIC_PAPER.bat", "LAUNCH_PUBLIC_PAPER.bat", "STOP_SENTINUITY.bat",
-    "Launch_Sentinuity.bat", "Launch_Sentinuity_Public_Paper.bat",
-    "Shutdown_Sentinuity.bat", "Watchdog_Sentinuity.bat",
-    "Sentinuity_Watch.bat", "sovereign_security_preflight.py",
+    "Launch_Sentinuity.bat", "Restart_Sentinuity.bat", "Shutdown_Sentinuity.bat",
+    "Stop_All.bat", "Watchdog_Sentinuity.bat", "sovereign_security_preflight.py",
     "paranoid_scan.py", "p1_runtime_proof.py", "verify_autonomous_build_signoff.py",
     "launch_config.py", "set_live_mode.py",
 }

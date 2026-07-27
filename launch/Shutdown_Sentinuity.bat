@@ -1,9 +1,9 @@
-@echo off
+﻿@echo off
 setlocal EnableExtensions EnableDelayedExpansion
 title SENTINUITY SHUTDOWN + OFFLINE RETENTION SIGN-OFF
 
 for %%I in ("%~dp0..") do set "ROOT_PATH=%%~fI"
-if not exist "%ROOT_PATH%\services" set "ROOT_PATH=C:\Users\Polar\.openclaw\workspace\trading-bot"
+if not exist "%ROOT_PATH%\services" set "ROOT_PATH=C:\Path\To\Sentinuity"
 set "LOG_PATH=%ROOT_PATH%\logs"
 set "PS_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 
@@ -138,3 +138,4 @@ echo  Full log: %LOG_PATH%\shutdown_retention_runner.log
 echo ============================================================
 if "!NO_PAUSE!"=="0" pause
 exit /b 0
+

@@ -38,6 +38,7 @@ COINGECKO_IDS = {
 
 # Rolling price history for indicator calculation
 _price_history: dict[str, deque] = {s: deque(maxlen=50) for s in SYMBOLS}
+_history_hydrated = False
 
 
 def _ensure_schema(conn) -> None:
@@ -112,20 +113,39 @@ def _fetch_prices() -> dict[str, dict]:
 
 
 def _compute_rsi(prices: list[float], period: int = 14) -> float:
-    """RSI(14) from list of closing prices."""
+    """Simple RSI(period) over the latest *period deltas*, including zero legs."""
     if len(prices) < period + 1:
         return 50.0
-    deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
-    gains  = [d for d in deltas if d > 0]
-    losses = [-d for d in deltas if d < 0]
-    if not gains:  return 0.0
-    if not losses: return 100.0
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0: return 100.0
-    rs  = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return round(rsi, 2)
+    deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))][-period:]
+    gains = [max(d, 0.0) for d in deltas]
+    losses = [max(-d, 0.0) for d in deltas]
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    if avg_gain == 0:
+        return 0.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 2)
+
+
+def _hydrate_price_history(conn) -> int:
+    """Restore rolling history from durable rows after a process restart."""
+    global _history_hydrated
+    if _history_hydrated:
+        return 0
+    loaded = 0
+    for sym in SYMBOLS:
+        rows = conn.execute(
+            "SELECT price_usd FROM substrate_prices WHERE symbol=? AND price_usd>0 "
+            "ORDER BY fetched_at DESC LIMIT 50", (sym,),
+        ).fetchall()
+        for row in reversed(rows):
+            _price_history[sym].append(float(row[0]))
+            loaded += 1
+    _history_hydrated = True
+    log.info("[HISTORY_REHYDRATED] rows=%d", loaded)
+    return loaded
 
 
 def _compute_bollinger(prices: list[float], period: int = 20, std_mult: float = 2.0):
@@ -154,6 +174,7 @@ def _run_cycle() -> dict:
     with get_connection() as conn:
         conn.row_factory = _sq.Row
         _ensure_schema(conn)
+        _hydrate_price_history(conn)
         for sym, data in prices.items():
             price = data["price_usd"]
             if price <= 0:

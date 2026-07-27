@@ -159,7 +159,18 @@ try:
     _LIVE_TRADING_AVAILABLE = True
 except Exception:
     _LIVE_TRADING_AVAILABLE = False
+
+    def _live_buy(mint, size_usd, expected_price, position_id=None):
+        """Fail-closed live-buy stub used only when live_trading cannot import."""
+        return {
+            "success": False,
+            "error": "live_trading not available",
+            "mint": mint,
+            "position_id": position_id,
+        }
+
     def _live_sell(mint, qty, pos_id, price, emergency=False):
+        """Fail-closed live-sell stub used only when live_trading cannot import."""
         return {"success": False, "error": "live_trading not available"}
 
 # logging.basicConfig and log = ... moved above service imports - prevents [MARKET_INTEL] format collision
@@ -359,6 +370,10 @@ def ensure_executor_schema() -> None:
                 ("settlement_pnl_sol",   "REAL"),
                 ("fill_meta_json",       "TEXT"),
                 ("sim_parent_position_id", "INTEGER"),
+                # SIGNOFF_MEASUREMENT_20260727: explicit paper fee economics.
+                ("fee_usd",              "REAL DEFAULT 0"),
+                ("entry_fee_usd",        "REAL DEFAULT 0"),
+                ("exit_fee_usd",         "REAL DEFAULT 0"),
             ]:
                 if col not in pp_cols:
                     conn.execute(
@@ -1037,7 +1052,8 @@ def update_position_mark(
             # ── MARK TAPE (instrumentation, 2026-07-08) ──────────────────
             # Append-only tape of every mark the exit manager can see.
             # Powers dwell/velocity/shelf calibration + phantom-peak forensics.
-            # Rolling 48h retention. Failure here never affects marking.
+            # Configurable retention preserves enough path history for exit-policy
+            # replay. Default 30 days. Failure here never affects marking.
             try:
                 conn.execute(
                     "CREATE TABLE IF NOT EXISTS mark_tape ("
@@ -1059,8 +1075,13 @@ def update_position_mark(
                 # opportunistic cheap prune (~1 in 200 marks)
                 import random as _rnd
                 if _rnd.random() < 0.005:
+                    try:
+                        _retention_days = float(get_config_value("MARK_TAPE_RETENTION_DAYS", 30.0))
+                    except Exception:
+                        _retention_days = 30.0
+                    _retention_days = min(365.0, max(2.0, _retention_days))
                     conn.execute("DELETE FROM mark_tape WHERE ts < ?",
-                                 (time.time() - 172800,))
+                                 (time.time() - (_retention_days * 86400.0),))
             except Exception:
                 pass
             # ── /MARK TAPE ───────────────────────────────────────────────
@@ -1227,10 +1248,19 @@ def close_position_canonical(
         # Apply in paper mode only, never on scratch/zombie exits.
         if not force_scratch and not is_real_position:
             try:
-                _slip_exit = float(get_config_value("PAPER_SLIPPAGE_EXIT_PCT", 2.5)) / 100.0
-                _fee_exit  = float(get_config_value("PAPER_FEE_PER_TX_USD", 0.10))
-                exit_price = exit_price * (1.0 - _slip_exit)   # receive less on exit
-                pos_size_usd = max(0.0, pos_size_usd - _fee_exit)  # deduct exit fee
+                _is_synthetic_stop_floor = str(exit_reason or "").upper().startswith(
+                    "HARD_STOP_LOSS_CAPPED_"
+                )
+                _fee_exit = max(0.0, float(get_config_value("PAPER_FEE_PER_TX_USD", 0.10)))
+                # A synthetic paper stop-floor is already the complete configured
+                # accounting outcome. Applying generic exit slippage again would
+                # turn a signed-off -4% floor into roughly -6.4%. Raw observed loss
+                # and mark provenance are retained separately before this close.
+                if not _is_synthetic_stop_floor:
+                    _slip_exit = float(get_config_value("PAPER_SLIPPAGE_EXIT_PCT", 2.5)) / 100.0
+                    exit_price = exit_price * (1.0 - _slip_exit)
+                # Do not mutate trade notional. Fees are charged additively
+                # when canonical realised PnL is calculated below.
             except Exception:
                 pass  # never block a close on slippage calculation failure
 
@@ -1244,8 +1274,19 @@ def close_position_canonical(
             )
             exit_price = entry_price  # force scratch - no PnL credited
 
-        pnl_pct = ((exit_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0.0
-        pnl_usd = 0.0 if force_scratch else pos_size_usd * (pnl_pct / 100.0)
+        gross_pnl_pct = ((exit_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0.0
+        _paper_entry_fee = 0.0
+        _paper_exit_fee = 0.0
+        if not force_scratch and not is_real_position:
+            try:
+                _paper_entry_fee = max(0.0, float(position.get("entry_fee_usd") or get_config_value("PAPER_FEE_PER_TX_USD", 0.10)))
+                _paper_exit_fee = max(0.0, float(get_config_value("PAPER_FEE_PER_TX_USD", 0.10)))
+            except Exception:
+                _paper_entry_fee, _paper_exit_fee = 0.10, 0.10
+        _total_paper_fees = _paper_entry_fee + _paper_exit_fee
+        gross_pnl_usd = 0.0 if force_scratch else pos_size_usd * (gross_pnl_pct / 100.0)
+        pnl_usd = gross_pnl_usd - _total_paper_fees
+        pnl_pct = (pnl_usd / pos_size_usd * 100.0) if pos_size_usd > 0 else 0.0
 
         # SIGNOFF_CEILING_REMOVAL_20260715 (final directive item 4):
         # The previous SIGN-OFF FIX 1+5 clamped realized PnL to ±100% of stake.
@@ -1442,11 +1483,13 @@ def close_position_canonical(
                 SET status='CLOSED', exit_price=?, realized_pnl_usd=?,
                     unrealized_pnl_usd=0.0, closed_at=?,
                     last_price=?, last_marked_at=?, exit_reason=?,
-                    exit_category=?, win_loss=?{_fep_set}{_hp_set}
+                    exit_category=?, win_loss=?, fee_usd=?, entry_fee_usd=?,
+                    exit_fee_usd=?{_fep_set}{_hp_set}
                 WHERE id=?
                 """,
                 (exit_price, pnl_usd, now, exit_price, now, exit_reason,
-                 halt_reason, outcome) + _fep_val + _hp_val + (position_id,),
+                 halt_reason, outcome, _total_paper_fees, _paper_entry_fee,
+                 _paper_exit_fee) + _fep_val + _hp_val + (position_id,),
             )
 
             if is_real_position:
@@ -1843,7 +1886,7 @@ def scan_for_entries() -> int:
             return _time.time() - (_latest / 1000.0)
         except Exception as e:
             log.warning("[ORACLE AGE ERROR] %s", e)
-            return 0.0  # fail-open -- never block trading on DB error
+            return 9999.0  # fail-closed: unknown oracle truth cannot authorise new risk
 
     _oracle_age = _get_oracle_age_sec()
     log.info("[ORACLE AGE] %.1fs (gate=%.0fs)", _oracle_age, _oracle_gate_sec)
@@ -3001,9 +3044,10 @@ def scan_for_entries() -> int:
             # Apply in paper mode only so paper results reflect live reality.
             if True:  # paper/SIM lane always models slippage
                 _slip_entry = float(get_config_value("PAPER_SLIPPAGE_ENTRY_PCT", 1.5)) / 100.0
-                _fee_entry  = float(get_config_value("PAPER_FEE_PER_TX_USD", 0.10))
+                _fee_entry  = max(0.0, float(get_config_value("PAPER_FEE_PER_TX_USD", 0.10)))
                 entry_price = entry_price * (1.0 + _slip_entry)   # pay more on entry
-                pos_size_usd = pos_size_usd + _fee_entry           # deduct tx fee
+                # Fee is a cost, never additional inventory. Keep position_size_usd
+                # as trade notional and persist the fee separately.
                 quantity = pos_size_usd / entry_price if entry_price > 0 else quantity
 
             with get_connection() as conn:
@@ -3022,16 +3066,18 @@ def scan_for_entries() -> int:
                         last_price, last_marked_at,
                         entry_price_source, entry_price_ts,
                         confidence, entry_confidence, strategy_version,
-                        funding_mode, money_source, execution_source, mode
+                        funding_mode, money_source, execution_source, mode,
+                        fee_usd, entry_fee_usd, exit_fee_usd
                     ) VALUES (?, ?, 'OPEN', ?, ?, ?, ?, ?, 0.0, 0.0, ?, ?, ?, ?, ?, ?, ?, ?,
-                              'SIM', 'SIM_EQUITY', 'PAPER_ENGINE', 'paper')
+                              'SIM', 'SIM_EQUITY', 'PAPER_ENGINE', 'paper', ?, ?, 0.0)
                     """,
                     (token_name, mint, entry_price, quantity, pos_size_usd,
                      tp_pct, sl_pct, now, entry_price, now,
                      # Tag tide state in source so FLOOD trades are filterable
                      f"{price_source}|tide={str(get_config_value('MARKET_TIDE_STATE','NORMAL')).upper()}",
                      price_ts, conf, entry_conf,
-                     str(get_config_value("ACTIVE_STRATEGY_VERSION", "UNVERSIONED"))),
+                     str(get_config_value("ACTIVE_STRATEGY_VERSION", "UNVERSIONED")),
+                     _fee_entry, _fee_entry),
                 )
                 position_id = cur.lastrowid
 
@@ -3390,9 +3436,60 @@ def scan_for_entries() -> int:
                     if _day_loss >= _daily_limit:
                         log.critical("[LIVE_RISK_HALT] day_loss=$%.2f limit=$%.2f; no new live buy",
                                      _day_loss, _daily_limit)
+                        # SIGNOFF_FIRE_TRUTH_20260724: a candidate must never
+                        # disappear after FIRE_PATH_OPEN. Record the terminal
+                        # outcome and republish so the contract cannot linger
+                        # as fire-ready. No behaviour change: this path
+                        # already refused to buy.
+                        try:
+                            from services.fire_path_ledger import record_terminal as _fpt
+                            _fpt("CANCELLED_WITH_REASON", position_id=position_id, mint=mint,
+                                 stage="RISK_HALT",
+                                 reason=f"day_loss=${_day_loss:.2f}>=limit=${_daily_limit:.2f}",
+                                 would_fire_usd=_live_size)
+                        except Exception:
+                            pass
+                        try:
+                            _publish_decision_contract(
+                                verdict="BLOCKED",
+                                gates=[{"name": "LIVE_RISK", "state": "BLOCK",
+                                        "current": f"daily loss halt ${_day_loss:.2f} >= ${_daily_limit:.2f}",
+                                        "contract": "LIVE_DAILY_LOSS_LIMIT_USD"}],
+                                blocker="LIVE_RISK: daily loss limit reached",
+                                next_event="halt clears after 24h loss window",
+                                lane_armed=True, candidate_mint=mint,
+                                position_id=position_id,
+                                authored_by="execution_engine.risk_halt_terminal")
+                        except Exception:
+                            pass
                     elif _real_open >= _live_max or _real_exposure + _live_size > _exposure_cap + 1e-9:
                         log.warning("[LIVE_MIRROR_BLOCKED] open=%d/%d exposure=$%.2f cap=$%.2f",
                                     _real_open, _live_max, _real_exposure, _exposure_cap)
+                        # SIGNOFF_FIRE_TRUTH_20260724: terminal truth (see above).
+                        try:
+                            from services.fire_path_ledger import record_terminal as _fpt
+                            _fpt("CANCELLED_WITH_REASON", position_id=position_id, mint=mint,
+                                 stage="CAPS",
+                                 reason=(f"open={_real_open}/{_live_max} "
+                                         f"exposure=${_real_exposure:.2f}+${_live_size:.2f}"
+                                         f">cap=${_exposure_cap:.2f}"),
+                                 would_fire_usd=_live_size)
+                        except Exception:
+                            pass
+                        try:
+                            _publish_decision_contract(
+                                verdict="BLOCKED",
+                                gates=[{"name": "LIVE_CAPS", "state": "BLOCK",
+                                        "current": (f"open={_real_open}/{_live_max} "
+                                                    f"exposure=${_real_exposure:.2f} cap=${_exposure_cap:.2f}"),
+                                        "contract": "LIVE_MAX_OPEN_POSITIONS + LIVE_MAX_TOTAL_EXPOSURE_USD"}],
+                                blocker="LIVE_CAPS: open-position or exposure cap reached",
+                                next_event="capacity frees when a REAL position closes",
+                                lane_armed=True, candidate_mint=mint,
+                                position_id=position_id,
+                                authored_by="execution_engine.caps_terminal")
+                        except Exception:
+                            pass
                     else:
                         # Use the candidate's authoritative price timestamp, not the
                         # newly-created SIM row timestamp. Requiring a tick strictly after
@@ -3421,6 +3518,29 @@ def scan_for_entries() -> int:
                             except Exception:
                                 pass
                             _lr = {"success": False, "error": _coverage_reason}
+                            # SIGNOFF_FIRE_TRUTH_20260724: coverage refusal is a
+                            # canonical terminal, distinct from a submit failure.
+                            try:
+                                from services.fire_path_ledger import record_terminal as _fpt
+                                _fpt("CANCELLED_WITH_REASON", position_id=position_id,
+                                     mint=mint, stage="ORACLE_COVERAGE",
+                                     reason=str(_coverage_reason)[:300],
+                                     would_fire_usd=_live_size)
+                            except Exception:
+                                pass
+                            try:
+                                _publish_decision_contract(
+                                    verdict="BLOCKED",
+                                    gates=[{"name": "ORACLE_COVERAGE", "state": "BLOCK",
+                                            "current": str(_coverage_reason)[:200],
+                                            "contract": "_live_oracle_coverage_guard fresh trusted tick"}],
+                                    blocker=f"ORACLE_COVERAGE: {str(_coverage_reason)[:140]}",
+                                    next_event="coverage restores when the oracle marks this mint",
+                                    lane_armed=True, candidate_mint=mint,
+                                    position_id=position_id,
+                                    authored_by="execution_engine.coverage_terminal")
+                            except Exception:
+                                pass
                         else:
                             log.info(
                                 "[LIVE_ORACLE_COVERAGE_PASS] SIM pos=%d mint=%s %s",
@@ -3469,6 +3589,15 @@ def scan_for_entries() -> int:
                                 _real_conn.commit()
                             log.info("[LIVE_BUY] REAL pos=%d mirror_of=%d sig=%s actual_size=$%.2f",
                                      _real_id, position_id, _sig[:20], _actual_cost_usd)
+                            # SIGNOFF_FIRE_TRUTH_20260724: terminal SUBMITTED.
+                            try:
+                                from services.fire_path_ledger import record_terminal as _fpt
+                                _fpt("SUBMITTED", position_id=position_id, mint=mint,
+                                     stage="RECONCILED_ENTRY", tx_sig=_sig,
+                                     reason=f"real_pos={_real_id}",
+                                     would_fire_usd=_actual_cost_usd)
+                            except Exception:
+                                pass
                         elif _lr.get("confirmed"):
                             # Chain succeeded but fill metadata is unresolved. Persist a
                             # non-trading state so restart/reconciliation cannot lose funds.
@@ -3492,12 +3621,57 @@ def scan_for_entries() -> int:
                                 _real_conn.commit()
                             log.critical("[LIVE_BUY_UNRESOLVED] sig=%s mint=%s; live lane must remain blocked",
                                          _sig[:20], mint[:16])
+                            # SIGNOFF_FIRE_TRUTH_20260724: chain accepted the tx;
+                            # this IS a submission even though the fill is
+                            # unresolved. Terminal SUBMITTED with the state noted.
+                            try:
+                                from services.fire_path_ledger import record_terminal as _fpt
+                                _fpt("SUBMITTED", position_id=position_id, mint=mint,
+                                     stage="BUY_CONFIRMED_UNRESOLVED", tx_sig=_sig,
+                                     reason="fill unresolved; settlement recovery owns it",
+                                     would_fire_usd=_live_size)
+                            except Exception:
+                                pass
                         else:
                             log.warning("[LIVE_BUY_FAIL] SIM pos=%d error=%s; paper remains OPEN, no REAL row",
                                         position_id, _lr.get("error"))
+                            # SIGNOFF_FIRE_TRUTH_20260724: terminal truth. The
+                            # coverage branch already recorded its own terminal;
+                            # only a genuine submit-path failure lands here with
+                            # a distinct error string.
+                            if str(_lr.get("error") or "") != str(locals().get("_coverage_reason") or "__none__"):
+                                try:
+                                    from services.fire_path_ledger import record_terminal as _fpt
+                                    _fpt("SUBMISSION_FAILED", position_id=position_id,
+                                         mint=mint, stage="EXECUTE_LIVE_BUY",
+                                         reason=str(_lr.get("error"))[:300],
+                                         would_fire_usd=_live_size)
+                                except Exception:
+                                    pass
+                                try:
+                                    _publish_decision_contract(
+                                        verdict="BLOCKED",
+                                        gates=[{"name": "LIVE_SUBMIT", "state": "BLOCK",
+                                                "current": str(_lr.get("error"))[:200],
+                                                "contract": "preflight -> quote -> swap -> confirm"}],
+                                        blocker=f"LIVE_SUBMIT: {str(_lr.get('error'))[:140]}",
+                                        next_event="resolve the submit failure above",
+                                        lane_armed=True, candidate_mint=mint,
+                                        position_id=position_id,
+                                        authored_by="execution_engine.submit_fail_terminal")
+                                except Exception:
+                                    pass
                 except Exception as _le:
                     log.error("[LIVE_BUY_ERROR] SIM pos=%d: %s; paper remains OPEN, no REAL row",
                               position_id, _le)
+                    # SIGNOFF_FIRE_TRUTH_20260724: terminal truth on the
+                    # exception path too (republish below already existed).
+                    try:
+                        from services.fire_path_ledger import record_terminal as _fpt
+                        _fpt("BLOCKED_POST_VERDICT", position_id=position_id, mint=mint,
+                             stage="LIVE_MIRROR_EXCEPTION", reason=str(_le)[:300])
+                    except Exception:
+                        pass
                     # SIZING_GATE_V2_20260721: a candidate must never disappear after
                     # FIRE_PATH_OPEN. Republish the executor contract as
                     # BLOCKED with the exact mirror error so the UI shows a
@@ -4691,6 +4865,23 @@ def evaluate_exit_for_position(position: dict) -> None:
     if not math.isfinite(_hard_stop_pct) or _hard_stop_pct <= 0.0:
         _hard_stop_pct = 4.0
     if pnl_pct <= -_hard_stop_pct:
+        # RUNNER GAP TRUTH: a latched runner that gaps through both its trail and
+        # hard stop must exit at the obtainable mark, never at an invented floor.
+        # Persist the failure mode so cadence/coverage can be audited directly.
+        try:
+            _trusted_peak_for_gap = max(float(position.get("trusted_peak_pct") or 0.0),
+                                        float(position.get("runner_peak_pct") or 0.0),
+                                        float(position.get("runner_latch_peak_pct") or 0.0),
+                                        float(position.get("peak_pnl_pct") or 0.0))
+            if _trusted_peak_for_gap >= 20.0:
+                log.error("[RUNNER_GAP_THROUGH_FLOOR] pos=%d mint=%s trusted_peak=%.2f current=%.2f eval_interval=%.2f",
+                          position_id,mint[:16],_trusted_peak_for_gap,pnl_pct,_runner_aware_poll_interval())
+                try:
+                    with get_connection() as _gc:
+                        _gc.execute("UPDATE paper_positions SET exit_quality_tag='RUNNER_GAP_THROUGH_FLOOR', exit_gap_from_peak_pct=? WHERE id=?",
+                                    (_trusted_peak_for_gap-pnl_pct,position_id)); _gc.commit()
+                except Exception: pass
+        except Exception: pass
         # SOURCE_CONSENSUS_HARDSTOP_GUARD (ported from 2026-06-26 infra).
         # Paper only: ask the price-integrity contract whether this catastrophic
         # mark came from a suspect/outlier source. If so, DEFER the close and let
@@ -4774,6 +4965,48 @@ def evaluate_exit_for_position(position: dict) -> None:
                 )
             except Exception:
                 _hard_stop_exit_price = current_price
+
+        # Preserve market truth before SIM accounting applies the configured
+        # stop floor. These fields allow audits to distinguish observed collapse
+        # from credited paper PnL without training on an invented raw outcome.
+        if not _is_real_eval:
+            try:
+                with get_connection() as _raw_stop_conn:
+                    _raw_stop_cols = {
+                        r["name"] for r in _raw_stop_conn.execute(
+                            "PRAGMA table_info(paper_positions)"
+                        ).fetchall()
+                    }
+                    _raw_sets, _raw_vals = [], []
+                    for _col, _val in (
+                        ("raw_pnl_pct_preclamp", float(pnl_pct)),
+                        ("raw_pnl_usd_preclamp", float(position_size_usd) * float(pnl_pct) / 100.0),
+                        ("raw_realized_pnl_pct", float(pnl_pct)),
+                        ("raw_realized_pnl_usd", float(position_size_usd) * float(pnl_pct) / 100.0),
+                        ("trusted_realized_pnl_pct", -float(_hard_stop_pct)),
+                        ("trusted_realized_pnl_usd", -float(position_size_usd) * float(_hard_stop_pct) / 100.0),
+                        ("pnl_integrity_status", "CAPPED_STOP_FLOOR"),
+                        ("pnl_integrity_reason", str(
+                            (_stop_policy or {}).get("audit_reason")
+                            if isinstance(_stop_policy, dict) else "UNIVERSAL_PAPER_STOP_FLOOR"
+                        )[:400]),
+                        ("close_price_source", str(
+                            (_stop_policy or {}).get("exit_mark_source")
+                            if isinstance(_stop_policy, dict) else (position.get("mark_source") or "engine")
+                        )[:120]),
+                    ):
+                        if _col in _raw_stop_cols:
+                            _raw_sets.append(f"{_col}=?")
+                            _raw_vals.append(_val)
+                    if _raw_sets:
+                        _raw_vals.append(position_id)
+                        _raw_stop_conn.execute(
+                            "UPDATE paper_positions SET " + ", ".join(_raw_sets) + " WHERE id=?",
+                            tuple(_raw_vals),
+                        )
+                        _raw_stop_conn.commit()
+            except Exception as _raw_stop_err:
+                log.warning("HARD_STOP_RAW_AUDIT_WRITE_FAIL pos=%d err=%s", position_id, _raw_stop_err)
 
         close_position_canonical(
             position_id,
@@ -5468,7 +5701,7 @@ def dry_run_entry_scan(limit: int = 30) -> list:
         _ic.close()
         _oracle_age = (now - _latest / 1000.0) if _latest else 9999.0
     except Exception:
-        _oracle_age = 0.0  # fail-open
+        _oracle_age = 9999.0  # fail-closed: unknown oracle truth cannot authorise new risk
 
     oracle_blocked = _oracle_age > _oracle_gate_sec and count_open_positions() > 0
 
@@ -5712,6 +5945,27 @@ def print_same_eyes_report() -> None:
     print(f"SUMMARY: {enters} WOULD_ENTER  {blocked} BLOCKED  ({len(results)} candidates)")
 
 
+def _runner_aware_poll_interval() -> float:
+    """Tighten evaluator cadence only while a trusted runner is open.
+
+    Price-cache ingestion remains event-driven/sub-second; this controls how
+    quickly the exit authority consumes those marks. It never invents a fill.
+    """
+    try:
+        with get_connection() as _c:
+            row=_c.execute("""SELECT MAX(COALESCE(trusted_peak_pct,runner_peak_pct,
+                runner_latch_peak_pct,peak_pnl_pct,0)) FROM paper_positions
+                WHERE UPPER(COALESCE(status,''))='OPEN'""").fetchone()
+        peak=float(row[0] or 0.0) if row else 0.0
+        if peak >= 150.0: return float(get_config_value("RUNNER_EVAL_INTERVAL_150_SEC", "0.25"))
+        if peak >= 100.0: return float(get_config_value("RUNNER_EVAL_INTERVAL_100_SEC", "0.40"))
+        if peak >= 50.0: return float(get_config_value("RUNNER_EVAL_INTERVAL_50_SEC", "0.75"))
+        if peak >= 20.0: return float(get_config_value("RUNNER_EVAL_INTERVAL_20_SEC", "1.20"))
+    except Exception:
+        pass
+    return POLL_INTERVAL
+
+
 def run() -> None:
     ensure_executor_schema()
     # Start cognition writer thread before first log call - avoids lazy-init
@@ -5830,7 +6084,7 @@ def run() -> None:
             log.exception("Execution engine loop error: %s", e)
             update_heartbeat(SERVICE_NAME, "ERROR", str(e)[:120])
 
-        time.sleep(POLL_INTERVAL)
+        time.sleep(max(0.20, _runner_aware_poll_interval()))
 
 
 

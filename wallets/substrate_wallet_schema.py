@@ -227,6 +227,16 @@ CREATE TABLE IF NOT EXISTS substrate_positions(
   realized_pnl REAL DEFAULT 0,
   raw_json TEXT
 );
+CREATE TABLE IF NOT EXISTS substrate_rejections(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  opportunity_id INTEGER NOT NULL,
+  created_at REAL NOT NULL,
+  reason TEXT NOT NULL,
+  detail TEXT,
+  UNIQUE(opportunity_id, reason)
+);
+CREATE INDEX IF NOT EXISTS idx_substrate_rejections_created
+  ON substrate_rejections(created_at DESC);
 CREATE TABLE IF NOT EXISTS substrate_execution_audit(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   created_at REAL,

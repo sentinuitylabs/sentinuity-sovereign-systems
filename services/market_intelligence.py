@@ -463,15 +463,21 @@ def _claim_qualifier_rows(limit: int) -> List[Dict[str, Any]]:
                   AND MAX(COALESCE(first_seen_at,0), COALESCE(qualified_at,0),
                           COALESCE(created_at,0)) >= ?
                 ORDER BY
+                    -- SIGNOFF_FLOW_LATENCY_20260724: priced-first is kept
+                    -- (qualifying an unpriced row burns a claim cycle), but
+                    -- RECENCY now outranks confidence. Confidence-first let
+                    -- older enriched rows repeatedly pre-empt fresh priced
+                    -- candidates during bursts. Scheduling only — every
+                    -- qualification gate and threshold is unchanged.
                     CASE WHEN COALESCE(observed_price,0)>0
                                AND COALESCE(price_updated_at,0)>0
                          THEN 0 ELSE 1 END,
-                    COALESCE(mint_confidence,0) DESC,
                     MAX(
                         COALESCE(first_seen_at,0),
                         COALESCE(qualified_at,0),
                         COALESCE(created_at,0)
                     ) DESC,
+                    COALESCE(mint_confidence,0) DESC,
                     id DESC
                 LIMIT ?
                 """,
@@ -494,6 +500,16 @@ def _claim_qualifier_rows(limit: int) -> List[Dict[str, Any]]:
             conn.commit()
     except Exception as e:
         log.warning("Signal claim pathway encountered dissonance: %s", e)
+    # SIGNOFF_FLOW_LATENCY_20260724: stage telemetry (additive, best-effort).
+    try:
+        from services.stage_telemetry import record_stage as _tel
+        for _c in claimed:
+            _tel("QUALIFY_CLAIMED", str(_c.get("mint_address") or ""),
+                 snapshot_id=int(_c.get("id") or 0) or None,
+                 source="qualifier",
+                 discovered_ts=float(_c.get("created_at") or 0.0) or None)
+    except Exception:
+        pass
     return claimed
 
 
@@ -603,6 +619,29 @@ def _write_qualifier_result(
             conn.commit()
     except Exception as e:
         log.warning("Signal write pathway fractured for row=%d: %s", row_id, e)
+    # SIGNOFF_FLOW_LATENCY_20260724: stage telemetry (additive, best-effort).
+    try:
+        from services.stage_telemetry import record_stage as _tel
+        _tel_mint = str(metrics.get("mint_address") or metrics.get("mint") or "")
+        if not _tel_mint and row_id:
+            try:
+                with get_connection() as _mc:
+                    _mr = _mc.execute(
+                        "SELECT mint_address FROM market_snapshots WHERE id=?",
+                        (row_id,),
+                    ).fetchone()
+                    _tel_mint = str(_mr[0]) if _mr and _mr[0] else ""
+            except Exception:
+                _tel_mint = ""
+        _tel("QUALIFY_COMPLETE",
+             _tel_mint,
+             snapshot_id=int(row_id) if row_id else None,
+             source="qualifier",
+             success=(quality_status == "qualified"),
+             failure_reason=None if quality_status == "qualified"
+             else str(quality_reason)[:200])
+    except Exception:
+        pass
 
 
 def _mark_qualifier_error(row_id: int, reason: str) -> None:
@@ -1690,47 +1729,118 @@ def _append_mtm_rows(rows: List[Tuple[str, float]], now: float) -> int:
     return inserted
 
 
+_PRICER_TLS = threading.local()
+
+
+def _pricer_thread_session() -> requests.Session:
+    """One resilient session per pricer worker thread (Session is not
+    guaranteed thread-safe for concurrent use)."""
+    sess = getattr(_PRICER_TLS, "session", None)
+    if sess is None:
+        sess = _build_resilient_session()
+        _PRICER_TLS.session = sess
+    return sess
+
+
+def _resolve_price_for_row(row, price_map: Dict[str, dict], sol_usd_now: float):
+    """Network-only price resolution for one row. IDENTICAL provider
+    waterfall and precedence to the previous serial implementation:
+    bonding curve → pump.fun → DexScreener → Jupiter batch map.
+    No DB access in this function — it is safe to run in a worker thread."""
+    mint = row["mint_address"]
+    session = _pricer_thread_session()
+    pv = None
+    src = None
+
+    if sol_usd_now > 0:
+        pv = _fetch_price_bonding_curve(session, mint, sol_usd_now)
+        if pv:
+            src = "bonding_curve"
+
+    if pv is None:
+        pv = _fetch_price_pumpfun(session, mint)
+        if pv:
+            src = "pumpfun"
+
+    if pv is None:
+        pv = _fetch_price_dexscreener(session, mint)
+        if pv:
+            src = "dexscreener"
+
+    if pv is None:
+        usd = (price_map.get(mint, {}) or {}).get("usdPrice")
+        if usd is not None:
+            try:
+                parsed = float(usd)
+                if parsed > 0:
+                    pv = parsed
+                    src = "jupiter_batch"
+            except (TypeError, ValueError):
+                pv = None
+
+    return row, pv, src
+
+
 def _update_price_rows(
     session: requests.Session,
     rows: list,
     price_map: Dict[str, dict],
     max_attempts: int,
 ) -> Tuple[int, int, int]:
+    """SIGNOFF_FLOW_LATENCY_20260724 — parallel resolution, serial writes.
+
+    Root cause of the measured 268s median / 434s p90 discovery→first-price
+    lag: this function resolved each mint SERIALLY with up to three network
+    calls (RPC getAccountInfo ≤5s, pump.fun ≤4s, DexScreener ≤4s). During a
+    launch burst of 50–100 unpriced rows one pricing pass took several
+    minutes, so a fresh candidate's first trusted price waited behind the
+    entire queue — the audit's dominant front-half bottleneck.
+
+    Fix: the NETWORK phase now fans out across a small bounded thread pool
+    (PRICER_MAX_WORKERS, default 6). The provider waterfall, precedence,
+    validity checks, retry/dead accounting and — critically — every DB write
+    remain serial and byte-identical in semantics. SOL/USD is fetched once
+    per call (it was already 30s-cached; the per-row call was wasted work).
+    No gate, threshold or qualification rule is touched.
+    """
     priced = retried = dead = 0
     now = time.time()
 
-    for row in rows:
+    sol_usd_now = _fetch_sol_usd_price(session)
+
+    try:
+        _workers = int(float(get_config_value("PRICER_MAX_WORKERS", 6)))
+    except Exception:
+        _workers = 6
+    _workers = max(1, min(_workers, 12))
+
+    resolved: list = []
+    if _workers > 1 and len(rows) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        try:
+            with ThreadPoolExecutor(
+                max_workers=_workers, thread_name_prefix="sentinuity-pricer"
+            ) as pool:
+                resolved = list(pool.map(
+                    lambda r: _resolve_price_for_row(r, price_map, sol_usd_now),
+                    rows,
+                ))
+        except Exception:
+            resolved = []
+    if not resolved:
+        resolved = [_resolve_price_for_row(r, price_map, sol_usd_now) for r in rows]
+
+    for row, pv, _src in resolved:
         row_id   = row["id"]
         mint     = row["mint_address"]
         attempts = int(row["price_attempts"] or 0) + 1
 
-        pv = None
-
-        sol_usd_now = _fetch_sol_usd_price(session)
-        if sol_usd_now > 0:
-            pv = _fetch_price_bonding_curve(session, mint, sol_usd_now)
-
-        if pv is None:
-            pv = _fetch_price_pumpfun(session, mint)
-
-        if pv is None:
-            pv = _fetch_price_dexscreener(session, mint)
-
-        if pv is None:
-            usd = (price_map.get(mint, {}) or {}).get("usdPrice")
-            if usd is not None:
-                try:
-                    parsed = float(usd)
-                    if parsed > 0:
-                        pv = parsed
-                except (TypeError, ValueError):
-                    pv = None
-
         if pv is not None and pv > 0:
+            _write_committed = False
             for attempt in range(4):
                 try:
                     with get_connection() as conn:
-                        conn.execute(
+                        cur = conn.execute(
                             """
                             UPDATE market_snapshots SET
                                 observed_price=?, price_attempts=?,
@@ -1742,7 +1852,15 @@ def _update_price_rows(
                             (pv, attempts, now, now, row_id, now),
                         )
                         conn.commit()
-                    priced += 1
+                        _write_committed = cur.rowcount > 0
+                    if _write_committed:
+                        priced += 1
+                        try:
+                            from services.stage_telemetry import record_stage as _tel
+                            _tel("FIRST_PRICE", mint, snapshot_id=row_id,
+                                 provider=_src, source="market_intelligence")
+                        except Exception:
+                            pass
                     break
                 except Exception:
                     if attempt < 3:

@@ -44,7 +44,7 @@ rem ── FORGE STATUS (snapshot before guardian loop starts) ─────�
 echo ============================================================
 echo SOVEREIGN FORGE STATUS
 echo ============================================================
-if exist "scripts\forge_status_snapshot.py" (python scripts\forge_status_snapshot.py 2^>^&1) else (echo [INFO] Optional forge status snapshot not included.)
+python scripts\forge_status_snapshot.py 2>&1
 echo ============================================================
 echo Guardian active. Running continuous cycle.
 echo ============================================================

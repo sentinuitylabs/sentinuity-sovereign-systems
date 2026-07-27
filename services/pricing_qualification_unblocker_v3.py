@@ -1,4 +1,4 @@
-# services/pricing_qualification_unblocker_v3.py
+﻿# services/pricing_qualification_unblocker_v3.py
 # SENTINUITY PRICING + QUALIFICATION LANE UNBLOCKER V3
 # Bounded, non-hanging, no dataclass, workspace-safe.
 #
@@ -25,8 +25,8 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_WORKSPACE = ROOT
+ROOT = Path.cwd()
+DEFAULT_WORKSPACE = Path(__file__).resolve().parents[1]
 
 PRICE_COL_CANDIDATES = [
     "price", "current_price", "latest_price", "last_price", "qual_price",
@@ -63,10 +63,10 @@ def locate_workspace(start: Optional[Path] = None) -> Path:
     if (start / "services").exists():
         return start
 
-    return start
+    return DEFAULT_WORKSPACE
 
 
-WORKSPACE = locate_workspace(ROOT)
+WORKSPACE = locate_workspace()
 
 
 def find_db(root: Optional[Path] = None) -> Path:
@@ -453,7 +453,7 @@ def update_priced(
     add("pricing_source", source)
     add("liquidity_usd", liquidity)
     add("route_status", route_status)
-    # === PATCH 1 — UNBLOCKER AUTHORITY GUARD ===
+    # === PATCH 1 â€” UNBLOCKER AUTHORITY GUARD ===
     # Default fail-closed. Unblocker v3 may not promote rows to execution_ready
     # unless SENTINUITY_ALLOW_UNBLOCKER_AUTHORITY=1.
     import os as _os_p1
@@ -663,3 +663,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

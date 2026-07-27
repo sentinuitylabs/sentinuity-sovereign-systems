@@ -250,7 +250,7 @@ def supervise_once():
             from services.copytrade_influence import evaluate_paper_bonus
             ct_bonus, ct_reason, _ct_evidence = evaluate_paper_bonus(
                 str(row["mint_address"]), conf, min_conf,
-                symbol=str(row["token_symbol"] if "token_symbol" in keys else ""),
+                token_symbol=str(row["token_symbol"] if "token_symbol" in keys else ""),
             )
         except Exception as _ct_exc:
             ct_reason = f"CT_ERROR:{type(_ct_exc).__name__}"

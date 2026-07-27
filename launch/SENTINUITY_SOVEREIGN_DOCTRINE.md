@@ -1,4 +1,4 @@
-# SENTINUITY SOVEREIGN DOCTRINE
+﻿# SENTINUITY SOVEREIGN DOCTRINE
 
 **File:** `SENTINUITY_SOVEREIGN_DOCTRINE.md`  
 **Placement:** `launch\SENTINUITY_SOVEREIGN_DOCTRINE.md`  
@@ -51,7 +51,7 @@ Paper mode may explore. Live mode must remain guarded.
 The canonical Windows runtime root is:
 
 ```text
-<EXTRACTED_SENTINUITY_FOLDER>
+C:\Path\To\Sentinuity
 ```
 
 The standard launch surface is:
@@ -543,3 +543,4 @@ This signed-off doctrine preserves the current paper-safe launch posture:
 
 **Signed-off posture:** PAPER SAFE / OPERATOR CONTROLLED / AUDITABLE / FAIL-CLOSED
 **Revision:** 2026-07-12
+

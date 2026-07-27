@@ -1379,10 +1379,26 @@ def _write_debate_turn(
     """
     try:
         result = result or {}
+        def _first_meaningful_payload_text(payload: dict) -> str:
+            for key in (
+                "verdict", "summary", "rebuttal_summary", "adjusted_action",
+                "research_summary", "proposal_summary", "reason",
+                "recommended_next_step", "synthesized_path",
+                "why_this_resolves_both", "current_state_summary",
+            ):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            for key in ("failures", "checks", "objections", "evidence_snippets"):
+                value = payload.get(key)
+                if isinstance(value, (list, tuple)) and value:
+                    clean = [str(item).strip() for item in value if str(item).strip()]
+                    if clean:
+                        return "; ".join(clean[:4])
+            return ""
+
         message = (
-            result.get("verdict") or
-            result.get("summary") or
-            result.get("rebuttal_summary") or
+            _first_meaningful_payload_text(result) or
             f"{action} | round={round_num} | proposal={proposal_id}"
         )
         if not result.get("narrative"):
@@ -2694,6 +2710,46 @@ def _axon_dry_run_validation(proposal: dict, current_state: dict,
     source_file = current_state.get("source_file") or _infer_source_target(proposal)[0]
     checks: list[str] = []
     failures: list[str] = []
+    proposal_type = str(proposal.get("proposal_type") or "").upper()
+    research_types = {
+        "RESEARCH_NOTE", "DOCTRINE_UPDATE", "PATTERN_OBSERVATION",
+        "WALLET_INTEL", "INTELLIGENCE_BUILD", "AUDIT", "OBSERVATION",
+    }
+    is_research_payload = proposal_type in research_types
+
+    if is_research_payload:
+        proposal_blob = " ".join(
+            str(proposal.get(key) or "").strip()
+            for key in ("proposal_text", "suggested_action")
+        ).strip()
+        turn_blob = ""
+        if isinstance(polaris_turn, dict):
+            turn_blob = " ".join(
+                str(polaris_turn.get(key) or "").strip()
+                for key in ("summary", "adjusted_action", "research_summary", "reason")
+            ).strip()
+        if len(proposal_blob + turn_blob) < 20:
+            failures.append("Research payload is empty or too short for validation.")
+        else:
+            checks.append("Research payload contains substantive proposal/evidence text.")
+        if current_state.get("source_grounded"):
+            checks.append(f"Optional CURRENT_STATE extracted from {source_file or 'target'}.")
+        else:
+            checks.append("Research-only proposal does not require a source-code target.")
+        safe_to_stage = not failures
+        return {
+            "safe_to_stage": safe_to_stage,
+            "confidence": 0.82 if safe_to_stage else 0.25,
+            "checks": checks,
+            "failures": failures,
+            "source_file": source_file,
+            "dry_run_only": True,
+            "verdict": (
+                "AXON research-payload validation passed; evidence review remains advisory."
+                if safe_to_stage else
+                "AXON research-payload validation blocked until substantive content is supplied."
+            ),
+        }
 
     if not current_state.get("source_grounded"):
         failures.append("CURRENT_STATE is not source-grounded; source target missing or extraction failed.")

@@ -195,6 +195,58 @@ def _update_strategy_score(con, strategy_id: str, realized: float,
     )
 
 
+def close_unpriced_writeoff(position_id: int, reason: str = "EXPIRED_UNPRICED_WRITEOFF") -> Dict[str, Any]:
+    """Release an expired unpriceable PAPER position without inventing a mark.
+
+    The position is terminal with realised PnL exactly 0.0, exit_price NULL and
+    mark_source NONE. Reserved paper cash is returned. Idempotent.
+    """
+    ensure_schema()
+    con = connect()
+    try:
+        _ensure_lifecycle_cols(con)
+        row = con.execute(
+            "SELECT * FROM substrate_positions WHERE id=?", (int(position_id),)
+        ).fetchone()
+        if not row:
+            return {"ok": False, "reason": "position_not_found"}
+        pos = dict(row)
+        if str(pos.get("state") or "").upper() != "OPEN":
+            return {"ok": False, "reason": "already_closed"}
+        if str(pos.get("mode") or "PAPER").upper() != "PAPER":
+            return {"ok": False, "reason": "not_paper"}
+        now = time.time()
+        size = float(pos.get("size_usd") or pos.get("position_size") or 0.0)
+        cur = con.execute(
+            "UPDATE substrate_positions SET state='CLOSED', status='CLOSED', "
+            "closed_at=?, exit_price=NULL, exit_reason=?, realized_pnl=0, "
+            "unrealized_pnl=0, updated_at=?, mark_source='NONE', "
+            "mark_status='EXPIRED_UNPRICED_WRITEOFF', marked_at=? "
+            "WHERE id=? AND state='OPEN'",
+            (now, str(reason)[:200], now, now, int(position_id)),
+        )
+        if cur.rowcount != 1:
+            return {"ok": False, "reason": "already_closed"}
+        cash = cfg_float(con, "SUBSTRATE_PAPER_CASH_USD", 0.0) + size
+        cfg_set(con, "SUBSTRATE_PAPER_CASH_USD", f"{cash:.4f}")
+        opp_id = pos.get("opportunity_id")
+        if opp_id:
+            con.execute(
+                "UPDATE substrate_opportunities SET state='PAPER_CLOSED', "
+                "updated_at=? WHERE id=?", (now, int(opp_id)),
+            )
+        strategy_id = str(pos.get("strategy_id") or DEFAULT_STRATEGY_ID)
+        _update_strategy_score(con, strategy_id, 0.0, now)
+        _audit(con, True, f"paper_closed:{reason}:pnl=+0.0000", pos,
+               source="paper_ledger.unpriced_writeoff")
+        con.commit()
+        return {"ok": True, "position_id": int(position_id),
+                "realized_pnl": 0.0, "exit_price": None,
+                "strategy_id": strategy_id, "reason": reason}
+    finally:
+        con.close()
+
+
 def close_paper_position(position_id: int, exit_price: float, reason: str,
                          mark_source: str = "substrate_price_feed") -> Dict[str, Any]:
     """Close one OPEN paper position at a REAL mark. Idempotent: a second call

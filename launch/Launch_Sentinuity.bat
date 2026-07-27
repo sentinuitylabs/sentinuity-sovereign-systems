@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 
 REM SENTINUITY_FONT_RESTORE_JUNE24_V3: preserve the operator-saved console font and size.
 
@@ -148,7 +148,7 @@ for %%I in ("%CD%\..") do set "CWD_PARENT_DIR=%%~fI"
 
 
 
-set "HARD_ROOT=C:\Users\Polar\.openclaw\workspace\trading-bot"
+set "HARD_ROOT=C:\Path\To\Sentinuity"
 
 
 
@@ -1323,6 +1323,7 @@ REM referenced a module absent from the signed codebase and produced a guarantee
 REM startup error, so it is intentionally not launched here.
 
 start "WsOracle" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.ws_price_oracle >> ""%LOG_PATH%\ws_price_oracle.log"" 2^>^&1"
+start "PriceTruthShadow" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.price_truth_mesh >> ""%LOG_PATH%\price_truth_mesh.log"" 2^>^&1"
 
 timeout /t 1 /nobreak >nul
 
@@ -1388,7 +1389,16 @@ start "SettleRecovery" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.
 
 start "CouncilChamber" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.council_chamber_bridge >> ""%LOG_PATH%\council_chamber_bridge.log"" 2^>^&1"
 
-start "CouncilBuild" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.council_build_orchestrator >> ""%LOG_PATH%\council_build_orchestrator.log"" 2^>^&1"
+rem COUNCIL_BUILD_PLANE_20260724: legacy matrix-writing orchestrator disabled.
+rem start "CouncilBuild" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.council_build_orchestrator >> ""%LOG_PATH%\council_build_orchestrator.log"" 2^>^&1"
+
+rem COUNCIL_BUILD_PLANE_20260724 - isolated DB; migration before daemon.
+"%PY%" .\launch\council_autobuild_migrate.py >> "%LOG_PATH%\council_autobuild_migrate.log" 2>&1
+if errorlevel 1 (
+  echo [FAIL] Council build-plane migration failed. Autobuilder not started.
+) else (
+  start "CouncilAutobuilder" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.council_autobuilder >> ""%LOG_PATH%\council_autobuilder.log"" 2^>^&1"
+)
 
 start "ForgeOrchestrator" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.intelligence_orchestrator >> ""%LOG_PATH%\intelligence_orchestrator.log"" 2^>^&1"
 
@@ -1400,7 +1410,8 @@ start "ForgeResearch" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.f
 
 start "Debate" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.debate_engine >> ""%LOG_PATH%\debate_engine.log"" 2^>^&1"
 
-start "ForgeWriter" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.forge_code_writer >> ""%LOG_PATH%\forge_code_writer.log"" 2^>^&1"
+rem COUNCIL_BUILD_PLANE_20260724: disabled competing patch writer; canonical writer is council_autobuilder.
+rem start "ForgeWriter" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.forge_code_writer >> ""%LOG_PATH%\forge_code_writer.log"" 2^>^&1"
 
 start "GithubScout" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.github_scout >> ""%LOG_PATH%\github_scout.log"" 2^>^&1"
 
@@ -1835,3 +1846,4 @@ print("If console was already open, close/reopen it so it rereads the reset bala
 conn.close()
 
 ::END_SOLANA_WALLET_RESET_PY
+

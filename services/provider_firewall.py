@@ -35,9 +35,34 @@ LIMITS = {
 }
 
 
+
+def ensure_provider_schema(conn: sqlite3.Connection) -> None:
+    """Create the provider telemetry contract before any read/write.
+
+    Additive only: this never drops, renames, prunes, or rewrites provider data.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS provider_health (
+            provider TEXT PRIMARY KEY, status TEXT DEFAULT 'UNKNOWN',
+            cooldown_until REAL DEFAULT 0, requests_24h INTEGER DEFAULT 0,
+            requests_30d INTEGER DEFAULT 0, last_status_code INTEGER,
+            last_error TEXT, updated_at REAL, enabled INTEGER DEFAULT 1
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS api_usage_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL,
+            caller_service TEXT, endpoint TEXT, status_code INTEGER,
+            request_ts REAL NOT NULL, proposal_id INTEGER, error_type TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_api_usage_provider_ts ON api_usage_log(provider, request_ts)")
+    conn.commit()
+
 def _get_db():
     c = sqlite3.connect(str(DB_PATH), timeout=10)
     c.row_factory = sqlite3.Row
+    ensure_provider_schema(c)
     return c
 
 

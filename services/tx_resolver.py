@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 r"""
 Sentinuity tx_resolver.py
 
@@ -19,10 +19,10 @@ Important:
     Live-fire gates should remain in execution_engine.py.
 
 Suggested location:
-    <sentinuity-root>\tx_resolver.py
+    C:\Path\To\Sentinuity\tx_resolver.py
 
 If your code imports services.tx_resolver instead, place the same file at:
-    <sentinuity-root>\services\tx_resolver.py
+    C:\Path\To\Sentinuity\services\tx_resolver.py
 or make a small services/tx_resolver.py shim that imports from root.
 """
 from __future__ import annotations
@@ -178,7 +178,7 @@ def _freshness_score(snapshot: Mapping[str, Any]) -> Tuple[float, bool]:
     # SIGN-OFF FIX 2026-05-26:
     # stored freshness_score=0.0 is a DB default/un-set value, NOT a real "completely stale"
     # measurement. The old guard `0.0 <= pre <= 1.0` accepted 0.0 as truth and returned
-    # (0.0, True), which caused fresh tokens to score 0.0 fresh → structural cap at 0.000
+    # (0.0, True), which caused fresh tokens to score 0.0 fresh â†’ structural cap at 0.000
     # calibrated_confidence for the entire fresh-runner class.
     #
     # Fix: treat pre=0.0 as missing (fall through to timestamp recompute).
@@ -218,13 +218,13 @@ def _freshness_score(snapshot: Mapping[str, Any]) -> Tuple[float, bool]:
                 break
 
     # Token age (birth time) is NOT a proxy for signal freshness.
-    # Only use it as a last resort — and cap its score conservatively.
+    # Only use it as a last resort â€” and cap its score conservatively.
     if age is None:
         token_age = _as_float(_first_present(snapshot, ("token_age_seconds", "token_birth_age_seconds")), None)
         if token_age is not None:
-            # Fresh token ≠ fresh signal. Give a neutral score.
+            # Fresh token â‰  fresh signal. Give a neutral score.
             return 0.55, False
-        return 0.55, False  # no age info at all — neutral, not penalised
+        return 0.55, False  # no age info at all â€” neutral, not penalised
 
     if age <= 0:
         return 0.65, True
@@ -789,3 +789,4 @@ def _self_test() -> None:
 
 if __name__ == "__main__":
     _self_test()
+

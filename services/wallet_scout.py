@@ -452,54 +452,20 @@ def _find_wallet_records(payload: Any, limit: int) -> list[dict]:
 
 
 def _prepare_gmgn_session(base_session: requests.Session) -> tuple[requests.Session, dict]:
-    """Attach Cloudflare/browser clearance if operator provided it.
+    """Return a plain standards-compliant session only.
 
-    GMGN often rejects bare Python requests. This is intentionally simple and
-    explicit: paste GMGN_CF_CLEARANCE + GMGN_CF_UA into .env, or GMGN_COOKIE for
-    a full cookie header. No secrets are logged.
+    SIGNOFF_COMPLIANCE_20260727: browser-cookie transplantation, cf_clearance
+    injection, browser impersonation and clearance-bridge imports are forbidden.
+    Use a documented licensed API or public on-chain RPC discovery instead.
     """
-    diag = {"cf_bridge": "not_configured"}
-    cookie = os.getenv("GMGN_COOKIE", "").strip()
-    clearance = os.getenv("GMGN_CF_CLEARANCE", "").strip()
-    ua = os.getenv("GMGN_CF_UA", "").strip()
-
-    if cookie:
-        base_session.headers.update({
-            "User-Agent": ua or base_session.headers.get("User-Agent") or "Mozilla/5.0",
-            "Cookie": cookie,
-            "Referer": "https://gmgn.ai/",
-            "Origin": "https://gmgn.ai",
-            "Accept": "application/json,text/plain,*/*",
-        })
-        diag.update({"cf_bridge": "full_cookie", "ua": "custom" if ua else "default"})
-        return base_session, diag
-
-    if clearance:
-        base_session.cookies.set("cf_clearance", clearance, domain=".gmgn.ai", path="/")
-        base_session.headers.update({
-            "User-Agent": ua or base_session.headers.get("User-Agent") or "Mozilla/5.0",
-            "Referer": "https://gmgn.ai/",
-            "Origin": "https://gmgn.ai",
-            "Accept": "application/json,text/plain,*/*",
-        })
-        diag.update({"cf_bridge": "cf_clearance", "ua": "custom" if ua else "default"})
-        return base_session, diag
-
-    # Optional drop-in module, if present. This keeps compatibility with the
-    # earlier bridge file without making wallet_scout depend on pywin32/DPAPI.
-    try:
-        try:
-            from services.gmgn_cf_bridge import build_gmgn_session  # type: ignore
-        except Exception:
-            from gmgn_cf_bridge import build_gmgn_session  # type: ignore
-        bridged, bridge_diag = build_gmgn_session(base_session)
-        if bridged is not None:
-            return bridged, {"cf_bridge": "module", **(bridge_diag or {})}
-    except Exception as exc:
-        diag.update({"cf_bridge": "missing", "bridge_error": str(exc)[:120]})
-
-    return base_session, diag
-
+    base_session.headers.update({
+        "Accept": "application/json,text/plain,*/*",
+        "User-Agent": "Sentinuity-Wallet-Research/1.0",
+    })
+    return base_session, {
+        "cf_bridge": "disabled_by_compliance",
+        "automation_policy": "plain_http_only",
+    }
 
 def fetch_gmgn_top_wallets(session: requests.Session, limit: int = GMGN_LIMIT) -> tuple[list[dict], dict]:
     """

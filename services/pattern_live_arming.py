@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from core.outcome_taxonomy import classify_realised, is_reset, is_success
+from services.pnl_truth import canonical_realized_pnl_pct
 
 @dataclass(frozen=True)
 class PatternPermission:
@@ -61,27 +62,21 @@ def _cohort_key(row: Any) -> str:
 
 
 def _row_outcome(row: Any) -> str:
-    """Reproduce the post-13-July Gold Runner confirmation contract.
+    """Classify only canonical realised truth for pattern confirmation.
 
-    The profitable pattern-upgrade state classified a completed SIM outcome from
-    the better of realised return and its trusted persisted high-water mark.
-    This restores pattern recognition when a genuine runner was observed but
-    exit leakage reduced the final realised result. Full funded size remains
-    governed separately by `_live_size_stage`.
+    Peak/MFE remains useful research telemetry but cannot count as a realised
+    success or arm funded capital. Capped paper stop rows consume their raw
+    observed loss through the shared PnL truth contract.
     """
-    size = abs(_f(row["position_size_usd"], 0.0))
-    pnl = _f(row["realized_pnl_usd"], 0.0)
-    realised_pct = (pnl / size * 100.0) if size > 1e-12 else 0.0
-
-    peak_pct = None
-    try:
-        if "pattern_peak_pct" in row.keys() and row["pattern_peak_pct"] is not None:
-            peak_pct = _f(row["pattern_peak_pct"], realised_pct)
-    except Exception:
-        peak_pct = None
-
-    achieved_pct = max(realised_pct, peak_pct if peak_pct is not None else realised_pct)
-    return classify_realised(achieved_pct)
+    realised_pct = canonical_realized_pnl_pct(row)
+    if realised_pct == 0.0:
+        size = abs(_f(row["position_size_usd"], 0.0))
+        try:
+            pnl = _f(row["realized_pnl_usd"], 0.0)
+        except Exception:
+            pnl = 0.0
+        realised_pct = (pnl / size * 100.0) if size > 1e-12 else 0.0
+    return classify_realised(realised_pct)
 
 
 

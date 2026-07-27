@@ -19,14 +19,73 @@ ROLE_CANDIDATES = {
 CONFIG_KEYS = {"IVARIS":"IVARIS_NIM_MODEL","NUGGET":"NUGGET_NIM_MODEL","AXIOM":"AXIOM_NIM_MODEL","FORGE":"FORGE_NIM_MODEL","FAST":"FAST_NIM_MODEL","VISION":"VISION_NIM_MODEL"}
 NON_CHAT_MARKERS = ("embed","retriever","parse","reward","safety","guard","detector","translate","nvclip","deplot","gliner")
 
+# SIGNOFF_MODEL_RESILIENCE_20260725
+# Quarantine cooldown for models that returned empty/error responses. A model
+# is not re-assignable until the cooldown expires; this is what stops the
+# two-model oscillation (see rotate_after_failure below).
+QUARANTINE_SEC = float(os.getenv("NIM_MODEL_QUARANTINE_SEC", "1800"))
+_DDL_DONE = False
+
+
 def _connect():
+    """SIGNOFF_MODEL_RESILIENCE_20260725: DDL is executed ONCE per process,
+    not on every connect. The previous version ran four CREATE TABLE
+    statements against the shared trading matrix DB on every single call
+    (including inside Ivaris retry loops), which violates the standing
+    'no shared-market-DB migrations during runtime' doctrine and adds
+    avoidable write-lock pressure to the pricing/execution hot path."""
+    global _DDL_DONE
     c=sqlite3.connect(DB, timeout=15); c.row_factory=sqlite3.Row
-    c.executescript('''
+    c.execute("PRAGMA busy_timeout=5000")
+    if not _DDL_DONE:
+        c.executescript('''
     CREATE TABLE IF NOT EXISTS llm_model_catalog(model_id TEXT PRIMARY KEY,provider TEXT,first_seen_at REAL,last_seen_at REAL,available INTEGER DEFAULT 1,chat_capable INTEGER,health_status TEXT,median_latency_ms REAL,last_error TEXT,last_probed_at REAL,capability_json TEXT);
     CREATE TABLE IF NOT EXISTS council_model_assignments(agent_name TEXT PRIMARY KEY,provider TEXT NOT NULL,model_id TEXT NOT NULL,fallback_model_id TEXT,assignment_reason TEXT,capability_score REAL,assigned_at REAL NOT NULL,catalogue_version TEXT,assignment_source TEXT,health_status TEXT);
     CREATE TABLE IF NOT EXISTS council_model_assignment_history(id INTEGER PRIMARY KEY AUTOINCREMENT,agent_name TEXT,old_model_id TEXT,new_model_id TEXT,reason TEXT,changed_at REAL,catalogue_version TEXT);
     CREATE TABLE IF NOT EXISTS system_config(key TEXT PRIMARY KEY,value TEXT);
-    '''); return c
+    CREATE TABLE IF NOT EXISTS llm_model_quarantine(model_id TEXT PRIMARY KEY,role TEXT,quarantined_at REAL,until_ts REAL,reason TEXT,failures INTEGER DEFAULT 1);
+    ''')
+        _DDL_DONE = True
+    return c
+
+
+def _quarantine(c, model_id: str, role: str, reason: str) -> None:
+    """Escalating quarantine: each repeat failure doubles the window
+    (capped at 8x). Never raises."""
+    try:
+        now = time.time()
+        row = c.execute("SELECT failures FROM llm_model_quarantine WHERE model_id=?",
+                        (model_id,)).fetchone()
+        n = int(row["failures"]) + 1 if row else 1
+        window = QUARANTINE_SEC * min(8, 2 ** (n - 1))
+        c.execute("INSERT INTO llm_model_quarantine(model_id,role,quarantined_at,until_ts,reason,failures)"
+                  " VALUES(?,?,?,?,?,?) ON CONFLICT(model_id) DO UPDATE SET"
+                  " role=excluded.role,quarantined_at=excluded.quarantined_at,"
+                  " until_ts=excluded.until_ts,reason=excluded.reason,failures=?",
+                  (model_id, role, now, now + window, str(reason)[:400], n, n))
+    except Exception:
+        pass
+
+
+def is_quarantined(model_id: str, c=None) -> bool:
+    """True while the model is inside its cooldown window."""
+    if not model_id:
+        return False
+    own = c is None
+    try:
+        if own:
+            c = _connect()
+        row = c.execute("SELECT until_ts FROM llm_model_quarantine WHERE model_id=?",
+                        (model_id,)).fetchone()
+        return bool(row and float(row["until_ts"] or 0) > time.time())
+    except Exception:
+        return False
+    finally:
+        if own and c is not None:
+            try:
+                c.close()
+            except Exception:
+                pass
 
 def _key():
     k=os.getenv("NVIDIA_NIM_API_KEY","").strip()
@@ -79,6 +138,13 @@ def scan_and_align(probe=True)->Dict[str,object]:
             if not healthy: continue
             chosen=healthy[0][0]; fallback=healthy[1][0] if len(healthy)>1 else (available[1] if len(available)>1 else chosen)
             old=con.execute("SELECT model_id FROM council_model_assignments WHERE agent_name=?",(role,)).fetchone(); oldm=old[0] if old else None
+            # SIGNOFF_MODEL_RESILIENCE_20260725: never assign a model that is
+            # still inside its quarantine cooldown.
+            if is_quarantined(chosen, con):
+                _alt = next((m for m in ROLE_CANDIDATES.get(role, [])
+                             if m in ids and not is_quarantined(m, con)), "")
+                if _alt:
+                    chosen = _alt
             reason="best validated role candidate available in current NVIDIA catalogue"
             con.execute("INSERT INTO council_model_assignments(agent_name,provider,model_id,fallback_model_id,assignment_reason,capability_score,assigned_at,catalogue_version,assignment_source,health_status) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent_name) DO UPDATE SET provider=excluded.provider,model_id=excluded.model_id,fallback_model_id=excluded.fallback_model_id,assignment_reason=excluded.assignment_reason,assigned_at=excluded.assigned_at,catalogue_version=excluded.catalogue_version,assignment_source=excluded.assignment_source,health_status=excluded.health_status",(role,"nim",chosen,fallback,reason,100.0,now,version,"AUTO_DISCOVERY","HEALTHY"))
             con.execute("INSERT INTO system_config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(CONFIG_KEYS[role],chosen))
@@ -86,6 +152,71 @@ def scan_and_align(probe=True)->Dict[str,object]:
                 con.execute("INSERT INTO council_model_assignment_history(agent_name,old_model_id,new_model_id,reason,changed_at,catalogue_version) VALUES(?,?,?,?,?,?)",(role,oldm,chosen,reason,now,version)); changes.append((role,oldm,chosen))
         con.commit(); return {"count":len(ids),"catalogue_version":version,"changes":changes}
     finally: con.close()
+
+
+def rotate_after_failure(role: str, failed_model: str, error: str = "", *, refresh: bool = True) -> str:
+    """Mark a failed assignment unhealthy and rotate to a known fallback.
+
+    Council-only control plane: never touches trading configuration. If the
+    stored fallback is unavailable, refresh the NVIDIA catalogue and probe role
+    candidates before returning the newly assigned model.
+    """
+    role = str(role or "").upper().strip()
+    failed_model = str(failed_model or "").strip()
+    now = time.time()
+    con = _connect()
+    try:
+        row = con.execute(
+            "SELECT model_id,fallback_model_id FROM council_model_assignments WHERE agent_name=?",
+            (role,),
+        ).fetchone()
+        fallback = str(row["fallback_model_id"] or "").strip() if row else ""
+        if failed_model:
+            con.execute(
+                "UPDATE llm_model_catalog SET health_status='FAILED',last_error=?,last_probed_at=? WHERE model_id=?",
+                (str(error or "runtime failure")[:400], now, failed_model),
+            )
+        # SIGNOFF_MODEL_RESILIENCE_20260725: quarantine the failed model so it
+        # cannot be re-selected inside the cooldown, and NEVER write it back
+        # into the fallback slot. The previous line set
+        # fallback_model_id=failed_model, so the very next failure rotated
+        # straight back onto the broken model; combined with ivaris.py's
+        # `attempted` set that ended the retry loop after two calls and left
+        # IVARIS unavailable exactly as the audit observed.
+        if failed_model:
+            _quarantine(con, failed_model, role, error or "runtime failure")
+        if fallback and fallback != failed_model and not is_quarantined(fallback, con):
+            _next_fb = ""
+            for _cand in ROLE_CANDIDATES.get(role, []):
+                if _cand not in (failed_model, fallback) and not is_quarantined(_cand, con):
+                    _next_fb = _cand
+                    break
+            con.execute(
+                "UPDATE council_model_assignments SET model_id=?,fallback_model_id=?,health_status='HEALTHY',assignment_reason=?,assigned_at=? WHERE agent_name=?",
+                (fallback, _next_fb, "runtime failover after empty/error response", now, role),
+            )
+            key = CONFIG_KEYS.get(role)
+            if key:
+                con.execute(
+                    "INSERT INTO system_config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, fallback),
+                )
+            con.execute(
+                "INSERT INTO council_model_assignment_history(agent_name,old_model_id,new_model_id,reason,changed_at,catalogue_version) VALUES(?,?,?,?,?,?)",
+                (role, failed_model, fallback, str(error or "runtime failure")[:300], now, "runtime-failover"),
+            )
+            con.commit()
+            return fallback
+        con.commit()
+    finally:
+        con.close()
+    if refresh:
+        try:
+            scan_and_align(probe=True)
+            return get_assignment(role, "")
+        except Exception:
+            return ""
+    return ""
 
 def get_assignment(role:str, default:str="")->str:
     role=role.upper()

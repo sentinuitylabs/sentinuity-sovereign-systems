@@ -353,6 +353,22 @@ def get_ui_price(
     return get_best_trade_price(mint, entry_price, opened_at, mode="ui")
 
 
+
+
+def get_reference_price_details(mint: str, opened_at: float, entry_price: float) -> dict:
+    """Shadow-only provenance read. Does not alter canonical routing authority."""
+    now=time.time(); max_sane=float(entry_price or 0)*MAX_SANE_MULTIPLE
+    try:
+        c=_intel_conn()
+        row=c.execute("SELECT price_usd,ts_ms,COALESCE(source,'unknown') FROM mtm_ticks WHERE mint_address=? AND ts_ms>=? ORDER BY ts_ms DESC LIMIT 1",(mint,(float(opened_at or 0)-0.5)*1000)).fetchone(); c.close()
+        if row and row[0] is not None:
+            price=float(row[0]); age=now-float(row[1])/1000.0
+            if 0<price<max_sane and age>=0:
+                return {"price":price,"source":"intel-mtm","actual_source":str(row[2] or 'unknown'),"age_sec":age,"shadow_only":True}
+    except Exception as exc:
+        log.debug("reference provenance read failed %s",exc)
+    r=dict(get_best_trade_price(mint,entry_price,opened_at,mode="ui")); r["actual_source"]=r.get("source","unknown"); r["shadow_only"]=True; return r
+
 def get_live_liquidation_price(
     mint: str,
     quantity: float,

@@ -19,17 +19,21 @@ Tier B ⇒ NEEDS_OPERATOR with a single explicit decision request.
 Tier C ⇒ FAILED_FINAL, never applied. Restart resumes from durable phase.
 """
 from __future__ import annotations
-import json, py_compile, shutil, sqlite3, subprocess, sys, time
+import os
+import json, py_compile, re, shutil, sqlite3, subprocess, sys, time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = ROOT / "sentinuity_matrix.db"
+BUILD_DB_PATH = ROOT / "sentinuity_build.db"
+MARKET_DB_PATH = ROOT / "sentinuity_matrix.db"
+DB_PATH = BUILD_DB_PATH
 BACKUP_DIR = ROOT / "backups" / "council_autobuild"
 
 from services import council_task_ledger as ledger
 from services import apply_policy
 from services import debate_quorum
+from services import operator_approval
 
 AGENT = "POLARIS"
 
@@ -46,6 +50,16 @@ CREATE TABLE IF NOT EXISTS council_task_evidence(
     confidence REAL,
     methodology TEXT,
     limitations TEXT
+);
+CREATE TABLE IF NOT EXISTS council_capability_gaps(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_id INTEGER UNIQUE,
+    created_at REAL NOT NULL,
+    title TEXT NOT NULL,
+    requested_capability TEXT NOT NULL,
+    status TEXT DEFAULT 'OPEN',
+    retry_count INTEGER DEFAULT 0,
+    last_seen_at REAL
 );
 CREATE TABLE IF NOT EXISTS code_patches(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,9 +82,11 @@ CREATE TABLE IF NOT EXISTS code_patches(
 
 
 def _con(db_path: Optional[Path] = None) -> sqlite3.Connection:
-    c = sqlite3.connect(str(db_path or DB_PATH), timeout=10)
+    c = sqlite3.connect(str(db_path or BUILD_DB_PATH), timeout=1.0)
     c.row_factory = sqlite3.Row
-    c.execute("PRAGMA busy_timeout=8000")
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
+    c.execute("PRAGMA busy_timeout=750")
     return c
 
 
@@ -163,7 +179,7 @@ def _find_handler(title: str) -> Optional[Callable]:
 # ── Built-in handler: THE PROOF TASK — canonical substrate chart source ─────
 @register_handler("substrate chart")
 def substrate_chart_handler(task: dict, ctx: dict) -> Dict[str, Any]:
-    db = ctx["db_path"]
+    db = ctx["market_db_path"]
     target = Path(ctx.get("ui_root", ROOT)) / "ui" / "substrate_node.py"
 
     def research() -> Dict[str, Any]:
@@ -249,7 +265,7 @@ def generic_schema_authority_handler(task: dict, ctx: dict) -> Dict[str, Any]:
     existence-as-authority anti-pattern by structure (regex over arbitrary
     table names), generates the patch, and fails safely (raises → BLOCKED)
     when no grounded match exists."""
-    db = ctx["db_path"]
+    db = ctx["market_db_path"]
     tf = (task.get("description") or "").strip()
     m = __import__("re").search(r"target_file=(\S+)", tf)
     if not m:
@@ -304,21 +320,67 @@ def generic_schema_authority_handler(task: dict, ctx: dict) -> Dict[str, Any]:
 
 
 # ── The phase machine ───────────────────────────────────────────────────────
+
+@register_handler("intelligence tab canary")
+@register_handler("council stage rail canary")
+def intelligence_stage_rail_canary_handler(task: dict, ctx: dict) -> Dict[str, Any]:
+    target=Path(ctx.get("ui_root",ROOT))/"ui"/"council_build_stage_rail.py"
+    def research():
+        src=target.read_text(encoding="utf-8") if target.exists() else ""
+        return {"kind":"ui_canary_probe","summary":f"stage rail present={target.exists()} revision={'CANARY_REVISION' in src}","data":{"target":str(target)},"sample_size":1,"confidence":1.0,"methodology":"local source inspection","limitations":"transaction canary only"}
+    def propose(evidence):
+        return {"proposal_type":"ui_canary","proposal_text":"Increment non-functional Council stage-rail canary revision.","suggested_action":"increment CANARY_REVISION","files":["ui/council_build_stage_rail.py"],"diff_chars":24,"compile_ok":True,"test_cmd":"py_compile + revision assertion","backup_planned":True}
+    def build():
+        src=target.read_text(encoding="utf-8"); m=re.search(r"^CANARY_REVISION=(\d+)$",src,re.M)
+        if not m: raise RuntimeError("CANARY_REVISION missing")
+        old=int(m.group(1)); new=src[:m.start(1)]+str(old+1)+src[m.end(1):]
+        def test(path): py_compile.compile(str(path),doraise=True); return f"CANARY_REVISION={old+1}" in path.read_text(encoding="utf-8")
+        def verify(path): return f"CANARY_REVISION={old+1}" in path.read_text(encoding="utf-8")
+        return {"target_file":target,"new_content":new,"test":test,"verify":verify}
+    return {"research":research,"propose":propose,"build":build}
+
 def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
              ctx: Optional[dict] = None,
              model_router: Optional[Callable] = None,
              get_config: Optional[Callable] = None) -> Dict[str, Any]:
     db = db_path or DB_PATH
-    ctx = dict(ctx or {}); ctx.setdefault("db_path", db)
+    ctx = dict(ctx or {}); ctx.setdefault("build_db_path", db)
+    ctx.setdefault("market_db_path", MARKET_DB_PATH)
     task = ledger.get(canonical_id, db)
     if not task:
         return {"ok": False, "reason": "NO_TASK"}
     handler = _find_handler(task["title"])
     if not handler:
-        ledger.transition(canonical_id, "BLOCKED_EXTERNAL", agent=AGENT,
-                          reason="no registered handler for task class",
+        # CAPABILITY-GAP RESOLVER: never endlessly reclaim the same unsupported
+        # task. Persist one deduplicated gap, increment the task retry count,
+        # release its lease, and request one visible operator/council decision.
+        c = _con(db)
+        try:
+            now = time.time()
+            c.execute("""INSERT INTO council_capability_gaps(
+                canonical_id,created_at,title,requested_capability,status,retry_count,last_seen_at)
+                VALUES(?,?,?,?, 'OPEN',1,?)
+                ON CONFLICT(canonical_id) DO UPDATE SET
+                  retry_count=retry_count+1,last_seen_at=excluded.last_seen_at""",
+                (canonical_id,now,str(task.get("title") or "")[:200],
+                 "REGISTER_TYPED_HANDLER",now))
+            c.execute("""UPDATE council_task_ledger SET retry_count=retry_count+1,
+                blocker_code='NO_HANDLER',claimed_by=NULL,claimed_at=NULL,
+                lease_expires_at=NULL,updated_at=? WHERE canonical_id=?""",(now,canonical_id))
+            c.execute("""INSERT INTO council_needs_operator(canonical_id,ts,decision_needed,context)
+                VALUES(?,?,?,?) ON CONFLICT(canonical_id) DO UPDATE SET
+                ts=excluded.ts,decision_needed=excluded.decision_needed,context=excluded.context""",
+                (canonical_id,now,
+                 f"Capability missing for task #{canonical_id}: {str(task.get('title') or '')[:120]}",
+                 "Choose: register bounded handler, supersede task, or keep blocked. No automatic code write occurred."))
+            c.commit()
+        finally:
+            c.close()
+        ledger.transition(canonical_id, "NEEDS_OPERATOR", agent=AGENT,
+                          reason="NO_HANDLER capability gap persisted; retry loop stopped",
+                          next_action="operator reviews capability gap",
                           db_path=db)
-        return {"ok": False, "reason": "NO_HANDLER"}
+        return {"ok": False, "reason": "NO_HANDLER_NEEDS_OPERATOR"}
     try:
         h = handler(task, ctx)
     except Exception as _hx:
@@ -412,6 +474,10 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
         except ImportError:
             _gcv = lambda key, default=None: default
     allowed, tier, why = apply_policy.can_autoapply(prop["files"], _gcv)
+    # A previously sealed Tier-B request resumes through the exact same build,
+    # compile, smoke-test, rollback and verification path. Tier C never bypasses.
+    if tier == "B" and operator_approval.approval_is_valid(canonical_id, db):
+        allowed, why = True, "OPERATOR_APPROVED_TIER_B"
     ledger.transition(canonical_id, "GATED", agent=AGENT,
                       reason=f"tier={tier} {why} quorum={verdict['quorum']}",
                       db_path=db)
@@ -447,6 +513,43 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
         return {"ok": True, "reason": "ALREADY_APPLIED",
                 "proposal_id": proposal_id, "verdict": verdict}
     target: Path = built["target_file"]
+    # SIGNOFF_BUILD_CONTAINMENT_20260725 — WRITE-SITE PATH ALLOWLIST.
+    # Previously the ONLY thing preventing this daemon from writing to a
+    # funded-execution module was the accident of which regex a handler
+    # matched: generic_schema_authority_handler takes `target_file=` out of
+    # the task DESCRIPTION TEXT and joins it to ROOT with no containment
+    # check, so a crafted/incorrect task description could resolve to
+    # services/execution_engine.py (or traverse with ../) and be written if
+    # quorum passed. Risk tier gates the DEBATE, not the WRITE. This guard
+    # enforces the boundary in code: writes are permitted only inside the
+    # allowlisted non-funded roots, and never to a protected module.
+    _ALLOWED_ROOTS = tuple(
+        (ROOT / r).resolve() for r in
+        (os.getenv("COUNCIL_BUILD_ALLOWED_ROOTS", "ui").split(",") if
+         os.getenv("COUNCIL_BUILD_ALLOWED_ROOTS") else ["ui"])
+    )
+    _PROTECTED_NAMES = {
+        "execution_engine.py", "live_trading.py", "live_decision_contract.py",
+        "price_integrity_contract.py", "ws_price_oracle.py",
+        "market_intelligence.py", "ingest_pipeline.py", "system_guardian.py",
+        "pattern_live_arming.py", "schema.py", "live_lane_common.py",
+    }
+    try:
+        _resolved = target.resolve()
+        _inside = any(
+            _resolved == _root or _root in _resolved.parents
+            for _root in _ALLOWED_ROOTS
+        )
+    except Exception:
+        _inside = False
+    if (not _inside) or _resolved.name in _PROTECTED_NAMES:
+        ledger.transition(canonical_id, "BLOCKED_EXTERNAL", agent=AGENT,
+                          reason=(f"BUILD_CONTAINMENT_DENIED target={target} "
+                                  f"outside allowlist {[str(r) for r in _ALLOWED_ROOTS]} "
+                                  f"or protected module — operator approval required"),
+                          db_path=db)
+        return {"ok": False, "reason": "BUILD_CONTAINMENT_DENIED",
+                "target": str(target)}
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     backup = BACKUP_DIR / f"{target.name}.{stamp}.bak"
@@ -558,34 +661,21 @@ def run_cycle(db_path: Optional[Path] = None, *,
               ctx: Optional[dict] = None,
               model_router: Optional[Callable] = None,
               get_config: Optional[Callable] = None) -> Dict[str, Any]:
-    ensure_schema(db_path)
-    reaped = ledger.release_expired_leases(db_path)
-    imported = ledger.import_sources(db_path)
-    stag = ledger.enforce_progress(db_path)
-    # Skip unsupported legacy work inside the SAME cycle instead of burning one
-    # 60-second cycle per task. Each unsupported task is durably parked as
-    # BLOCKED_EXTERNAL by run_task(), then selection continues until a task with
-    # a registered capability handler is found.
-    task = None
-    result = None
-    skipped_no_handler = []
-    for _ in range(250):
-        candidate = ledger.claim(AGENT, db_path=db_path)
-        if not candidate:
-            break
-        candidate_result = run_task(
-            candidate["canonical_id"], db_path=db_path, ctx=ctx,
-            model_router=model_router, get_config=get_config)
-        if candidate_result.get("reason") == "NO_HANDLER":
-            skipped_no_handler.append(candidate["canonical_id"])
-            continue
-        task = candidate
-        result = candidate_result
-        break
+    db = Path(db_path or BUILD_DB_PATH)
+    if not db.exists():
+        return {"ok": False, "reason": "BUILD_DB_MISSING_RUN_MIGRATION"}
+    reaped = ledger.release_expired_leases(db)
+    # Intake is read-only against market truth and writes only to build DB.
+    imported = ledger.import_sources(db, source_db_path=MARKET_DB_PATH)
+    stag = ledger.enforce_progress(db)
+    candidate = ledger.claim(AGENT, db_path=db)
+    if not candidate:
+        return {"reaped": reaped, "imported": imported,
+                "stagnation": stag, "claimed": None, "result": None}
+    result = run_task(candidate["canonical_id"], db_path=db, ctx=ctx,
+                      model_router=model_router, get_config=get_config)
     return {"reaped": reaped, "imported": imported, "stagnation": stag,
-            "claimed": task["canonical_id"] if task else None,
-            "skipped_no_handler": skipped_no_handler,
-            "result": result}
+            "claimed": candidate["canonical_id"], "result": result}
 
 
 def main() -> None:
@@ -595,7 +685,7 @@ def main() -> None:
             print(f"[AUTOBUILDER] {json.dumps(out, default=str)[:300]}")
         except Exception as exc:
             print(f"[AUTOBUILDER] cycle error: {exc}")
-        time.sleep(60)
+        time.sleep(300)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ if str(BASE_DIR) not in sys.path:
 load_dotenv(BASE_DIR / ".env", override=True)
 
 from core.schema import get_connection, update_heartbeat, init_db, get_config_value
+from services.token_identity import resolve_token_identity
 
 logging.basicConfig(
     level=logging.INFO,
@@ -535,7 +536,11 @@ def _resolve_one(session: requests.Session, tx_hash: str) -> tuple[str, str, Opt
         return "failed", "NO_MINT", None
 
     block_time = _safe_float(tx_result.get("blockTime"), 0.0)
-    token_name = str(mint).strip()  # preserve old signal_engine contract
+    # Identity is enrichment only: bounded timeout, persistent cache, and mint
+    # fallback. It never blocks or authorises trading.
+    identity = resolve_token_identity(mint, session=session, timeout_sec=0.40)
+    token_name = str(identity.get("name") or identity.get("symbol") or mint).strip()
+    token_symbol = str(identity.get("symbol") or "").strip()
 
     # PATCH 1: Persist full forensic bundle — signature, slot, block_time, logMessages.
     # Previously logMessages was discarded. Now persisted so POLARIS/IVARIS can
@@ -560,6 +565,8 @@ def _resolve_one(session: requests.Session, tx_hash: str) -> tuple[str, str, Opt
         "owner_address":     owner,
         "block_time":        block_time,
         "token_name":        token_name,
+        "token_symbol":      token_symbol,
+        "identity_source":   str(identity.get("source") or "UNRESOLVED"),
         "forensic_bundle":   forensic_bundle,
     }
     return "resolved", "OK", payload

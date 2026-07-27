@@ -28,6 +28,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+try:
+    from ui.theme import constellation_html, constellation_instrument_css
+except Exception:
+    constellation_html = None
+    constellation_instrument_css = None
+
 
 def _safe(v: Any) -> str:
     return html.escape(str(v if v is not None else "—"))
@@ -336,10 +342,41 @@ def render_live_gate_constellation(st, db_path: str | Path, intel_db_path: str |
 
     ladder_html, confirms, ladder_stage, ladder_unavailable = _arming_ladder(contract)
 
-    # STAR ALIGNMENT — advisory aggregate of truths already shown above:
-    # 70% technical circuit closure + 30% pattern charge. Display-only.
+    # CONSTELLATION COHERENCE — discrete node states, not a commodity fill bar.
+    # Each technical gate becomes a celestial node with four semantic states.
+    # Overall readiness is expressed as coherence (verified count / total), never a gradient track.
     pattern_frac = 0.0 if ladder_unavailable else max(0.0, min(1.0, (ladder_stage if ladder_stage >= 0 else 0) / 3.0))
-    charge = round(100 * (0.70 * hard_passed / hard_total + 0.30 * pattern_frac))
+    charge = round(100 * (0.70 * hard_passed / hard_total + 0.30 * pattern_frac))  # retained for any residual advisory text
+    constellation_nodes = []
+    # SIGNOFF_SINGLE_CONSTELLATION_20260727 — one canonical visual instrument.
+    # Mechanical gates, pattern charge and FINAL FIRE are represented once here.
+    # The legacy technical rail and separate pattern ladder are deliberately not
+    # rendered below; they duplicated the same decision truths and hierarchy.
+    canonical_visual_nodes = list(hard_nodes)
+    if pattern_node is not None:
+        canonical_visual_nodes.append(pattern_node)
+    canonical_visual_nodes.extend(final_nodes)
+    for n in canonical_visual_nodes:
+        if n.get("name") == "PATTERN":
+            if ladder_unavailable:
+                node_state = "unavailable"
+            elif bool(contract.get("pattern_armed")) or ladder_stage >= 2:
+                node_state = "verified"
+            elif confirms > 0 or ladder_stage >= 0:
+                node_state = "pending"
+            else:
+                node_state = "blocked" if n.get("passed") == "0" else "pending"
+        elif n.get("passed") == "1":
+            node_state = "verified"
+        elif n.get("passed") == "0":
+            node_state = "blocked"
+        elif str(n.get("current", "")).upper() in ("PENDING", "WATCHING", "ARMING", "DORMANT"):
+            node_state = "pending"
+        else:
+            node_state = "unavailable"
+        constellation_nodes.append({"name": n.get("name", "?"), "state": node_state})
+    verified_count = sum(1 for c in constellation_nodes if c["state"] == "verified")
+    coherence_label = f"{verified_count}/{len(constellation_nodes)} COHERENT"
 
     _VERDICT_TEXT = {
         "FIRE_PATH_OPEN": "FIRE PATH OPEN",
@@ -418,10 +455,7 @@ def render_live_gate_constellation(st, db_path: str | Path, intel_db_path: str |
         f'<b>{_safe(n["name"])}</b>{_safe(n["current"])}</span>'
         for n in flow_nodes
     )
-    # Charge meter stars: five stars fill with the charge percentage.
-    stars = "".join(
-        f'<i class="{"lit" if charge >= t else ""}">✦</i>' for t in (18, 38, 58, 78, 96)
-    )
+    # stars removed — constellation instrument replaces commodity meter
 
     rhythm_cells = "".join(
         f'<span class="rh-{r["label"].lower()}">{"✦" if r["label"]=="GOLD" else ("◆" if r["label"]=="BE" else "×")}&nbsp;{r["pnl"]:+.1f}%</span>'
@@ -440,6 +474,28 @@ def render_live_gate_constellation(st, db_path: str | Path, intel_db_path: str |
 
     _vcol = "#14F195" if verdict_class == "open" else ("#FF073A" if verdict_class == "blocked" else "#FFD700")
     _acol = {"fire": "#FFD700", "charge": "#14F195", "block": "#FF073A", "wait": "#52606E"}[anticipation_cls]
+
+    # Build true constellation instrument (replaces commodity STAR ALIGNMENT bar)
+    try:
+        if constellation_html and constellation_instrument_css:
+            _css_extra = constellation_instrument_css()
+            constellation_block = _css_extra + constellation_html(
+                constellation_nodes, coherence_label=coherence_label
+            )
+        else:
+            raise RuntimeError("theme helpers unavailable")
+    except Exception:
+        _bits = "".join(
+            f"<span style='margin:0 6px;font:600 0.66rem Share Tech Mono,monospace;"
+            f"color:{'#14F195' if c['state']=='verified' else ('#FF073A' if c['state']=='blocked' else '#8EF9FF')}'>"
+            f"{'✦' if c['state']=='verified' else ('✕' if c['state']=='blocked' else '✧')} {c['name']}</span>"
+            for c in constellation_nodes
+        )
+        constellation_block = (
+            f"<div style='margin:10px 0;padding:10px;border:1px solid rgba(20,241,149,.2);"
+            f"border-radius:12px;font:600 0.66rem Share Tech Mono,monospace;color:#9DB5A8'>"
+            f"DOCTRINE R2 · CAPITAL ALIGNMENT · {coherence_label}<br>{_bits}</div>"
+        )
 
     st.markdown(f'''
 <style>
@@ -460,13 +516,7 @@ def render_live_gate_constellation(st, db_path: str | Path, intel_db_path: str |
 .lg-anticipate{{position:relative;margin:10px 0 4px;padding:12px 14px;border-radius:14px;border:1px solid {_acol}44;background:linear-gradient(90deg,{_acol}0F,transparent 62%);display:flex;gap:12px;align-items:center}}
 .lg-anticipate b{{font:700 .72rem/1.35 'Orbitron',sans-serif;letter-spacing:.11em;color:{_acol};text-shadow:0 0 12px {_acol}66}}
 .lg-anticipate .lg-adv{{margin-left:auto;font:600 .52rem/1 'Share Tech Mono',monospace;letter-spacing:.16em;color:#52606E;border:1px solid rgba(142,249,255,.14);border-radius:999px;padding:4px 8px;white-space:nowrap}}
-/* STAR ALIGNMENT meter */
-.lg-charge{{margin:10px 0 2px;display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:12px;align-items:center}}
-.lg-charge label{{font:600 0.60rem/1 'Share Tech Mono',monospace;letter-spacing:.18em;color:#8EF9FF}}
-.lg-charge-track{{position:relative;height:10px;border-radius:999px;background:rgba(142,249,255,.07);border:1px solid rgba(142,249,255,.12);overflow:hidden}}
-.lg-charge-fill{{position:absolute;inset:0 auto 0 0;width:{charge}%;border-radius:999px;background:linear-gradient(90deg,#14F195,#8EF9FF 55%,#FFD700);box-shadow:0 0 14px rgba(20,241,149,.45);transition:width .6s ease}}
-.lg-charge-stars i{{font-style:normal;font-size:.86rem;color:#33424D;margin-left:4px;text-shadow:none;transition:color .4s ease}}
-.lg-charge-stars i.lit{{color:#FFD700;text-shadow:0 0 12px rgba(255,215,0,.75)}}
+/* STAR ALIGNMENT commodity meter REMOVED — constellation instrument from ui.theme */
 /* layer strips */
 .lg-layer-head{{margin:14px 0 2px;display:flex;justify-content:space-between;gap:10px;align-items:baseline}}
 .lg-layer-head b{{font:700 0.64rem/1 'Orbitron',sans-serif;letter-spacing:.20em}}
@@ -499,6 +549,7 @@ def render_live_gate_constellation(st, db_path: str | Path, intel_db_path: str |
 .lg-link.pass i,.lg-link.final-open i{{transform:scaleX(1);opacity:.95;box-shadow:0 0 12px rgba(20,241,149,.7);animation:lgFlow 1.8s ease-in-out infinite}}
 .lg-link.block{{background:repeating-linear-gradient(90deg,rgba(255,7,58,.45) 0 5px,transparent 5px 10px)}}.lg-link.block i{{display:none}}
 /* observation-only candidate flow chips */
+.lg-single-note{{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:10px 2px 4px;padding:8px 11px;border-left:2px solid rgba(255,215,0,.58);background:linear-gradient(90deg,rgba(255,215,0,.045),transparent);font:500 .58rem/1.4 'Share Tech Mono',monospace;color:#607A74}}.lg-single-note b{{font:700 .60rem/1.2 'Orbitron',sans-serif;letter-spacing:.14em;color:#FFD700}}
 .lg-flow-strip{{display:flex;gap:7px;flex-wrap:wrap;padding:8px 2px 2px}}
 .lg-flow-chip{{border:1px solid rgba(142,249,255,.15);border-radius:999px;padding:6px 11px;font:500 0.58rem/1.3 'Share Tech Mono',monospace;color:#55707C;background:rgba(142,249,255,.02)}}
 .lg-flow-chip b{{display:block;font:700 0.56rem/1 'Orbitron',sans-serif;letter-spacing:.14em;color:#5E7A86;margin-bottom:3px}}
@@ -528,17 +579,15 @@ def render_live_gate_constellation(st, db_path: str | Path, intel_db_path: str |
 .lgp-note{{margin-top:8px;font:500 0.58rem/1.5 'Share Tech Mono',monospace;color:#55706A}}
 @keyframes lgSpin{{to{{transform:rotate(360deg)}}}}@keyframes lgFlow{{0%,100%{{opacity:.55}}50%{{opacity:1}}}}@keyframes lgPulse{{0%,100%{{transform:scale(.75);opacity:.55}}50%{{transform:scale(1.25);opacity:1}}}}
 @keyframes lgFirePulse{{0%,100%{{box-shadow:0 0 26px rgba(255,215,0,.30),0 0 0 8px rgba(255,215,0,.05)}}50%{{box-shadow:0 0 42px rgba(255,215,0,.52),0 0 0 10px rgba(255,215,0,.08)}}}}
-@media(max-width:900px){{.lg-head{{grid-template-columns:1fr}}.lg-score{{text-align:left}}.lg-rhythm{{grid-template-columns:repeat(2,1fr)}}.lg-ribbon{{grid-column:1/-1}}.lg-charge{{grid-template-columns:auto 1fr}}.lg-charge-stars{{grid-column:1/-1}}}}
+@media(max-width:900px){{.lg-head{{grid-template-columns:1fr}}.lg-score{{text-align:left}}.lg-rhythm{{grid-template-columns:repeat(2,1fr)}}.lg-ribbon{{grid-column:1/-1}}/* lg-charge removed */}}
 @media(max-width:560px){{.lg-shell{{padding:16px 12px 18px;border-radius:18px}}.lg-title{{font-size:.98rem}}.lg-verdict{{align-items:flex-start;flex-direction:column}}.lg-verdict code{{text-align:left}}.lg-live-pulse{{grid-template-columns:auto 1fr}}.lg-live-pulse span{{grid-column:1/-1;text-align:left}}.lg-anticipate{{flex-wrap:wrap}}.lg-anticipate .lg-adv{{margin-left:0}}}}
 </style>
 <div id="live-gate-constellation" class="lg-shell">
- <div class="lg-head"><div><div class="lg-kicker">✦ SOVEREIGN CAPITAL CONSTELLATION{_help_glyph}</div><div class="lg-title">CAPITAL ALIGNMENT INSTRUMENT</div><div class="lg-sub">An organism-grade capital interlock: every funded fire is visible as a living alignment, never a hidden score. The TECHNICAL UNDERLAY is the sovereign circuit — green closes verified gates and doctrine red #FF073A breaks the path at the authoritative veto. The PATTERN OVERLAY is earned behavioural charge — gold marks confirmed edge and only governs size. Cyan is candidate flow; violet is intelligence. FIRE = circuit closed AND pattern armed.</div></div><div class="lg-score"><b>{readiness}%</b><span>{passed}/{len(nodes)} ALIGNED<br>{_safe(verdict)}</span></div></div>
+ <div class="lg-head"><div><div class="lg-kicker">✦ SOVEREIGN CAPITAL CONSTELLATION{_help_glyph}</div><div class="lg-title">CAPITAL ALIGNMENT INSTRUMENT <span style="font:600 .48rem Share Tech Mono;color:#5A6B70;letter-spacing:.12em">DOCTRINE R2</span></div><div class="lg-sub">An organism-grade capital interlock: every funded fire is visible as a living alignment, never a hidden score. The TECHNICAL UNDERLAY is the sovereign circuit — green closes verified gates and doctrine red #FF073A breaks the path at the authoritative veto. The PATTERN OVERLAY is earned behavioural charge — gold marks confirmed edge and only governs size. Cyan is candidate flow; violet is intelligence. FIRE = circuit closed AND pattern armed.</div></div><div class="lg-score"><b>{readiness}%</b><span>{passed}/{len(nodes)} ALIGNED<br>{_safe(verdict)}</span></div></div>
  <div class="lg-verdict"><strong>{_safe(verdict)}</strong><code>PRIMARY BLOCKER :: {_safe(blocker)}</code></div>
  <div class="lg-anticipate"><b>{_safe(anticipation)}</b><span class="lg-adv">ADVISORY · EXECUTOR VERDICT IS FINAL</span></div>
- <div class="lg-charge"><label>STAR ALIGNMENT {charge}%</label><div class="lg-charge-track"><div class="lg-charge-fill"></div></div><div class="lg-charge-stars">{stars}</div></div>
- <div class="lg-layer-head tech"><b>⚙ TECHNICAL UNDERLAY — HARD CIRCUIT</b><span>{hard_passed}/{hard_total} gates closed · every gate is absolute · ends at the executor's FINAL FIRE star</span></div>
- <div class="lg-rail-viewport"><div class="lg-rail">{hard_rail}</div></div>
- {ladder_html}
+ {constellation_block}
+ <div class="lg-single-note"><b>ONE CANONICAL CONSTELLATION</b><span>technical gates → pattern charge → final fire · each authority appears once · executor verdict remains final</span></div>
  <div class="lg-layer-head flow"><b>◌ CANDIDATE COMET FLOW — OBSERVATION ONLY</b><span>10-minute telemetry · descriptive, never a gate</span></div>
  <div class="lg-flow-strip">{flow_chips}</div>
  <div class="lg-live-pulse"><em></em><strong>{pulse_text}</strong><span>NEXT EVENT :: {_safe(next_event)}</span></div>

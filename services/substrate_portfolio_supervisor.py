@@ -22,9 +22,9 @@ V2 defects repaired here:
 Exit doctrine:
   * stop/profit decisions require a FRESH or DEGRADED mark from a live
     provider — never a mock, never a stale echo.
-  * expiry (SUBSTRATE_MAX_HOLD_SEC) also requires a real mark to settle at;
-    an expired position with no actionable mark is flagged mark_status
-    EXPIRED_UNPRICED and stays OPEN — an honest limbo beats an invented exit.
+  * price-based exits require a real mark. Clock expiry does not: an expired
+    unpriceable PAPER position is terminally written off at realised PnL 0.0,
+    with no invented exit price, so it cannot hold capacity forever.
 """
 
 import argparse
@@ -33,12 +33,12 @@ import time
 from typing import Dict, Optional
 
 from wallets.substrate_wallet_schema import (
-    connect, ensure_schema, heartbeat, cfg_bool, cfg_float, _ensure_col,
+    connect, ensure_schema, heartbeat, cfg_bool, cfg_float, cfg_int, _ensure_col,
 )
 from wallets.substrate_wallet import refresh_wallet_state
 from wallets.substrate_paper_ledger import (
     open_paper_position_from_opportunity, close_paper_position,
-    _ensure_lifecycle_cols,
+    close_unpriced_writeoff, _ensure_lifecycle_cols,
 )
 from wallets.substrate_live_guard import stage_live_order_from_opportunity
 from services.substrate_price_feed import ACTIONABLE_STATUSES, get_prices
@@ -222,17 +222,13 @@ def evaluate_exits(marks: Optional[Dict[str, dict]] = None,
         expired = opened_at > 0 and (now - opened_at) >= max_hold
         if not actionable:
             if expired:
-                expired_unpriced += 1
-                c2 = connect()
-                try:
-                    c2.execute(
-                        "UPDATE substrate_positions SET mark_status="
-                        "'EXPIRED_UNPRICED', updated_at=? WHERE id=? "
-                        "AND state='OPEN'", (now, int(d["id"])),
-                    )
-                    c2.commit()
-                finally:
-                    c2.close()
+                res = close_unpriced_writeoff(
+                    int(d["id"]),
+                    reason=f"EXPIRED_UNPRICED_WRITEOFF:{(now - opened_at) / 3600.0:.1f}h",
+                )
+                if res.get("ok"):
+                    expired_unpriced += 1
+                    closed += 1
             continue
         price = float(px["price"])
         side = str(d.get("side") or "LONG").upper()
@@ -257,6 +253,20 @@ def evaluate_exits(marks: Optional[Dict[str, dict]] = None,
             "realized_pnl": round(realized_total, 6)}
 
 
+def _record_rejection(opportunity_id: int, reason: str, detail: str = "") -> None:
+    con = connect()
+    try:
+        con.execute(
+            "INSERT INTO substrate_rejections(opportunity_id,created_at,reason,detail) "
+            "VALUES(?,?,?,?) ON CONFLICT(opportunity_id,reason) DO UPDATE SET "
+            "created_at=excluded.created_at, detail=excluded.detail",
+            (int(opportunity_id), time.time(), str(reason)[:80], str(detail)[:300]),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
 def supervise_once(fetch_json=None) -> dict:
     ensure_schema()
     state = refresh_wallet_state()
@@ -269,7 +279,7 @@ def supervise_once(fetch_json=None) -> dict:
     opened = 0
     rejected_seen = 0
     try:
-        max_open = int(os.getenv("SUBSTRATE_MAX_OPEN_PAPER_POSITIONS", "3"))
+        max_open = cfg_int(con, "SUBSTRATE_MAX_OPEN", 3)
         open_count = con.execute(
             "SELECT COUNT(*) c FROM substrate_positions "
             "WHERE mode='PAPER' AND state='OPEN'"
@@ -278,19 +288,26 @@ def supervise_once(fetch_json=None) -> dict:
         opps = con.execute(
             """SELECT * FROM substrate_opportunities WHERE state='NEW'
                ORDER BY confidence DESC, created_at DESC LIMIT ?""",
-            (slots or 1,),
+            (max(slots, 20),),
         ).fetchall()
     finally:
         con.close()
 
     staged_live = 0
     live_blocked = 0
+    if slots <= 0:
+        for opp in opps[:20]:
+            _record_rejection(int(opp["id"]), "NO_SLOTS",
+                              f"open_count={open_count};cap={max_open}")
     for opp in opps[:slots]:
         res = open_paper_position_from_opportunity(int(opp["id"]))
         if res.get("ok"):
             opened += 1
         else:
             rejected_seen += 1
+            _record_rejection(int(opp["id"]),
+                              str(res.get("reason") or "NOT_ACTIONABLE").upper(),
+                              str(res))
 
         # Live path is manual-sign only. This creates a READY_FOR_MANUAL_SIGN
         # row after guard checks, never an auto-sent transaction.

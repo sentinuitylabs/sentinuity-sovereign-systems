@@ -328,6 +328,19 @@ def paper_hard_stop_exit_policy(*, is_live_mode: bool, entry_price: Any, current
         out["exit_reason"] = f"HARD_STOP_LOSS_CAPPED_{stop:.1f}pct_raw{pnl:.1f}pct"
         return out
 
+    # SIGNOFF_UNIVERSAL_PAPER_STOP_FLOOR_20260725:
+    # This policy is called only after the executor has observed pnl <= -stop.
+    # Paper accounting must therefore represent the configured stop doctrine,
+    # even when the first observable mark arrives below the threshold. Preserve
+    # the raw trigger separately in the executor; use the synthetic floor only
+    # for SIM accounting. REAL positions remain chain-settled above.
+    out.update(
+        capped=True,
+        exit_price=entry * (1.0 - stop / 100.0),
+        exit_reason=f"HARD_STOP_LOSS_CAPPED_{stop:.1f}pct_raw{pnl:.1f}pct",
+        audit_reason="UNIVERSAL_PAPER_STOP_FLOOR",
+    )
+
     source_blob = _src_text(price_source, first_mark_source, entry_price_source, price_integrity_reason)
     trigger_source_suspect = _is_suspect_source(price_source) or any(tok in source_blob for tok in (
         "enricher_open_position", "intel-mtm", "mtm-snapshot", "router:intel-mtm", "router:mtm-snapshot"
@@ -348,11 +361,11 @@ def paper_hard_stop_exit_policy(*, is_live_mode: bool, entry_price: Any, current
         out.update(
             capped=True,
             dirty=True,
-            defer_close=True,
+            defer_close=False,
             outlier_rejected=True,
-            audit_reason="MARK_OUTLIER_REJECTED:SUSPECT_SOURCE_CATASTROPHIC_HARD_STOP",
+            audit_reason="MARK_OUTLIER_CAPPED:SUSPECT_SOURCE_CATASTROPHIC_HARD_STOP",
             exit_price=entry * (1.0 - stop / 100.0),
-            exit_reason=f"HARD_STOP_DEFERRED_MARK_OUTLIER_raw{pnl:.1f}pct",
+            exit_reason=f"HARD_STOP_LOSS_CAPPED_{stop:.1f}pct_raw{pnl:.1f}pct",
         )
         return out
 
@@ -360,11 +373,11 @@ def paper_hard_stop_exit_policy(*, is_live_mode: bool, entry_price: Any, current
         out.update(
             capped=True,
             dirty=True,
-            defer_close=True,
+            defer_close=False,
             outlier_rejected=True,
-            audit_reason=f"MARK_OUTLIER_REJECTED:{first_tick_reason}",
+            audit_reason=f"MARK_OUTLIER_CAPPED:{first_tick_reason}",
             exit_price=entry * (1.0 - stop / 100.0),
-            exit_reason=f"HARD_STOP_DEFERRED_FIRST_TICK_raw{pnl:.1f}pct",
+            exit_reason=f"HARD_STOP_LOSS_CAPPED_{stop:.1f}pct_raw{pnl:.1f}pct",
         )
         return out
 

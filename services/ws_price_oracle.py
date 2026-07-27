@@ -303,6 +303,61 @@ def _refresh_hot_set() -> None:
             except Exception as exc:
                 log.debug("ws_oracle: hot latched query skipped: %s", exc)
 
+            # SIGNOFF_FLOW_LATENCY_20260724 — Tier 2.5: FRESH-CANDIDATE SPRINT.
+            # Root cause: Tier 3 ranks ALREADY-PRICED rows ahead of unpriced
+            # ones (priced-first CASE) and confidence ahead of recency, so a
+            # brand-new discovery with no price and no confidence sorted last
+            # and was routinely pushed out of the 40-mint cap during bursts —
+            # the measured 268s median discovery→first-price starvation.
+            # Sprint slots are a SMALL bounded partition (default 12) for
+            # UNPRICED candidates discovered in the last SPRINT_MAX_AGE
+            # seconds (default 120), newest first. Slots expire naturally via
+            # the age predicate. Open positions (Tier 1) and latched rows
+            # (Tier 2) are added before this and are never evicted by it.
+            # Pricing allocation only — no qualification/latch/exit change.
+            try:
+                sprint_limit = int(float(os.getenv("ORACLE_FRESH_SPRINT_LIMIT", "12")))
+            except Exception:
+                sprint_limit = 12
+            sprint_limit = max(0, min(sprint_limit, 20))
+            try:
+                sprint_max_age = float(os.getenv("ORACLE_FRESH_SPRINT_MAX_AGE_SEC", "120"))
+            except Exception:
+                sprint_max_age = 120.0
+            if sprint_limit > 0:
+                try:
+                    _pre_sprint = set(ordered)
+                    add_rows(conn.execute("""
+                        SELECT mint_address
+                        FROM market_snapshots
+                        WHERE mint_address IS NOT NULL
+                          AND TRIM(mint_address)!=''
+                          AND LOWER(COALESCE(candidate_state,'pending'))='pending'
+                          AND LOWER(COALESCE(quality_status,'pending'))
+                              NOT IN ('rejected','error')
+                          AND COALESCE(latched,0)=0
+                          AND COALESCE(execution_ready,0)=0
+                          AND (COALESCE(observed_price,0)<=0
+                               OR COALESCE(price_updated_at,0)<=0)
+                          AND COALESCE(first_seen_at,created_at,timestamp,0) >= ?
+                        ORDER BY COALESCE(first_seen_at,created_at,timestamp,0) DESC,
+                                 id DESC
+                        LIMIT ?
+                    """, (now - sprint_max_age, sprint_limit)).fetchall())
+                    _sprint_added = [m for m in ordered if m not in _pre_sprint]
+                    if _sprint_added:
+                        log.info("[ORACLE_FRESH_SPRINT] admitted=%d mints=%s",
+                                 len(_sprint_added), [m[:10] for m in _sprint_added[:8]])
+                        try:
+                            from services.stage_telemetry import record_stage as _tel
+                            for _sm in _sprint_added:
+                                _tel("ORACLE_ADMITTED", _sm, source="fresh_sprint")
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    log.debug("ws_oracle: fresh sprint query skipped: %s", exc)
+            # /SIGNOFF_FLOW_LATENCY_20260724 Tier 2.5
+
             # Tier 3: fresh real candidates. Confidence and recency are used only
             # to allocate oracle coverage; all qualification and safety gates stay
             # unchanged in market_intelligence.
@@ -588,18 +643,48 @@ def _remove_mint_event_ts(mint: str) -> None:
 
 
 # ── BONDING CURVE LOOKUP (FIXED) ──────────────────────────────────────────────
-import base58 as _b58_mod
+# `base58` is optional.  The oracle must remain importable when that third-party
+# package is absent because solders may still provide PDA derivation and the
+# internal codec below is sufficient for the pure-Python fallback.
+try:
+    import base58 as _b58_mod
+except ImportError:
+    _b58_mod = None
+
+_B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_B58_INDEX = {ch: i for i, ch in enumerate(_B58_ALPHABET)}
 
 _bc_cache: Dict[str, str] = {}
 _bc_cache_lock = threading.Lock()
 
 
-def _b58decode(s: str) -> bytes:
-    return _b58_mod.b58decode(s)
+def _b58decode(value: str) -> bytes:
+    if _b58_mod is not None:
+        return _b58_mod.b58decode(value)
+    raw = str(value or "").encode("ascii")
+    number = 0
+    for ch in raw:
+        if ch not in _B58_INDEX:
+            raise ValueError(f"invalid base58 character: {chr(ch)!r}")
+        number = number * 58 + _B58_INDEX[ch]
+    body = number.to_bytes((number.bit_length() + 7) // 8, "big") if number else b""
+    leading_zeroes = len(raw) - len(raw.lstrip(b"1"))
+    return (b"\x00" * leading_zeroes) + body
 
 
-def _b58encode(b: bytes) -> str:
-    return _b58_mod.b58encode(b).decode()
+def _b58encode(value: bytes) -> str:
+    if _b58_mod is not None:
+        return _b58_mod.b58encode(value).decode("ascii")
+    raw = bytes(value)
+    number = int.from_bytes(raw, "big")
+    encoded = bytearray()
+    while number:
+        number, remainder = divmod(number, 58)
+        encoded.append(_B58_ALPHABET[remainder])
+    leading_zeroes = len(raw) - len(raw.lstrip(b"\x00"))
+    prefix = b"1" * leading_zeroes
+    body = bytes(reversed(encoded)) if encoded else b""
+    return (prefix + body).decode("ascii")
 
 
 def _rpc_call(method: str, params: list) -> Optional[dict]:
@@ -780,6 +865,16 @@ def get_bonding_curve_pda_verified(mint: str) -> Optional[str]:
 
 
 # ── DECODER ───────────────────────────────────────────────────────────────────
+def decode_bonding_curve_state(data_b64: str) -> Optional[dict]:
+    """Shadow provenance helper including Pump migration flag; legacy decoder unchanged."""
+    try:
+        raw = base64.b64decode(data_b64)
+        if len(raw) < 49 or raw[:8] != _BC_DISCRIMINATOR:
+            return None
+        return {"virtual_token_reserves": struct.unpack_from("<Q", raw, VTOK_OFFSET)[0], "virtual_sol_reserves": struct.unpack_from("<Q", raw, VSOL_OFFSET)[0], "complete": bool(raw[48])}
+    except Exception:
+        return None
+
 def decode_bonding_curve(data_b64: str) -> Optional[tuple[float, float]]:
     try:
         raw = base64.b64decode(data_b64)
@@ -802,7 +897,7 @@ def _fetch_dexscreener_fallback(mint: str) -> Optional[float]:
         r = _req.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=6)
         if r.status_code != 200:
             return None
-        pairs = r.json().get("pairs") or []
+        pairs = [p for p in (r.json().get("pairs") or []) if str(p.get("chainId") or "").lower() == "solana"]
         if not pairs:
             return None
         best = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
@@ -1091,10 +1186,12 @@ def _write_mtm(mint: str, price_usd: float, source: str = "helius") -> None:
             _last_price_ts = _mtm_last_write.get(mint, 0.0)
         except Exception:
             pass
-        _interval = 1.2 if _is_open_pos else _get_tier_write_interval(mint, _last_price_ts)
+        _is_runner_pos = _is_runner_position_mint(mint) if _is_open_pos else False
+        _interval = (0.25 if _is_runner_pos else 1.2) if _is_open_pos else _get_tier_write_interval(mint, _last_price_ts)
         _should_write = (
             (_elapsed >= _interval)                     # rate-limited per mint
             or (_delta_pct >= MTM_MIN_DELTA_PCT)        # always write on significant move
+            or (_is_runner_pos and _delta_pct > 0.10)   # runner collapse sensitivity
             or (_is_open_pos and _delta_pct > 0.4)      # force on any meaningful move
         )
         if not _should_write:
@@ -1185,23 +1282,47 @@ def _write_mtm(mint: str, price_usd: float, source: str = "helius") -> None:
             )
         else:
             # Candidate pricing must update the original ingest row in place.
-            conn.execute(
+            # SIGNOFF_FLOW_LATENCY_20260724: resolve the target row id with the
+            # SAME predicate first (identical row selection semantics), so the
+            # write can be attributed to an exact snapshot lineage and a
+            # FIRST_PRICE telemetry event can be emitted when the row had no
+            # prior trusted price. This is the row-level truth the audit could
+            # not reconstruct from text logs.
+            _target = conn.execute(
                 """
-                UPDATE market_snapshots
-                SET observed_price = ?,
-                    price_updated_at = ?,
-                    price_last_attempt_at = ?,
-                    price_status = 'priced'
-                WHERE id = (
-                    SELECT id FROM market_snapshots
-                    WHERE mint_address = ?
-                      AND candidate_state IN ('pending','qualified')
-                      AND COALESCE(execution_ready,0) != 2
-                    ORDER BY id DESC LIMIT 1
-                )
+                SELECT id, COALESCE(price_updated_at,0) AS prior_ts,
+                       COALESCE(first_seen_at, created_at, 0) AS first_seen
+                FROM market_snapshots
+                WHERE mint_address = ?
+                  AND candidate_state IN ('pending','qualified')
+                  AND COALESCE(execution_ready,0) != 2
+                ORDER BY id DESC LIMIT 1
                 """,
-                (price_usd, now, now, mint),
-            )
+                (mint,),
+            ).fetchone()
+            if _target is not None:
+                _target_id = int(_target[0])
+                _prior_price_ts = float(_target[1] or 0.0)
+                _row_first_seen = float(_target[2] or 0.0)
+                conn.execute(
+                    """
+                    UPDATE market_snapshots
+                    SET observed_price = ?,
+                        price_updated_at = ?,
+                        price_last_attempt_at = ?,
+                        price_status = 'priced'
+                    WHERE id = ?
+                    """,
+                    (price_usd, now, now, _target_id),
+                )
+                if _prior_price_ts <= 0:
+                    try:
+                        from services.stage_telemetry import record_stage as _tel
+                        _tel("FIRST_PRICE", mint, snapshot_id=_target_id,
+                             provider=source, source="ws_price_oracle",
+                             discovered_ts=_row_first_seen or None)
+                    except Exception:
+                        pass
 
         _sent0707_peak_ok = 1 if _sent0707_peak_trusted_source(source) else 0
         _pp_cols = {r[1] for r in conn.execute("PRAGMA table_info(paper_positions)").fetchall()}
@@ -1275,8 +1396,9 @@ def _write_mtm(mint: str, price_usd: float, source: str = "helius") -> None:
 
 # ── OPEN POSITION PRIORITY ───────────────────────────────────────────────────
 _open_position_mints_cache: set = set()
+_runner_position_mints_cache: set = set()
 _open_position_mints_last_check = 0.0
-_OPEN_MINTS_CACHE_TTL = 1.0  # refresh every 1s - new positions visible within 1s
+_OPEN_MINTS_CACHE_TTL = 0.5  # runner transitions become visible within one evaluator cycle
 
 
 def _is_open_position_mint(mint: str) -> bool:
@@ -1284,20 +1406,28 @@ def _is_open_position_mint(mint: str) -> bool:
     Returns True if mint has an OPEN paper_position.
     Cached for 5s to avoid per-tick DB reads.
     """
-    global _open_position_mints_cache, _open_position_mints_last_check
+    global _open_position_mints_cache, _runner_position_mints_cache, _open_position_mints_last_check
     now = time.time()
     if now - _open_position_mints_last_check > _OPEN_MINTS_CACHE_TTL:
         try:
             _c = sqlite3.connect(str(DB_PATH), timeout=2.0)
             rows = _c.execute(
-                "SELECT DISTINCT mint_address FROM paper_positions WHERE status='OPEN'"
+                """SELECT DISTINCT mint_address,
+                    MAX(COALESCE(trusted_peak_pct,runner_peak_pct,runner_latch_peak_pct,peak_pnl_pct,0)) AS peak
+                    FROM paper_positions WHERE status='OPEN' GROUP BY mint_address"""
             ).fetchall()
             _open_position_mints_cache = {str(r[0]).strip() for r in rows if r[0]}
+            _runner_position_mints_cache = {str(r[0]).strip() for r in rows if r[0] and float(r[1] or 0)>=20.0}
             _c.close()
             _open_position_mints_last_check = now
         except Exception:
             pass  # keep stale cache on error
     return mint in _open_position_mints_cache
+
+
+def _is_runner_position_mint(mint: str) -> bool:
+    _is_open_position_mint(mint)  # refresh shared cache
+    return mint in _runner_position_mints_cache
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -1503,7 +1633,18 @@ class HeliusOracle:
     async def _subscribe_mint(self, ws, mint: str):
         if mint in self._subscribed:
             return
-        pda = get_bonding_curve_pda_verified(mint)
+        # SIGNOFF_FLOW_LATENCY_20260724: get_bonding_curve_pda_verified()
+        # performs a synchronous requests.post (up to ~5s timeout, plus a
+        # 15-signature fallback scan). Calling it directly here BLOCKED the
+        # entire asyncio event loop — message handling, price writes and all
+        # other subscriptions stalled for seconds per new mint during launch
+        # bursts. Run it in the default executor instead; behaviour and the
+        # returned PDA are identical.
+        try:
+            _loop = asyncio.get_running_loop()
+            pda = await _loop.run_in_executor(None, get_bonding_curve_pda_verified, mint)
+        except RuntimeError:
+            pda = get_bonding_curve_pda_verified(mint)
         if not pda:
             log.warning("[ORACLE_SUBSCRIBE_FAIL] mint=%s reason=no_bonding_curve - will use DexScreener fallback", mint[:16])
             # No PDA = graduated or unknown token. Add to subscribed set with a
@@ -1688,11 +1829,32 @@ class HeliusOracle:
                 open_mints = await loop.run_in_executor(None, _get_open_mints)
                 if not open_mints:
                     continue
-                for mint in list(open_mints):
+                # SIGNOFF_FLOW_LATENCY_20260724: _get_open_mints() is wrapped
+                # by the sign-off universe patch and can return up to ~90
+                # mints (positions + candidates). The previous unbounded
+                # serial waterfall (DexScreener→Jupiter→Birdeye, 1–4s each)
+                # made ONE keepalive pass take minutes during bursts, so the
+                # "2s loop" was fiction and fresh candidates queued behind
+                # the whole universe. Fix: a bounded per-cycle HTTP budget
+                # (default 12) with true open positions ALWAYS serviced
+                # first; remaining budget goes to candidates newest-side of
+                # the wrapped ordering. Coverage-scheduling only.
+                try:
+                    _ka_budget = int(float(os.getenv("ORACLE_KEEPALIVE_HTTP_BUDGET", "12")))
+                except Exception:
+                    _ka_budget = 12
+                _ka_budget = max(2, min(_ka_budget, 40))
+                _positions_first = [m for m in open_mints if _is_open_position_mint(m)]
+                _candidates_next = [m for m in open_mints if m not in set(_positions_first)]
+                _ka_spent = 0
+                for mint in _positions_first + _candidates_next:
+                    if _ka_spent >= _ka_budget and mint not in _positions_first:
+                        break  # budget exhausted; open positions were already serviced
                     # Skip if WSS already wrote a fresh tick recently
                     age = get_mint_event_age(mint)
                     if age < 2.0:
                         continue
+                    _ka_spent += 1
                     try:
                         price, src = await loop.run_in_executor(
                             None, _fetch_best_fallback_price, mint
@@ -2182,14 +2344,30 @@ def _sentinuity_signoff_hot_candidate_mints(existing: list[str]) -> list[str]:
         created_expr = _sentinuity_signoff_coalesce(cols, ("created_at", "updated_at", "first_seen_at", "timestamp"), "0")
         state_expr   = _sentinuity_signoff_coalesce(cols, ("candidate_state",), "'pending'")
 
+        # SIGNOFF_FLOW_LATENCY_20260724 — fresh-window exemption.
+        # Root cause (circular starvation): the flat `confidence >= 0.80`
+        # gate excluded fresh discoveries whose confidence is only written
+        # DURING qualification, while the qualifier itself schedules priced
+        # rows first — so no price → no confidence → no oracle coverage →
+        # no price. Candidates younger than the sprint window are admitted
+        # regardless of confidence; the 0.80 floor still applies to
+        # everything older. Coverage allocation only — never fakes price,
+        # never sets qualified/latched/execution_ready.
+        try:
+            fresh_exempt_age = _sentinuity_signoff_cfg_float(
+                "ORACLE_FRESH_SPRINT_MAX_AGE_SEC", 120.0)
+        except Exception:
+            fresh_exempt_age = 120.0
+        fresh_cutoff = now - max(0.0, fresh_exempt_age)
         where = [
             "mint_address IS NOT NULL",
             "TRIM(mint_address) != ''",
-            f"CAST({conf_expr} AS REAL) >= ?",
+            f"(CAST({conf_expr} AS REAL) >= ? OR CAST({created_expr} AS REAL) >= ?)",
             f"CAST({created_expr} AS REAL) >= ?",
             f"LOWER(COALESCE({state_expr}, 'pending')) NOT IN ('vetoed','exited','closed','reset_archived')",
         ]
-        params: list[object] = [min_conf, cutoff]
+        params: list[object] = [min_conf, fresh_cutoff, cutoff]
+        # /SIGNOFF_FLOW_LATENCY_20260724
 
         if "price_status" in cols:
             # Include stale `priced` qualified rows too. They already have a truth

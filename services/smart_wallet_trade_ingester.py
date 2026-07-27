@@ -95,13 +95,18 @@ DB_PATH = next((ROOT / c for c in ("sentinuity_matrix.db", "data/sentinuity_matr
 SERVICE = "smart_wallet_trade_ingester"
 WSOL = "So11111111111111111111111111111111111111112"
 
-WALLETS_PER_CYCLE = 12
-SIGS_PER_WALLET = 15
-REQUEST_SPACING_S = 0.25
-CYCLE_SLEEP_S = 90
+WALLETS_PER_CYCLE = max(1, min(20, int(os.getenv("SWTI_WALLETS_PER_CYCLE", "12"))))
+SIGS_PER_WALLET = max(1, min(20, int(os.getenv("SWTI_SIGS_PER_WALLET", "15"))))
+REQUEST_SPACING_S = max(0.10, float(os.getenv("SWTI_REQUEST_SPACING_SEC", "0.25")))
+CYCLE_SLEEP_S = max(60, int(os.getenv("SWTI_CYCLE_SLEEP_SEC", "90")))
 COMPLETED_MIN_FOR_SCORE = 3
 SCORE_WINDOW_DAYS = 14
 OVERLAP_WINDOW_S = 900  # observed buys within 15 min match active snapshots
+
+# SIGNOFF_RPC_BUDGET_RESTORE_20260725
+# Restore the last edge-preserving observer budget. This service shares Solana
+# RPC providers with price/oracle services, so aggressive backfill must remain
+# subordinate to trading continuity. Environment overrides remain available.
 
 _PROVIDERS = [(n, (os.environ.get(e) or "").strip()) for n, e in
               (("QUICKNODE", "QUICKNODE_RPC"), ("HELIUS", "HELIUS_RPC"),
@@ -111,9 +116,18 @@ _provider_idx = 0
 
 
 def _conn() -> sqlite3.Connection:
-    c = sqlite3.connect(str(DB_PATH), timeout=10)
+    # SIGNOFF_OBSERVER_LOCK_20260725: timeout=0.25s + busy_timeout=200ms meant
+    # ANY concurrent writer on the shared matrix DB (oracle marks, qualifier
+    # verdicts, executor opens) made this observer's writes fail outright.
+    # Overlap signals are written in a loop over active mints — a single lock
+    # collision silently dropped the batch, which is a leading candidate for
+    # "many wallet transactions fetched, zero overlap signals produced".
+    # The observer stays subordinate: it waits briefly, it does not hold
+    # write transactions open, and it never blocks trading.
+    c = sqlite3.connect(str(DB_PATH),
+                        timeout=float(os.getenv("SWTI_DB_TIMEOUT_SEC", "5.0")))
     c.row_factory = sqlite3.Row
-    c.execute("PRAGMA busy_timeout=10000")
+    c.execute("PRAGMA busy_timeout=%d" % int(float(os.getenv("SWTI_DB_TIMEOUT_SEC", "5.0")) * 1000))
     return c
 
 
@@ -451,8 +465,9 @@ def write_overlap_signals() -> int:
                     " VALUES(?,?,?,?,?,?,?,?,?, 'OBSERVE')",
                     (mint, mint[:10], now, int(r["n"]), elite,
                      min(1.0, int(r["n"]) / 3.0), conv,
-                     "LOW" if elite else "UNKNOWN",
-                     "" if elite else "MATCHED_BUT_SUB_ELITE"))
+                     "LOW" if elite else ("MEDIUM" if int(r["n"]) >= 2 else "UNKNOWN"),
+                     "" if (elite >= 1 or int(r["n"]) >= 2)
+                     else "INSUFFICIENT_WALLET_CONVERGENCE"))
                 c.execute("INSERT INTO smart_wallet_events(event_time, event_type,"
                           " token_mint, message) VALUES(?, 'OVERLAP_SIGNAL', ?, ?)",
                           (now, mint, json.dumps({

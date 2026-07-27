@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = ROOT / "sentinuity_matrix.db"
+DB_PATH = ROOT / "sentinuity_build.db"
 
 PHASES = ["OPEN", "CLAIMED", "RESEARCHING", "EVIDENCE_READY", "PROPOSING",
           "DEBATING", "GATED", "PATCH_READY", "APPLYING", "NEEDS_OPERATOR",
@@ -86,9 +86,11 @@ CREATE TABLE IF NOT EXISTS council_needs_operator(
 
 
 def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
-    c = sqlite3.connect(str(db_path or DB_PATH), timeout=10)
+    c = sqlite3.connect(str(db_path or DB_PATH), timeout=1.0)
     c.row_factory = sqlite3.Row
-    c.execute("PRAGMA busy_timeout=8000")
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
+    c.execute("PRAGMA busy_timeout=750")
     return c
 
 
@@ -131,40 +133,64 @@ def _qi(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-def import_sources(db_path: Optional[Path] = None) -> int:
-    """Import legacy task authorities without assuming one historical schema.
+def import_sources(db_path: Optional[Path] = None,
+                   source_db_path: Optional[Path] = None) -> int:
+    """Import task authorities from the live matrix into the isolated build DB.
 
-    Every SELECT is assembled from columns actually present in the live table.
-    A malformed or unfamiliar source table is skipped rather than killing the
-    entire autobuilder cycle. Existing canonical rows remain deduplicated by
-    (source_table, source_id).
+    Source access is read-only and fail-fast. Build bookkeeping is written only
+    to sentinuity_build.db, so a busy trading database causes a skipped intake
+    rather than delaying market or execution services.
     """
     ensure_schema(db_path)
-    c = connect(db_path)
+    source = Path(source_db_path or (ROOT / "sentinuity_matrix.db"))
+    if not source.exists():
+        return 0
+    uri = f"file:{source.as_posix()}?mode=ro"
+    try:
+        src = sqlite3.connect(uri, uri=True, timeout=0.2)
+        src.row_factory = sqlite3.Row
+        src.execute("PRAGMA query_only=ON")
+        src.execute("PRAGMA busy_timeout=200")
+    except sqlite3.Error:
+        return 0
+    dst = connect(db_path)
     n = 0
     now = time.time()
     try:
-        # council_work_queue
-        table = "council_work_queue"
-        cols = _table_columns(c, table)
-        idc, titlec = _pick(cols, "id", "task_id"), _pick(cols, "title", "task_name", "name")
-        if idc and titlec:
+        specs = [
+            ("council_work_queue", ("id","task_id"), ("title","task_name","name"), "ui"),
+            ("council_world_tasks", ("task_id","id"), ("title","task_name","name"), "world"),
+            ("polaris_standing_tasks", ("id","task_id"), ("title","task_name","name"), "research"),
+        ]
+        for table, ids, titles, default_domain in specs:
+            cols = _table_columns(src, table)
+            idc, titlec = _pick(cols, *ids), _pick(cols, *titles)
+            if not idc or not titlec:
+                continue
             desc = _pick(cols, "description", "details", "prompt")
-            pri = _pick(cols, "priority")
+            pri = _pick(cols, "priority", "operator_priority")
             risk = _pick(cols, "risk_level", "risk_tier")
-            tab = _pick(cols, "target_tab", "domain", "world_location")
+            domainc = _pick(cols, "target_tab", "domain", "world_location", "building_id")
             typ = _pick(cols, "task_type", "type")
             agent = _pick(cols, "assigned_agent", "owner", "agent_owner")
             status = _pick(cols, "status")
-            where = f"WHERE lower(COALESCE(CAST({_qi(status)} AS TEXT),'open')) IN ('open','queued','active')" if status else ""
-            sql = f"SELECT * FROM {_qi(table)} {where}"
-            for r in c.execute(sql):
-                domain = str(r[tab] if tab and r[tab] is not None else "ui").lower()
+            enabled = _pick(cols, "enabled", "is_enabled")
+            clauses = []
+            if enabled:
+                clauses.append(f"COALESCE(CAST({_qi(enabled)} AS INTEGER),1)=1")
+            if status:
+                clauses.append(f"lower(COALESCE(CAST({_qi(status)} AS TEXT),'active')) NOT IN ('disabled','cancelled','superseded','completed','failed')")
+            where = "WHERE " + " AND ".join(clauses) if clauses else ""
+            for r in src.execute(f"SELECT * FROM {_qi(table)} {where}"):
+                domain = str(r[domainc] if domainc and r[domainc] else default_domain).lower()
                 risk_val = str(r[risk] if risk and r[risk] is not None else "LOW")
                 type_val = str(r[typ] if typ and r[typ] is not None else "")
                 owner = str(r[agent] if agent and r[agent] else "POLARIS").upper()
-                priority = int(r[pri] if pri and r[pri] is not None else 5)
-                cur = c.execute(
+                try:
+                    priority = int(r[pri] if pri and r[pri] is not None else 7)
+                except Exception:
+                    priority = 7
+                cur = dst.execute(
                     "INSERT INTO council_task_ledger(source_table,source_id,title,"
                     "description,domain,risk_tier,priority,owner,created_at,updated_at) "
                     "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_table,source_id) DO NOTHING",
@@ -173,61 +199,13 @@ def import_sources(db_path: Optional[Path] = None) -> int:
                      domain, _risk_tier(risk_val, domain, type_val), priority,
                      owner, now, now))
                 n += max(cur.rowcount, 0)
-
-        # council_world_tasks
-        table = "council_world_tasks"
-        cols = _table_columns(c, table)
-        idc, titlec = _pick(cols, "task_id", "id"), _pick(cols, "title", "task_name", "name")
-        if idc and titlec:
-            risk = _pick(cols, "risk_tier", "risk_level")
-            status = _pick(cols, "status")
-            domainc = _pick(cols, "world_location", "domain", "building_id")
-            where = f"WHERE lower(COALESCE(CAST({_qi(status)} AS TEXT),'queued')) IN ('queued','open','active')" if status else ""
-            for r in c.execute(f"SELECT * FROM {_qi(table)} {where}"):
-                raw_risk = r[risk] if risk and r[risk] is not None else 1
-                try:
-                    tier = "A" if int(raw_risk) <= 2 else "B"
-                except Exception:
-                    tier = "A" if str(raw_risk).upper() in ("A","LOW","MEDIUM") else "B"
-                domain = str(r[domainc] if domainc and r[domainc] else "world").lower()
-                cur = c.execute(
-                    "INSERT INTO council_task_ledger(source_table,source_id,title,"
-                    "domain,risk_tier,priority,created_at,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(source_table,source_id) DO NOTHING",
-                    (table, r[idc], str(r[titlec]), domain, tier, 6, now, now))
-                n += max(cur.rowcount, 0)
-
-        # polaris_standing_tasks -- live schemas use title; older packs used task_name.
-        table = "polaris_standing_tasks"
-        cols = _table_columns(c, table)
-        idc = _pick(cols, "id", "task_id")
-        titlec = _pick(cols, "title", "task_name", "name")
-        if idc and titlec:
-            status = _pick(cols, "status")
-            enabled = _pick(cols, "enabled", "is_enabled")
-            domainc = _pick(cols, "domain")
-            pric = _pick(cols, "priority", "operator_priority")
-            clauses = []
-            if enabled:
-                clauses.append(f"COALESCE(CAST({_qi(enabled)} AS INTEGER),1)=1")
-            if status:
-                clauses.append(f"lower(COALESCE(CAST({_qi(status)} AS TEXT),'active')) NOT IN ('disabled','cancelled','superseded')")
-            where = "WHERE " + " AND ".join(clauses) if clauses else ""
-            for r in c.execute(f"SELECT * FROM {_qi(table)} {where}"):
-                domain = str(r[domainc] if domainc and r[domainc] else "research").lower()
-                try:
-                    priority = int(r[pric] if pric and r[pric] is not None else 7)
-                except Exception:
-                    priority = 7
-                cur = c.execute(
-                    "INSERT INTO council_task_ledger(source_table,source_id,title,"
-                    "domain,risk_tier,priority,created_at,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(source_table,source_id) DO NOTHING",
-                    (table, r[idc], str(r[titlec]), domain, "A", priority, now, now))
-                n += max(cur.rowcount, 0)
-        c.commit()
+        dst.commit()
+    except sqlite3.OperationalError:
+        dst.rollback()
+        return 0
     finally:
-        c.close()
+        src.close()
+        dst.close()
     return n
 
 
@@ -288,7 +266,7 @@ def claim(agent: str, canonical_id: Optional[int] = None,
                 "SELECT canonical_id FROM council_task_ledger "
                 "WHERE phase IN ('OPEN','FAILED_RETRYABLE','BLOCKED_TRANSIENT') "
                 "AND (claimed_by IS NULL OR lease_expires_at < ?) "
-                "ORDER BY (domain=?) ASC, priority ASC, created_at ASC LIMIT 1",
+                "ORDER BY priority ASC, (domain=?) ASC, created_at ASC LIMIT 1",
                 (now, last_dom)).fetchone()
             if not row:
                 return None
@@ -361,9 +339,10 @@ def enforce_progress(db_path: Optional[Path] = None) -> Dict[str, int]:
            "needs_operator": 0}
     try:
         out["escalated"] = c.execute(
-            "UPDATE council_task_ledger SET priority=MAX(1, priority-1),"
+            "UPDATE council_task_ledger SET priority=0,"
             " updated_at=? WHERE phase='OPEN' AND claimed_by IS NULL"
-            " AND created_at < ?", (now, now - UNCLAIMED_ESCALATE_SEC)).rowcount
+            " AND priority>0 AND updated_at < ?",
+            (now, now - UNCLAIMED_ESCALATE_SEC)).rowcount
         for r in c.execute(
                 "SELECT canonical_id, phase, retry_count, title, domain,"
                 " risk_tier, priority FROM council_task_ledger WHERE phase IN "

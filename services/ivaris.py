@@ -50,57 +50,55 @@ Output JSON only: {"verdict": "APPROVE|REJECT|DEBATE", "confidence": 0.0-1.0,
 
 
 def _try_nim(system: str, user: str) -> Optional[str]:
-    """Call IVARIS via NIM. Returns raw text or None on failure."""
+    """Call IVARIS through the assigned NIM model and rotate on empty/error."""
+    nim_key = os.getenv("NVIDIA_NIM_API_KEY", "").strip()
+    if not nim_key:
+        return None
     try:
-        nim_key = os.getenv("NVIDIA_NIM_API_KEY", "").strip()
-        if not nim_key:
-            return None
+        from services.nvidia_model_registry import get_assignment, rotate_after_failure
+    except Exception:
+        get_assignment = None
+        rotate_after_failure = None
 
-        try:
-            from core.schema import get_config_value
-            
-            try:
-                from services.nvidia_model_registry import get_assignment
-                model = get_assignment("IVARIS", IVARIS_NIM_MODEL_DEFAULT)
-            except Exception:
-                model = str(get_config_value("IVARIS_NIM_MODEL", IVARIS_NIM_MODEL_DEFAULT)).strip()
-        except Exception:
+    model = get_assignment("IVARIS", IVARIS_NIM_MODEL_DEFAULT) if get_assignment else IVARIS_NIM_MODEL_DEFAULT
+    attempted = set()
+    for attempt in range(2):
+        model = str(model or IVARIS_NIM_MODEL_DEFAULT).strip()
+        if not model or model in attempted:
+            break
+        attempted.add(model)
+        if model.lower().startswith("claude"):
             model = IVARIS_NIM_MODEL_DEFAULT
-
-        if str(model).lower().startswith("claude"):
-            # V3_HONESTY_ROUTING_20260721: never send an Anthropic model id to the NIM
-            # endpoint — guaranteed 400. Fall back to the NIM default and log
-            # a sanitised diagnostic (model name only; no keys).
-            log.error("IVARIS routing guard: refusing Anthropic model %r on the "
-                      "NIM endpoint; using NIM default %r",
-                      str(model)[:48], IVARIS_NIM_MODEL_DEFAULT)
-            model = IVARIS_NIM_MODEL_DEFAULT
-
         payload = json.dumps({
             "model": model,
             "messages": [
                 {"role": "system", "content": system},
-                {"role": "user",   "content": user},
+                {"role": "user", "content": user},
             ],
             "max_tokens": 600,
             "temperature": 0.3,
         }).encode()
-
         req = urllib.request.Request(
-            NIM_BASE_URL,
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {nim_key}",
-                "Content-Type": "application/json",
-            },
+            NIM_BASE_URL, data=payload,
+            headers={"Authorization": f"Bearer {nim_key}", "Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
-            return data["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        log.debug("NIM IVARIS call failed: %s", e)
-        return None
+        failure = ""
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+                text = str((((data.get("choices") or [{}])[0].get("message") or {}).get("content")) or "").strip()
+                if text:
+                    return text
+                failure = "EMPTY_CONTENT_200"
+        except Exception as exc:
+            failure = f"{type(exc).__name__}:{str(exc)[:220]}"
+        log.warning("IVARIS_NIM_MODEL_FAILED model=%s reason=%s", model, failure)
+        if rotate_after_failure:
+            model = rotate_after_failure("IVARIS", model, failure, refresh=(attempt == 1))
+        else:
+            break
+    return None
 
 
 def _try_anthropic(system: str, user: str) -> Optional[str]:

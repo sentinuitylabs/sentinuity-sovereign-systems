@@ -27,6 +27,8 @@ import re
 from urllib.parse import urlparse
 from pathlib import Path
 
+UI_DOCTRINE_RUNTIME_BUILD = "20260725-R2"
+
 # ── SENTINUITY COLOUR DOCTRINE (SIGNOFF_DOCTRINE_MAP_20260624) ───────────────
 # Single source of truth for the patched components (pressure core, runner tape).
 # Gold is NEVER a routine base fill - it is the earned apex only.
@@ -2042,6 +2044,26 @@ def _row_text(row, keys, default="-"):
 
 
 @st.fragment(run_every=29)
+
+
+
+def render_price_truth_shadow_panel() -> None:
+    """Read-only Phase 0/1 executable-vs-reference divergence panel."""
+    import sqlite3 as _sq
+    from pathlib import Path as _Path
+    db = _Path(__file__).resolve().parent.parent / "sentinuity_price_truth.db"
+    if not db.exists():
+        st.caption("PRICE TRUTH SHADOW · awaiting first snapshot")
+        return
+    try:
+        c=_sq.connect(f"file:{db}?mode=ro",uri=True,timeout=.1); c.row_factory=_sq.Row; c.execute("PRAGMA query_only=ON")
+        rows=c.execute("SELECT s.* FROM price_truth_snapshots s JOIN (SELECT position_id,MAX(id) id FROM price_truth_snapshots GROUP BY position_id) x ON s.id=x.id ORDER BY ABS(COALESCE(s.divergence_pct,0)) DESC LIMIT 8").fetchall(); c.close()
+        st.markdown("<div style='font-family:Share Tech Mono,monospace;letter-spacing:2px;color:#8EF9FF'>PRICE TRUTH SHADOW · NO AUTHORITY</div>",unsafe_allow_html=True)
+        for r in rows:
+            div=r["divergence_pct"]; sev="#FF073A" if div and div>20 else ("#FFB347" if div and div>10 else "#14F195")
+            st.markdown(f"<div style='font-family:Share Tech Mono,monospace;border-left:3px solid {sev};padding:4px 8px;margin:3px 0'>POS {r['position_id']} · {str(r['mint_address'])[:12]} · EXEC {float(r['executable_pnl_pct'] or 0):+.1f}% · REF {float(r['reference_pnl_pct'] or 0):+.1f}% · Δ {float(div or 0):.1f}% · {r['quorum_state']} · ref={r['reference_source']}</div>",unsafe_allow_html=True)
+    except Exception as e:
+        st.caption(f"Price Truth Shadow unavailable: {type(e).__name__}")
 
 def render_pipeline_truth_panel() -> None:
     """
@@ -6578,22 +6600,62 @@ GOLDEN LATTICE - EVOLUTION CHAMBER
                 )
             with _col2:
                 if st.button("◈ SEAL", key=f"lattice_seal_{_hp_id}", use_container_width=True):
-                    if _code and len(_code) >= 4:
-                        try:
-                            import sqlite3 as _sq2
-                            _db2 = _sq2.connect(str(DB_PATH), timeout=2.0)
-                            _db2.execute(
-                                "UPDATE polaris_proposals SET status='approved', "
-                                "notes=? WHERE id=? AND status IN ('HITL_REQUIRED','nugget_escalated')",
-                                (f"SEALED_BY_OPERATOR code={_code[:8]}", _hp_id)
-                            )
-                            _db2.commit(); _db2.close()
-                            st.success(f"◈ Proposal #{_hp_id} sealed - Golden Lattice advancing")
-                        except Exception as _se:
-                            st.error(f"Seal failed: {_se}")
-                    else:
-                        st.warning("Enter a valid approval code")
+                    try:
+                        from services.operator_approval import expected_daily_code
+                        # Legacy matrix proposals are display-only here. The old
+                        # implementation accepted any 4 characters, which was not
+                        # an approval check. Surface the canonical build gate below.
+                        if str(_code or "").strip() == expected_daily_code():
+                            st.warning("Legacy proposal acknowledged. Canonical Tier-B approvals are handled in the Council Operator Gate below.")
+                        else:
+                            st.warning("Invalid daily operator seal")
+                    except Exception as _se:
+                        st.error(f"Seal validation failed: {_se}")
         st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_council_operator_gate() -> None:
+    """Visible canonical HITL gate for the isolated council build database."""
+    import html as _html, sqlite3 as _sq
+    from pathlib import Path as _Path
+    _build_db = _Path(__file__).resolve().parent.parent / "sentinuity_build.db"
+    if not _build_db.exists():
+        return
+    try:
+        _c = _sq.connect(str(_build_db), timeout=2.0); _c.row_factory = _sq.Row
+        _rows = _c.execute("""
+            SELECT n.canonical_id,n.decision_needed,n.context,n.ts,
+                   l.title,l.risk_tier,l.retry_count,l.blocker_code
+            FROM council_needs_operator n
+            JOIN council_task_ledger l ON l.canonical_id=n.canonical_id
+            WHERE l.phase='NEEDS_OPERATOR' AND COALESCE(n.decision,'PENDING')!='APPROVED'
+            ORDER BY n.ts DESC LIMIT 8
+        """).fetchall(); _c.close()
+    except Exception:
+        return
+    if not _rows:
+        return
+    st.markdown("""<div style='border:1px solid rgba(255,215,0,.5);border-radius:12px;
+      padding:12px 14px;background:rgba(255,215,0,.045);margin:8px 0'>
+      <div style='font-family:Orbitron;color:#FFD700;letter-spacing:3px;font-size:.72rem'>
+      ◈ COUNCIL OPERATOR GATE</div><div style='color:#888;font-size:.7rem;margin-top:5px'>
+      Tier-B non-funded work only. Tier-C/live/key/signing changes cannot be approved here.</div></div>""",
+      unsafe_allow_html=True)
+    for _r in _rows:
+        _cid=int(_r['canonical_id']); _tier=str(_r['risk_tier'] or '')
+        st.markdown(f"**Task #{_cid} · Tier {_html.escape(_tier)} — {_html.escape(str(_r['title'] or ''))}**")
+        st.caption(str(_r['decision_needed'] or _r['context'] or 'Operator decision required'))
+        _a,_b=st.columns([3,1])
+        with _a:
+            _seal=st.text_input("Daily seal",type="password",key=f"council_gate_{_cid}",placeholder="DDMM Melbourne time",label_visibility="collapsed")
+        with _b:
+            if st.button("APPROVE",key=f"approve_council_{_cid}",use_container_width=True):
+                try:
+                    from services.operator_approval import approve_tier_b
+                    _ok,_why=approve_tier_b(_cid,_seal,_build_db)
+                    if _ok: st.success(f"Task #{_cid} approved and requeued")
+                    else: st.error(_why)
+                except Exception as _e: st.error(f"Approval failed: {_e}")
 
 
 # render_council_build_map() removed 2026-05-26 - dead wrapper, never invoked.
@@ -7980,6 +8042,13 @@ def render_living_cortex():
                     _task_error = "No standing-task table found"
             except Exception as _task_exc:
                 _task_error = _sanitize_exception_text(str(_task_exc))
+
+            # PACK1_COUNCIL_BUILD_RAIL_20260724
+            try:
+                from ui.council_build_stage_rail import render_council_build_stage_rail
+                render_council_build_stage_rail(st)
+            except Exception as _build_rail_exc:
+                st.caption(f"Build stage rail unavailable: {type(_build_rail_exc).__name__}")
 
             _debate_html = "<div class='snty-debate-stage' style='max-height:560px;overflow-y:auto;padding:12px 10px;font-family:\"Share Tech Mono\",monospace;background:linear-gradient(180deg,rgba(7,3,20,.42),rgba(3,2,10,.18));border-top:1px solid rgba(153,69,255,.22);border-bottom:1px solid rgba(142,249,255,.12);margin-bottom:10px;'>"
             if not debate_df.empty:
@@ -9439,6 +9508,7 @@ def _render_diagnostics_bay() -> None:
                 "letter-spacing:2px;color:#9945FF;margin:10px 0 4px;'>§¬ PIPELINE TRUTH / "
                 "PRICE HANDOFF</div>", unsafe_allow_html=True)
             render_pipeline_truth_panel()
+            render_price_truth_shadow_panel()
         except Exception as _pt_panel_err:
             st.caption(f"Pipeline Truth unavailable: {_pt_panel_err}")
 # ── /SIGNOFF_CANONICAL_HIERARCHY_20260715 mounts ─────────────────────────────
@@ -9863,6 +9933,10 @@ if not _sec_active:
     # outcome cadence and the Final Gate execution arena. Read-only UI.
     try:
         from ui.live_gate_constellation import render_live_gate_constellation
+        st.markdown(
+            f"<div style='text-align:right;margin:-4px 2px 4px;font:600 .48rem Share Tech Mono,monospace;letter-spacing:.14em;color:#5A6B70'>UI DOCTRINE {UI_DOCTRINE_RUNTIME_BUILD} · RUNTIME AUTHORITY</div>",
+            unsafe_allow_html=True,
+        )
         render_live_gate_constellation(st, DB_PATH, ROOT / "sentinuity_intelligence.db")
     except Exception as _lgc_err:
         st.caption(f"Live Gate Constellation unavailable; backend unaffected: {type(_lgc_err).__name__}: {_lgc_err}")
@@ -9894,6 +9968,7 @@ if not _sec_active:
     # Real HITL proposals: always visible (operator may need to act without enabling world).
     # Collapses to nothing when no action needed - never clutters the view.
     render_golden_lattice()
+    render_council_operator_gate()
 
     # LOGIC GATES: Signal Latch + Matrix Filtration + Same-Eyes
     # (these are inside render_living_cortex already - no duplicate call needed)
@@ -10588,6 +10663,10 @@ def _render_council_build_status_panel() -> None:
 def _sec_substrate() -> None:
     if _substrate_node_available:
         try:
+            st.markdown(
+                f"<div style='text-align:right;margin:-4px 2px 4px;font:600 .48rem Share Tech Mono,monospace;letter-spacing:.14em;color:#5A6B70'>UI DOCTRINE {UI_DOCTRINE_RUNTIME_BUILD} · SUBSTRATE AUTHORITY</div>",
+                unsafe_allow_html=True,
+            )
             _render_substrate_tab(query_db)
         except Exception as _ste:
             st.error(f"Substrate tab error: {_ste}")

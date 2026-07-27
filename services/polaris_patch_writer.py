@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-polaris_patch_writer.py — SIGNOFF_COUNCIL_EXECUTION_SPINE_20260618
+polaris_patch_writer.py â€” SIGNOFF_COUNCIL_EXECUTION_SPINE_20260618
 
 Applies a gate-approved code_patches row to disk SAFELY and VISIBLY:
   1. resolve + validate target path (must be inside repo root, no traversal)
@@ -22,8 +22,10 @@ from pathlib import Path
 
 log = logging.getLogger("polaris_patch_writer")
 
-REPO_ROOT = Path(os.environ.get("SENTINUITY_ROOT") or Path(__file__).resolve().parent.parent).resolve()
-if not (REPO_ROOT / "services").exists():
+REPO_ROOT = Path(os.environ.get("SENTINUITY_ROOT",
+                  r"C:\Path\To\Sentinuity")).resolve()
+# if that path doesn't exist (e.g. running elsewhere), fall back to cwd
+if not REPO_ROOT.exists():
     REPO_ROOT = Path.cwd().resolve()
 
 BACKUP_DIR = REPO_ROOT / "_council_patch_backups"
@@ -97,7 +99,7 @@ def apply_patch_artifact(patch_id, conn=None) -> dict:
             _set_status(conn, patch_id, "BLOCKED", "no code body")
             return {"ok": False, "reason": "NO_CODE"}
 
-        # ── path validation: must resolve inside repo, no traversal ──
+        # â”€â”€ path validation: must resolve inside repo, no traversal â”€â”€
         target = (REPO_ROOT / rel).resolve()
         try:
             target.relative_to(REPO_ROOT)
@@ -106,7 +108,7 @@ def apply_patch_artifact(patch_id, conn=None) -> dict:
             _set_status(conn, patch_id, "BLOCKED", "path outside repo")
             return {"ok": False, "reason": "PATH_TRAVERSAL_BLOCKED"}
 
-        # ── core-risk guard: refuse unless explicitly enabled ──
+        # â”€â”€ core-risk guard: refuse unless explicitly enabled â”€â”€
         if _is_core(rel):
             core_ok = str(_cfg(conn, "COUNCIL_CORE_AUTOPATCH", "0")).strip() == "1"
             if not core_ok:
@@ -114,7 +116,7 @@ def apply_patch_artifact(patch_id, conn=None) -> dict:
                 _set_status(conn, patch_id, "BLOCKED", "CORE_AUTOPATCH_DISABLED")
                 return {"ok": False, "reason": "CORE_AUTOPATCH_DISABLED", "file_path": rel}
 
-        # ── backup ──
+        # â”€â”€ backup â”€â”€
         BACKUP_DIR.mkdir(exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
         backup = None
@@ -123,14 +125,14 @@ def apply_patch_artifact(patch_id, conn=None) -> dict:
             shutil.copy2(str(target), str(backup))
             _journal(conn, patch_id, "backup", "OK", str(backup))
 
-        # ── write temp ──
+        # â”€â”€ write temp â”€â”€
         tmp = tempfile.NamedTemporaryFile("w", delete=False, dir=str(target.parent),
                                           suffix=".cwtmp", encoding="utf-8")
         tmp.write(code)
         tmp.close()
         tmp_path = Path(tmp.name)
 
-        # ── compile/syntax check for python ──
+        # â”€â”€ compile/syntax check for python â”€â”€
         if target.suffix == ".py":
             proc = subprocess.run(["python", "-m", "py_compile", str(tmp_path)],
                                   capture_output=True, text=True, timeout=60)
@@ -141,7 +143,7 @@ def apply_patch_artifact(patch_id, conn=None) -> dict:
                 return {"ok": False, "reason": "COMPILE_FAILED", "detail": proc.stderr[:400]}
             _journal(conn, patch_id, "compile", "OK", "")
 
-        # ── atomic replace ──
+        # â”€â”€ atomic replace â”€â”€
         try:
             os.replace(str(tmp_path), str(target))
         except Exception as e:
@@ -165,3 +167,4 @@ def apply_patch_artifact(patch_id, conn=None) -> dict:
         if own:
             try: conn.close()
             except Exception: pass
+

@@ -113,8 +113,8 @@ def _is_db_locked(exc: BaseException) -> bool:
 
 def _note_lock_backoff(exc: BaseException, where: str = "unknown") -> None:
     global _LOCK_BACKOFF_UNTIL, _LOCK_BACKOFF_SEC
-    base = _cfg_float("COPYTRADE_LOCK_BACKOFF_BASE_SEC", 60.0)
-    max_sec = _cfg_float("COPYTRADE_LOCK_BACKOFF_MAX_SEC", 600.0)
+    base = _cfg_float("COPYTRADE_LOCK_BACKOFF_BASE_SEC", 10.0)
+    max_sec = _cfg_float("COPYTRADE_LOCK_BACKOFF_MAX_SEC", 90.0)
     _LOCK_BACKOFF_SEC = min(max_sec, max(base, (_LOCK_BACKOFF_SEC * 2.0) if _LOCK_BACKOFF_SEC else base))
     _LOCK_BACKOFF_UNTIL = time.time() + _LOCK_BACKOFF_SEC
     log.warning("DB_LOCK_BACKOFF where=%s sleep=%.0fs err=%s", where, _LOCK_BACKOFF_SEC, str(exc)[:160])

@@ -315,13 +315,11 @@ def build_fingerprint_for_wallet(wallet_address: str, db_path: Path | str = None
     if len(trades) < 5:
         return None
     
-    # Quality scoring (repeatability, not raw PnL)
-    # OUTCOME_SOURCE_PATCH_20260616: prefer forward-measured max_x_after_entry
-    # (computed by backfill_wallet_trade_outcomes.py), fall back to realized_x.
+    # Quality scoring must use closed realised outcome. Maximum favourable
+    # excursion remains research telemetry and cannot qualify an elite wallet.
     def _outcome_x(t):
-        mx = float(t.get('max_x_after_entry', 0) or 0)
         rx = float(t.get('realized_x', 0) or 0)
-        return mx if mx > 0 else rx
+        return rx
     xs = [_outcome_x(t) for t in trades if _outcome_x(t) > 0]
     if not xs:
         return None

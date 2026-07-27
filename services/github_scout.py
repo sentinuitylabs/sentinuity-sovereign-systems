@@ -34,6 +34,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.append(str(BASE_DIR))
 
 from core.schema import get_connection, update_heartbeat, get_config_value
+from services.provider_firewall import check_provider, log_api_call
 
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
@@ -85,6 +86,21 @@ SEARCH_TARGETS = [
 ]
 
 
+
+def _ensure_research_activity_schema(conn) -> None:
+    conn.execute("""CREATE TABLE IF NOT EXISTS research_activity_ledger(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, created_at REAL NOT NULL, event_type TEXT NOT NULL,
+      actor TEXT NOT NULL, task_id TEXT, query TEXT, source_ref TEXT, source_type TEXT,
+      commit_sha TEXT, licence TEXT, safety_status TEXT, summary TEXT, confidence REAL,
+      parent_event_id INTEGER, disposition TEXT, metadata_json TEXT)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_research_activity_created ON research_activity_ledger(created_at DESC)")
+
+def _research_event(conn, event_type: str, **fields) -> int:
+    cols=['created_at','event_type','actor','task_id','query','source_ref','source_type','commit_sha','licence','safety_status','summary','confidence','parent_event_id','disposition','metadata_json']
+    vals=[time.time(),event_type,'GITHUB_SCOUT',fields.get('task_id'),fields.get('query'),fields.get('source_ref'),fields.get('source_type','github'),fields.get('commit_sha'),fields.get('licence'),fields.get('safety_status'),fields.get('summary'),fields.get('confidence'),fields.get('parent_event_id'),fields.get('disposition'),json.dumps(fields.get('metadata',{}),sort_keys=True)]
+    cur=conn.execute(f"INSERT INTO research_activity_ledger({','.join(cols)}) VALUES({','.join('?' for _ in cols)})",vals)
+    return int(cur.lastrowid or 0)
+
 def _safe_ts(val) -> float:
     if not val: return 0.0
     try:
@@ -97,6 +113,10 @@ def _github_search(query: str, token: str, max_results: int = 5) -> list[dict]:
     """Search GitHub repos by query. Returns list of repo summaries."""
     try:
         import requests
+        allowed, reason = check_provider("github", SERVICE_NAME)
+        if not allowed:
+            log.warning("[GITHUB_BLOCKED] query=%r reason=%s", query, reason)
+            return []
         headers = {
             "Authorization": f"token {token}",
             "Accept": "application/vnd.github.v3+json",
@@ -112,6 +132,7 @@ def _github_search(query: str, token: str, max_results: int = 5) -> list[dict]:
             headers=headers,
             timeout=10,
         )
+        log_api_call("github", SERVICE_NAME, "/search/repositories", r.status_code, error_type=None if r.status_code == 200 else r.text[:120])
         if r.status_code == 403:
             log.warning("GitHub rate limit hit — sleeping 60s")
             time.sleep(60)
@@ -285,6 +306,7 @@ def _run_scout_cycle(token: str) -> dict:
     import sqlite3 as _sq
     with get_connection() as conn:
         conn.row_factory = _sq.Row
+        _ensure_research_activity_schema(conn)
         # Expire old entries
         conn.execute("DELETE FROM forge_research_cache WHERE expires_at IS NOT NULL AND expires_at < ?", (now,))
 
@@ -301,7 +323,10 @@ def _run_scout_cycle(token: str) -> dict:
                 continue
 
             for query in queries[:2]:  # Max 2 queries per project per cycle
+                planned_id = _research_event(conn, "SEARCH_PLANNED", task_id=pk, query=query, summary=f"GitHub repository search planned for {topic}", disposition="PLANNED")
+                log.info("[SEARCH_QUERY] project=%s query=%r", pk, query)
                 repos = _github_search(query, token, max_results=5)
+                _research_event(conn, "SEARCH_EXECUTED", task_id=pk, query=query, parent_event_id=planned_id, summary=f"repositories_returned={len(repos)}", disposition="RESULTS" if repos else "NO_RESULTS")
                 if not repos:
                     continue
                 total_repos += len(repos)
@@ -317,6 +342,7 @@ def _run_scout_cycle(token: str) -> dict:
                 summary = _synthesise_evidence(pk, topic, query, repos, readmes)
                 _write_cache_entry(conn, pk, f"{topic}_{query[:30].replace(' ','_')}", summary, "github")
                 for repo in repos:
+                    _research_event(conn, "SOURCE_FETCHED", task_id=pk, query=query, source_ref=repo.get("url"), licence=repo.get("licence"), safety_status="UNSCREENED", summary=f"{repo.get('name')} | stars={repo.get('stars')} | {repo.get('description','')[:300]}", confidence=0.6, disposition="INTAKE")
                     _record_repo_inspiration(
                         conn,
                         project_key=pk,
