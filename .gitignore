@@ -1,0 +1,39 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*private_key*
+*seed*
+
+# Wallets, databases and runtime state
+*.db
+*.db-*
+*.sqlite*
+wallet*.json
+keystore*
+logs/
+audits/
+backups/
+cache/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated archives and local artefacts
+*.zip
+*.7z
+*.tar
+*.gz
+*.before_*
+.thumbnail
+.DS_Store
+Thumbs.db
