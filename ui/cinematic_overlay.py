@@ -278,21 +278,43 @@ _RAIN_JS = r"""
         transform:none!important;
         pointer-events:none!important;
       }
-      #${ID}{
-        position:fixed;
-        inset:0;
-        width:100vw;
-        height:100vh;
-        z-index:0;
-        pointer-events:none;
-        opacity:.22;                  /* RAIN_CRISP_20260718: screen blend removed — it washed glyphs into the gradient and read as blur */
-        mix-blend-mode:normal;
+      /* SIGNOFF_MATRIX_RAIN_VISIBILITY_20260728
+         Keep the Truth Fabric behind content but above Streamlit's root paint.
+         Streamlit theme backgrounds can otherwise fully cover a z-index:0 canvas. */
+      html, body, .stApp,
+      [data-testid="stAppViewContainer"],
+      [data-testid="stHeader"],
+      [data-testid="stToolbar"]{
+        background-color:transparent!important;
       }
-      [data-testid="stAppViewContainer"]{position:relative;isolation:isolate;}
+      #${ID}{
+        position:fixed!important;
+        inset:0!important;
+        width:100vw!important;
+        height:100vh!important;
+        z-index:0!important;
+        display:block!important;
+        visibility:visible!important;
+        pointer-events:none!important;
+        opacity:.28!important;
+        mix-blend-mode:normal!important;
+      }
+      [data-testid="stAppViewContainer"]{
+        position:relative!important;
+        isolation:isolate!important;
+      }
       [data-testid="stAppViewContainer"] > section,
-      [data-testid="stAppViewContainer"] main{position:relative;z-index:1;}
-      @media(max-width:760px){#${ID}{opacity:.15;}}
-      @media(prefers-reduced-motion:reduce){#${ID}{display:none!important;}}
+      [data-testid="stAppViewContainer"] main,
+      [data-testid="stMain"],
+      [data-testid="stMainBlockContainer"]{
+        position:relative!important;
+        z-index:1!important;
+        background-color:transparent!important;
+      }
+      @media(max-width:760px){#${ID}{opacity:.20!important;}}
+      /* Reduced-motion users still retain the operator-requested identity layer.
+         The 30fps loop is already bounded and pauses while the tab is hidden. */
+      @media(prefers-reduced-motion:reduce){#${ID}{opacity:.16!important;}}
     `;
     doc.head.appendChild(style);
 
@@ -312,6 +334,15 @@ _RAIN_JS = r"""
     canvas.setAttribute('aria-hidden', 'true');
     const host = doc.querySelector('[data-testid="stAppViewContainer"]') || doc.body;
     host.prepend(canvas);
+
+    // Streamlit may replace the app subtree during a rerun. Reattach the same
+    // singleton canvas instead of allowing the identity layer to disappear.
+    const rainHostGuard = new MutationObserver(() => {
+      const currentHost = doc.querySelector('[data-testid="stAppViewContainer"]') || doc.body;
+      if (!doc.getElementById(ID)) currentHost.prepend(canvas);
+    });
+    rainHostGuard.observe(doc.body, {childList:true, subtree:true});
+    win['snty-rain-host-guard'] = rainHostGuard;
 
     const ctx = canvas.getContext('2d', {alpha:true});
     if (!ctx) return;
