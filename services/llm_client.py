@@ -14,6 +14,8 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +32,30 @@ from services.model_router import choose_model, log_routing_decision
 
 logger = logging.getLogger("llm_client")
 _LAST_ERROR: Optional[str] = None
+_PROVIDER_FAILS = {"nim": 0, "openai": 0}
+_PROVIDER_BACKOFF_UNTIL = {"nim": 0.0, "openai": 0.0}
+
+def _provider_ready(name: str) -> bool:
+    return time.time() >= float(_PROVIDER_BACKOFF_UNTIL.get(name, 0.0))
+
+def _provider_success(name: str) -> None:
+    _PROVIDER_FAILS[name] = 0
+    _PROVIDER_BACKOFF_UNTIL[name] = 0.0
+
+def _provider_failure(name: str) -> float:
+    failures = int(_PROVIDER_FAILS.get(name, 0)) + 1
+    _PROVIDER_FAILS[name] = failures
+    delay = min(1800.0, 60.0 * (2 ** min(failures - 1, 5)))
+    _PROVIDER_BACKOFF_UNTIL[name] = time.time() + delay
+    return delay
+
+def _safe_error(exc: Exception) -> str:
+    text = str(exc)
+    for secret in (os.getenv("NVIDIA_NIM_API_KEY", ""), os.getenv("OPENAI_API_KEY", "")):
+        if secret:
+            text = text.replace(secret, "<redacted>")
+    text = re.sub(r"([?&](?:api[-_]?key|token|key)=)[^&\s]+", r"\1<redacted>", text, flags=re.I)
+    return " ".join(text.split())[:220]
 
 def _reload_env() -> None:
     try:
@@ -66,6 +92,9 @@ def _http_error(resp) -> str:
 
 def _post_chat(url: str, key: str, model: str, system_prompt: str, user_message: str,
                max_tokens: int, temperature: float, provider: str) -> tuple[Optional[str], Optional[str]]:
+    if not _provider_ready(provider):
+        remaining = max(0.0, _PROVIDER_BACKOFF_UNTIL[provider] - time.time())
+        return None, f"CIRCUIT_OPEN:{remaining:.0f}s"
     try:
         import requests
         body={
@@ -86,11 +115,16 @@ def _post_chat(url: str, key: str, model: str, system_prompt: str, user_message:
             return None, _http_error(resp)
         payload=resp.json(); choices=payload.get("choices") or []
         text=str(((choices[0].get("message") or {}).get("content") if choices else "") or "").strip()
-        return (text, None) if text else (None, "EMPTY_CONTENT_200")
+        if text:
+            _provider_success(provider)
+            return text, None
+        delay = _provider_failure(provider)
+        return None, f"EMPTY_CONTENT_200:backoff={delay:.0f}s"
     except Exception as exc:
         name=exc.__class__.__name__.upper()
         code="TIMEOUT" if "TIMEOUT" in name or "timed out" in str(exc).lower() else "MODEL_REQUEST_ERROR"
-        return None, f"{code}:{str(exc)[:220]}"
+        delay = _provider_failure(provider)
+        return None, f"{code}:backoff={delay:.0f}s:{_safe_error(exc)}"
 
 def polaris_complete(system_prompt: str, user_message: str, *, task_type: str="routine_summary",
                      risk_level: str="low", live_trade: bool=False, code_touch: bool=False,

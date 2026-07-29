@@ -73,9 +73,9 @@ def now() -> float:
 def connect() -> sqlite3.Connection:
     if HAS_SCHEMA and get_connection is not None:
         return get_connection()  # type: ignore[no-any-return]
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    conn = sqlite3.connect(str(DB_PATH), timeout=15)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=15000")
     return conn
 
 
@@ -495,10 +495,22 @@ def run_once(verbose: bool = True) -> int:
 
 
 def service_loop(interval: float) -> None:
+    # Security scans are auxiliary and must yield to trading/database writers.
+    # On a lock/error, exponentially back off instead of contributing to a
+    # shutdown or recovery write storm.
+    interval = max(300.0, float(interval))
+    failures = 0
     print(f"[{SERVICE_NAME}] starting interval={interval}s mode=observe/lockdown via SECURITY_SENTINEL_RESPONSE_MODE")
     while True:
-        run_once(verbose=True)
-        time.sleep(interval)
+        rc = run_once(verbose=True)
+        if rc == 0:
+            failures = 0
+            sleep_for = interval
+        else:
+            failures += 1
+            sleep_for = min(3600.0, interval * (2 ** min(failures, 5)))
+            print(f"[{SERVICE_NAME}] backing off {sleep_for:.0f}s after rc={rc}")
+        time.sleep(sleep_for)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -508,7 +520,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
     if args.once:
         return run_once(verbose=True)
-    service_loop(max(10.0, args.interval))
+    service_loop(max(300.0, args.interval))
     return 0
 
 

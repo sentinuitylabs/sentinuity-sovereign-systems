@@ -958,7 +958,7 @@ def _render_copytrade_station() -> None:
                 f"<li>Restart wallet_scout (it checks MANUAL_WALLET_LIST on boot)</li>"
                 f"<li>Wait 2–3 cycles for trade ingester to populate smart_wallet_trades</li>"
                 f"<li>Once ≥3 completed trades per wallet, fingerprints build automatically</li>"
-                f"<li>Set COPYTRADE_PAPER_BONUS_ENABLED=1 when ≥50 calibration rows exist</li>"
+                f"<li>Keep SHADOW until ≥100 resolved decision-changing A/B pairs and positive out-of-sample uplift</li>"
                 f"</ol></div>", unsafe_allow_html=True)
 
     # ── Recent signals ────────────────────────────────────────────────────────
@@ -1023,7 +1023,7 @@ def _render_copytrade_station() -> None:
     else:
         st.markdown(
             f"<div class='sn-mini'><div class='sn-muted'>Influence ledger empty — "
-            f"decisions populate once COPYTRADE_PAPER_BONUS_ENABLED=1 and signals exist.</div></div>",
+            f"shadow decisions populate while bonus remains disabled; promotion requires measured out-of-sample uplift.</div></div>",
             unsafe_allow_html=True)
 
     # ── How copy trading works on alts ────────────────────────────────────────
@@ -1043,7 +1043,7 @@ def _render_copytrade_station() -> None:
             f"with a score 0–1. ELITE wallets (quality≥80, copy≥70) create stronger signals.<br><br>"
             f"<strong style='color:{C_GOLD};'>Paper influence gate:</strong> Conviction signals "
             f"can add a bounded bonus (+0.00 to +0.03) to a near-qualified token's confidence score. "
-            f"This only fires if COPYTRADE_PAPER_BONUS_ENABLED=1 and at least 2 independent wallets "
+            f"This remains advisory while COPYTRADE_PAPER_BONUS_ENABLED=0; promotion requires at least 100 resolved decision-changing A/B pairs and 2 independent wallets "
             f"or 1 elite wallet has a fresh buy. Sell imbalance vetoes the bonus immediately.<br><br>"
             f"<strong style='color:{C_RED};'>Live influence: always OFF.</strong> "
             f"The bonus only affects paper mode. Live copy execution is not implemented "

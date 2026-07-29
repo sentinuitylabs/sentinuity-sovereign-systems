@@ -40,7 +40,24 @@ from services.substrate_price_feed import (
     ACTIONABLE_STATUSES, STATUS_SEED_MOCK, get_prices, seed_mock_contract,
 )
 
-DEFAULT_STRATEGY_ID = "SUBSTRATE_CORE_SPOT_V1"
+# ── SEED TEMPLATE HONESTY (SUBSTRATE_SEED_LABELLING_20260728) ───────────────
+# _seed_templates() below is a HARDCODED three-asset list with LITERAL
+# confidence and expected_edge values typed into source. It is NOT a scanner,
+# NOT a signal, and NOT a strategy. It must never be presented as evidence of
+# channel-strategy PnL, council-derived edge, strategy validation, or
+# profitable autonomous trading.
+#
+# The classification below travels with every row so downstream consumers
+# (strategy scores, UI panels, audit reports) cannot mistake a static basket
+# for a validated strategy.
+SEED_TEMPLATE_CLASSIFICATION = ("SEED_TEMPLATE", "NON_SIGNAL", "RESEARCH_ONLY")
+SEED_TEMPLATE_STRATEGY_ID = "SUBSTRATE_SEED_TEMPLATE_NON_SIGNAL"
+SEED_TEMPLATE_NOTE = (
+    "Hardcoded research basket. Literal confidence/expected_edge values; no "
+    "price-action signal was computed. NOT a profitable strategy claim."
+)
+
+DEFAULT_STRATEGY_ID = SEED_TEMPLATE_STRATEGY_ID
 
 
 def _seed_templates() -> List[Dict]:
@@ -54,7 +71,9 @@ def _seed_templates() -> List[Dict]:
             "liquidity_usd": 100000000, "volume_5m_usd": 1000000,
             "risk_score": 0.28, "strategy_id": DEFAULT_STRATEGY_ID,
             "raw_json": {"phase": "council_fetch",
-                         "note": "core low-fee Solana exposure"},
+                         "note": "core low-fee Solana exposure",
+                         "classification": SEED_TEMPLATE_CLASSIFICATION,
+                         "not_a_strategy": SEED_TEMPLATE_NOTE},
         },
         {
             "source": "COUNCIL_RESEARCH", "chain": "base",
@@ -64,7 +83,9 @@ def _seed_templates() -> List[Dict]:
             "liquidity_usd": 50000000, "volume_5m_usd": 500000,
             "risk_score": 0.42, "strategy_id": DEFAULT_STRATEGY_ID,
             "raw_json": {"phase": "wrapped_exposure",
-                         "note": "ETH exposure on cheaper chain, not native ETH"},
+                         "note": "ETH exposure on cheaper chain, not native ETH",
+                         "classification": SEED_TEMPLATE_CLASSIFICATION,
+                         "not_a_strategy": SEED_TEMPLATE_NOTE},
         },
         {
             "source": "COUNCIL_RESEARCH", "chain": "base",
@@ -74,7 +95,9 @@ def _seed_templates() -> List[Dict]:
             "liquidity_usd": 35000000, "volume_5m_usd": 250000,
             "risk_score": 0.48, "strategy_id": DEFAULT_STRATEGY_ID,
             "raw_json": {"phase": "wrapped_exposure",
-                         "note": "BTC exposure via tokenized asset; small allocation only"},
+                         "note": "BTC exposure via tokenized asset; small allocation only",
+                         "classification": SEED_TEMPLATE_CLASSIFICATION,
+                         "not_a_strategy": SEED_TEMPLATE_NOTE},
         },
     ]
 

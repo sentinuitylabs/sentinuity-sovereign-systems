@@ -14,6 +14,12 @@ from typing import Iterable, Tuple
 ROOT = Path(__file__).resolve().parent.parent
 
 TIER_C_MARKERS = (
+    # Build-plane integrity: autonomous code may never rewrite its own gate,
+    # ledger, apply/rollback machinery, retrospective authority or launcher.
+    "council_execution_spine", "council_build_orchestrator", "council_autobuilder",
+    "council_task_ledger", "golden_latch_gate", "autonomous_apply_policy",
+    "apply_policy", "safe_patch_apply", "polaris_patch_writer",
+    "build_retrospective", "launch/", "core/schema.py",
     "wallets/providers", "private_key", "keypair", "signing", "wallet_sign",
     "live_trading", "live_arm", "withdraw", "order_submit", "set_live_mode",
     "substrate_live_guard", "launch_config", "prelaunch",

@@ -4,6 +4,7 @@ import logging
 import os
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal
 from pathlib import Path
 
@@ -16,6 +17,8 @@ INTERVAL = float(os.getenv("PRICE_TRUTH_SHADOW_INTERVAL_SEC", "12"))
 MAX_POS = int(os.getenv("PRICE_TRUTH_SHADOW_MAX_POSITIONS", "8"))
 PUMP_FEE_BPS = int(os.getenv("PUMP_SHADOW_FEE_BPS", "125"))
 PUMP_FEE_SOURCE = "ENV" if os.getenv("PUMP_SHADOW_FEE_BPS") else "SHADOW_DEFAULT_125BPS"
+MARK_WORKERS = max(1, int(os.getenv("PRICE_TRUTH_MARK_WORKERS", "3")))
+CYCLE_BUDGET_SEC = max(5.0, float(os.getenv("PRICE_TRUTH_CYCLE_BUDGET_SEC", "15")))
 
 
 def _cols(connection, table):
@@ -32,6 +35,7 @@ def _open_positions():
         name for name in (
             "id", "mint_address", "entry_price", "quantity", "opened_at",
             "funding_mode", "status", "is_open", "position_size_usd",
+            "token_decimals", "decimals", "current_price", "updated_at",
         ) if name in cols
     ]
     if not wanted:
@@ -44,6 +48,95 @@ def _open_positions():
     ).fetchall()
     connection.close()
     return [dict(row) for row in rows]
+
+
+def _ensure_decimal_cache(db):
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS token_decimals_cache (
+            mint_address TEXT PRIMARY KEY,
+            decimals INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            resolved_at REAL NOT NULL
+        )
+        """
+    )
+
+
+def _resolve_token_decimals(db, position, mint):
+    # Prefer durable position truth, then the persistent cache, and only then RPC.
+    for key in ("token_decimals", "decimals"):
+        value = position.get(key)
+        if value is not None:
+            try:
+                dec = int(value)
+                if 0 <= dec <= 18:
+                    db.execute(
+                        "INSERT OR REPLACE INTO token_decimals_cache "
+                        "(mint_address,decimals,source,resolved_at) VALUES(?,?,?,?)",
+                        (mint, dec, f"paper_positions.{key}", time.time()),
+                    )
+                    return dec
+            except Exception:
+                pass
+
+    row = db.execute(
+        "SELECT decimals FROM token_decimals_cache WHERE mint_address=?", (mint,)
+    ).fetchone()
+    if row is not None:
+        dec = int(row[0])
+        if 0 <= dec <= 18:
+            return dec
+
+    from services.live_trading import _get_token_decimals
+    dec = int(_get_token_decimals(mint))
+    if not 0 <= dec <= 18:
+        raise RuntimeError(f"token_decimals_invalid:{dec}")
+    db.execute(
+        "INSERT OR REPLACE INTO token_decimals_cache "
+        "(mint_address,decimals,source,resolved_at) VALUES(?,?,?,?)",
+        (mint, dec, "chain_rpc", time.time()),
+    )
+    db.commit()
+    return dec
+
+
+def _mark_position(position_id, price, source, observed_at):
+    if not price or not position_id:
+        return
+    con = sqlite3.connect(MATRIX, timeout=2.0)
+    try:
+        con.execute("PRAGMA busy_timeout=2000")
+        cols = _cols(con, "paper_positions")
+        sets, args = [], []
+        for col, value in (
+            ("current_price", float(price)),
+            ("updated_at", float(observed_at)),
+            ("mark_timestamp", float(observed_at)),
+            ("mark_source", str(source or "price_truth_mesh")),
+            ("mark_status", "FRESH"),
+        ):
+            if col in cols:
+                sets.append(f"{col}=?")
+                args.append(value)
+        if sets:
+            args.append(position_id)
+            con.execute(f"UPDATE paper_positions SET {','.join(sets)} WHERE id=?", args)
+            con.commit()
+    finally:
+        con.close()
+
+
+def _quote_position(position, decimals):
+    from services.price_router import get_live_liquidation_price, get_reference_price_details
+    mint = str(position.get("mint_address") or "")
+    quantity = Decimal(str(position.get("quantity") or 0))
+    entry = float(position.get("entry_price") or 0)
+    opened_at = float(position.get("opened_at") or 0)
+    raw_quantity = int(quantity * (Decimal(10) ** decimals))
+    reference = get_reference_price_details(mint, opened_at, entry)
+    executable = get_live_liquidation_price(mint, float(quantity), entry, opened_at)
+    return raw_quantity, reference, executable
 
 
 def _pct(price, entry):
@@ -150,15 +243,13 @@ def _observe_pump_shadow(db, position, mint, raw_quantity, decimals, entry, refe
 
 
 def observe_once():
-    from services.live_trading import _get_token_decimals
-    from services.price_router import get_live_liquidation_price, get_reference_price_details
-
     started = time.time()
     rows = _open_positions()
     wrote = 0
     pump_wrote = 0
-    error = ""
+    errors = []
     db = connect()
+    _ensure_decimal_cache(db)
     legacy_sql = (
         "INSERT INTO price_truth_snapshots "
         "(decision_id,position_id,funding_mode,mint_address,raw_quantity,decimals,observed_at,"
@@ -168,6 +259,7 @@ def observe_once():
         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)"
     )
 
+    prepared = []
     for position in rows:
         try:
             mint = str(position.get("mint_address") or "")
@@ -175,41 +267,86 @@ def observe_once():
             entry = float(position.get("entry_price") or 0)
             if not mint or quantity <= 0 or entry <= 0:
                 continue
-            decimals = int(_get_token_decimals(mint))
-            raw_quantity = int(quantity * (Decimal(10) ** decimals))
-            reference = get_reference_price_details(mint, float(position.get("opened_at") or 0), entry)
-            executable = get_live_liquidation_price(mint, float(quantity), entry, float(position.get("opened_at") or 0))
-            reference_price = float(reference.get("price") or 0)
-            executable_price = float(executable.get("price") or 0)
-            divergence = _spread_pct(reference_price, executable_price)
-            quorum = "EXECUTABLE_SINGLE_SOURCE" if executable_price > 0 else "NO_EXECUTABLE"
-            if executable_price > 0 and reference_price > 0:
-                quorum = "DIVERGENCE_ALARM" if divergence and divergence > 10 else "SHADOW_AGREEMENT"
-            db.execute(
-                legacy_sql,
-                (
-                    f"position:{position.get('id')}", position.get("id"), str(position.get("funding_mode") or "SIM"),
-                    mint, str(raw_quantity), decimals, time.time(), reference_price or None,
-                    reference.get("actual_source") or reference.get("source"), reference.get("age_sec"),
-                    executable_price or None, executable.get("source"), executable.get("age_sec"),
-                    1 if executable.get("can_execute_exit") else 0, executable.get("warning"),
-                    _pct(executable_price, entry), _pct(reference_price, entry), divergence, quorum,
-                ),
-            )
-            wrote += 1
-            _observe_pump_shadow(
-                db, position, mint, raw_quantity, decimals, entry,
-                reference_price, executable_price,
-            )
-            pump_wrote += 1
+            decimals = _resolve_token_decimals(db, position, mint)
+            prepared.append((position, decimals))
         except Exception as exc:
-            error = f"{type(exc).__name__}:{exc}"
-            log.warning("shadow position failed id=%s %s", position.get("id"), error)
+            err = f"id={position.get('id')}:{type(exc).__name__}:{exc}"
+            errors.append(err)
+            log.warning("shadow metadata failed %s", err)
 
+    futures = {}
+    pool = ThreadPoolExecutor(max_workers=min(MARK_WORKERS, max(1, len(prepared))))
+    try:
+        for position, decimals in prepared:
+            futures[pool.submit(_quote_position, position, decimals)] = (position, decimals)
+        deadline = started + CYCLE_BUDGET_SEC
+        pending = set(futures)
+        while pending and time.time() < deadline:
+            timeout = max(0.05, deadline - time.time())
+            completed = []
+            try:
+                for future in as_completed(pending, timeout=timeout):
+                    completed.append(future)
+                    position, decimals = futures[future]
+                    try:
+                        raw_quantity, reference, executable = future.result()
+                        mint = str(position.get("mint_address") or "")
+                        entry = float(position.get("entry_price") or 0)
+                        observed_at = time.time()
+                        reference_price = float(reference.get("price") or 0)
+                        executable_price = float(executable.get("price") or 0)
+                        divergence = _spread_pct(reference_price, executable_price)
+                        quorum = "EXECUTABLE_SINGLE_SOURCE" if executable_price > 0 else "NO_EXECUTABLE"
+                        if executable_price > 0 and reference_price > 0:
+                            quorum = "DIVERGENCE_ALARM" if divergence and divergence > 10 else "SHADOW_AGREEMENT"
+                        db.execute(
+                            legacy_sql,
+                            (
+                                f"position:{position.get('id')}", position.get("id"),
+                                str(position.get("funding_mode") or "SIM"), mint,
+                                str(raw_quantity), decimals, observed_at, reference_price or None,
+                                reference.get("actual_source") or reference.get("source"), reference.get("age_sec"),
+                                executable_price or None, executable.get("source"), executable.get("age_sec"),
+                                1 if executable.get("can_execute_exit") else 0, executable.get("warning"),
+                                _pct(executable_price, entry), _pct(reference_price, entry), divergence, quorum,
+                            ),
+                        )
+                        db.commit()  # mark truth survives even if optional Pump shadow fails later
+                        wrote += 1
+                        mark_price = executable_price or reference_price
+                        _mark_position(position.get("id"), mark_price, executable.get("source") or reference.get("source"), observed_at)
+
+                        # Pump shadow is diagnostic. Never let it block canonical marking.
+                        if time.time() < deadline:
+                            try:
+                                _observe_pump_shadow(
+                                    db, position, mint, raw_quantity, decimals, entry,
+                                    reference_price, executable_price,
+                                )
+                                db.commit()
+                                pump_wrote += 1
+                            except Exception as exc:
+                                errors.append(f"pump_id={position.get('id')}:{type(exc).__name__}:{exc}")
+                    except Exception as exc:
+                        err = f"id={position.get('id')}:{type(exc).__name__}:{exc}"
+                        errors.append(err)
+                        log.warning("shadow position failed %s", err)
+                pending.difference_update(completed)
+            except TimeoutError:
+                break
+        for future in pending:
+            future.cancel()
+        if pending:
+            errors.append(f"cycle_budget_exceeded:pending={len(pending)}")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    cycle_ms = (time.time() - started) * 1000
+    error = " | ".join(errors[-5:])
     db.execute(
         "UPDATE price_truth_health SET last_cycle_at=?,positions_seen=?,"
         "snapshots_written=snapshots_written+?,last_error=?,cycle_ms=? WHERE id=1",
-        (time.time(), len(rows), wrote, error, (time.time() - started) * 1000),
+        (time.time(), len(rows), wrote, error, cycle_ms),
     )
     db.commit()
     db.close()
@@ -218,8 +355,8 @@ def observe_once():
         "written": wrote,
         "pump_written": pump_wrote,
         "error": error,
-        "cycle_ms": round((time.time() - started) * 1000, 1),
-        "authority": "NONE",
+        "cycle_ms": round(cycle_ms, 1),
+        "authority": "MARK_FIRST_PUMP_OPTIONAL",
     }
 
 

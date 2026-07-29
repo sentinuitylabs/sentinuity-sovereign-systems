@@ -4848,7 +4848,8 @@ def evaluate_exit_for_position(position: dict) -> None:
     # Config-driven hard stop. Signed-off operator intent is 4%.
     # Keep this explicit and auditable: system_config wins; 4.0 is the safe default.
     try:
-        _hard_stop_pct = abs(float(get_config_value("HARD_STOP_LOSS_PCT", 4.0)))
+        # Operator constitution: the hard stop may be tightened below 4%, never widened above it.
+        _hard_stop_pct = min(abs(float(get_config_value("HARD_STOP_LOSS_PCT", 4.0))), 4.0)
     except Exception:
         _hard_stop_pct = 4.0
     if not math.isfinite(_hard_stop_pct) or _hard_stop_pct <= 0.0:

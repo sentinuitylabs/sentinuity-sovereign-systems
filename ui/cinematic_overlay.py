@@ -652,7 +652,8 @@ def _exit_gear_cfg() -> dict:
             "('HARD_STOP_LOSS_PCT','RUNNER_ACTIVATE_PCT','RUNNER_TRAIL_PCT',"
             "'RUNNER_TRAIL_TIGHT_PCT')", n=8)
         m = {r["key"]: float(r["value"]) for r in rows if r.get("value") is not None}
-        v["hard_stop"] = abs(m.get("HARD_STOP_LOSS_PCT", v["hard_stop"]))
+        # Display the executable constitution, not a stale/wider database value.
+        v["hard_stop"] = min(abs(m.get("HARD_STOP_LOSS_PCT", v["hard_stop"])), 4.0)
         v["runner_at"] = m.get("RUNNER_ACTIVATE_PCT", v["runner_at"])
         v["trail_pct"] = m.get("RUNNER_TRAIL_PCT", v["trail_pct"])
         v["tight_pct"] = m.get("RUNNER_TRAIL_TIGHT_PCT", v["tight_pct"])

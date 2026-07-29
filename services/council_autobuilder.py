@@ -82,11 +82,11 @@ CREATE TABLE IF NOT EXISTS code_patches(
 
 
 def _con(db_path: Optional[Path] = None) -> sqlite3.Connection:
-    c = sqlite3.connect(str(db_path or BUILD_DB_PATH), timeout=1.0)
+    c = sqlite3.connect(str(db_path or BUILD_DB_PATH), timeout=15.0)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA synchronous=NORMAL")
-    c.execute("PRAGMA busy_timeout=750")
+    c.execute("PRAGMA busy_timeout=15000")
     return c
 
 
@@ -168,8 +168,22 @@ def register_handler(match_substr: str):
     return deco
 
 
-def _find_handler(title: str) -> Optional[Callable]:
-    t = (title or "").lower()
+def _find_handler(task) -> Optional[Callable]:
+    """F1: production routing resolves on handler_key ONLY.
+
+    Titles are display strings. The legacy substring table below is consulted
+    only for rows that pre-date the migration and still have no handler_key.
+    """
+    if not isinstance(task, dict):
+        task = {"title": task}
+    try:
+        from services.council_handler_registry import resolve as _resolve
+        fn, _key = _resolve(task)
+        if fn is not None:
+            return fn
+    except Exception:
+        pass
+    t = (task.get("title") or "").lower()
     for k, fn in HANDLERS.items():
         if k in t:
             return fn
@@ -339,6 +353,160 @@ def intelligence_stage_rail_canary_handler(task: dict, ctx: dict) -> Dict[str, A
         return {"target_file":target,"new_content":new,"test":test,"verify":verify}
     return {"research":research,"propose":propose,"build":build}
 
+# ── STAGE CONTRACT WIRING (COUNCIL_STAGE_WIRED_20260728) ────────────────────
+# core/council_stage_contract.record_run() previously had ZERO callers. The
+# proof-of-work tables were therefore empty no matter how long the system ran,
+# and COUNCIL_CANARY_MODE's release condition (DONE_APPLIED_VERIFIED) named a
+# state nothing could record.
+#
+# Every ledger.transition() inside run_task() now routes through _transition(),
+# which writes the ledger phase AND a durable stage-contract row. One wrapper
+# instead of ~25 call-site edits, so no transition can be missed.
+_PHASE_TO_STAGE = {
+    "CLAIMED": "CLAIMED",
+    "RESEARCHING": "RESEARCHING",
+    "EVIDENCE_READY": "EVIDENCE_RECORDED",
+    "PROPOSING": "SPECIFIED",
+    "DEBATING": "DEBATING",
+    "GATED": "AWAITING_APPROVAL",
+    "NEEDS_OPERATOR": "AWAITING_APPROVAL",
+    "PATCH_READY": "BUILDING",
+    "APPLYING": "STAGED",
+    "VERIFYING": "VERIFYING",
+    "APPLIED": "APPLIED",
+    "COMPLETED": "RETROSPECTIVE",
+    "ROLLED_BACK": "REJECTED",
+    "FAILED_FINAL": "REJECTED",
+    "FAILED_RETRYABLE": "BLOCKED",
+    "BLOCKED_TRANSIENT": "BLOCKED",
+    "BLOCKED_EXTERNAL": "BLOCKED",
+}
+
+
+def _stage_conn(db):
+    import sqlite3 as _s
+    c = _s.connect(str(db), timeout=15)
+    c.execute("PRAGMA busy_timeout=8000")
+    return c
+
+
+def _record_stage(canonical_id, phase, reason=None, outputs=None, db=None,
+                  run_id=None, attempt_id=None):
+    """Mirror a ledger phase into the durable stage contract.
+
+    F2: a stage-write failure must not break trading, but it must NEVER be
+    swallowed silently. It is persisted to council_stage_write_failures with
+    the expected and actual schema so drift is visible instead of invisible."""
+    stage = _PHASE_TO_STAGE.get(str(phase).upper())
+    if stage is None:
+        return
+    try:
+        from core.council_stage_contract import record_run
+    except Exception:
+        return
+    outputs = outputs or {}
+    artifact_kind = artifact_ref = None
+    for key in ("patch_id", "proposal_id", "evidence_id", "artifact_ref", "file"):
+        if outputs.get(key):
+            artifact_kind, artifact_ref = key, str(outputs[key])
+            break
+    try:
+        c = _stage_conn(db or DB_PATH)
+        try:
+            record_run(
+                c, f"council_task:{canonical_id}", stage,
+                artifact_kind=artifact_kind, artifact_ref=artifact_ref,
+                delta_summary=str(reason or "")[:400],
+                blocked_reason=(str(reason or "")[:200] if stage in ("BLOCKED", "REJECTED") else None),
+                run_id=run_id, actor=AGENT, status=str(phase).upper(),
+                attempt_id=attempt_id,
+            )
+        finally:
+            c.close()
+    except Exception as exc:
+        _record_stage_failure(canonical_id, phase, db or DB_PATH, run_id, exc)
+
+
+def _record_stage_failure(canonical_id, phase, db, run_id, exc):
+    """Persist STAGE_EVIDENCE_WRITE_FAILED. Best-effort, but loud in the log."""
+    import logging as _log
+    _log.error("STAGE_EVIDENCE_WRITE_FAILED task=%s phase=%s db=%s err=%s",
+               canonical_id, phase, db, exc)
+    try:
+        c = _stage_conn(db)
+        try:
+            c.execute(
+                "CREATE TABLE IF NOT EXISTS council_stage_write_failures("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, task_key TEXT,"
+                " run_id TEXT, phase TEXT, db_path TEXT, expected_schema TEXT,"
+                " actual_columns TEXT, exception TEXT)")
+            actual = []
+            for tbl in ("council_stage_evidence", "council_task_evidence"):
+                try:
+                    actual += [f"{tbl}.{r[1]}" for r in
+                               c.execute(f"PRAGMA table_info({tbl})")]
+                except Exception:
+                    pass
+            c.execute(
+                "INSERT INTO council_stage_write_failures(ts, task_key, run_id,"
+                " phase, db_path, expected_schema, actual_columns, exception)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                (time.time(), f"council_task:{canonical_id}", run_id,
+                 str(phase), str(db),
+                 "council_stage_evidence(task_key,stage,artifact_kind,"
+                 "artifact_ref,delta_summary,is_spin,run_id,attempt_id,actor,"
+                 "status,blocker,previous_stage,created_at)",
+                 ",".join(actual)[:2000], repr(exc)[:400]))
+            c.commit()
+        finally:
+            c.close()
+    except Exception:
+        pass          # the failure log above is the durable signal of last resort
+
+
+def _transition(canonical_id, phase, *, agent=None, reason=None, outputs=None,
+                db_path=None, **kw):
+    """ledger.transition + durable stage record, in that order."""
+    attempt_id = kw.pop("attempt_id", None)
+    res = ledger.transition(canonical_id, phase, agent=agent, reason=reason,
+                            outputs=outputs, db_path=db_path, **kw)
+    _record_stage(canonical_id, phase, reason=reason, outputs=outputs,
+                  db=db_path, attempt_id=attempt_id)
+    return res
+
+
+def _record_verified(canonical_id, patch_id, verifier_result, db):
+    """Explicit VERIFIED stage. safe_patch_apply sets phase='VERIFIED' with a
+    verifier_result; the stage contract now records it with the patch as the
+    citing artifact, which is what evaluate_canary_release() requires."""
+    _record_stage(canonical_id, "VERIFYING", reason="verification started", db=db)
+    try:
+        from core.council_stage_contract import record_run
+        c = _stage_conn(db or DB_PATH)
+        try:
+            record_run(c, f"council_task:{canonical_id}", "VERIFIED",
+                       artifact_kind="patch_id", artifact_ref=str(patch_id),
+                       delta_summary=str(verifier_result or "verified")[:400],
+                       actor=AGENT, status="VERIFIED")
+        finally:
+            c.close()
+    except Exception:
+        pass
+
+
+def release_canary_if_verified(canonical_id, db=None) -> dict:
+    """After a canary completes, evaluate the DURABLE build-plane latch."""
+    try:
+        from core.council_stage_contract import evaluate_canary_release
+        c = _stage_conn(db or DB_PATH)
+        try:
+            return evaluate_canary_release(c, f"council_task:{canonical_id}")
+        finally:
+            c.close()
+    except Exception as exc:
+        return {"state": "UNKNOWN", "released": False, "reason": f"error:{exc}"}
+
+
 def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
              ctx: Optional[dict] = None,
              model_router: Optional[Callable] = None,
@@ -349,7 +517,7 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
     task = ledger.get(canonical_id, db)
     if not task:
         return {"ok": False, "reason": "NO_TASK"}
-    handler = _find_handler(task["title"])
+    handler = _find_handler(task)
     if not handler:
         # CAPABILITY-GAP RESOLVER: never endlessly reclaim the same unsupported
         # task. Persist one deduplicated gap, increment the task retry count,
@@ -376,7 +544,7 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
             c.commit()
         finally:
             c.close()
-        ledger.transition(canonical_id, "NEEDS_OPERATOR", agent=AGENT,
+        _transition(canonical_id, "NEEDS_OPERATOR", agent=AGENT,
                           reason="NO_HANDLER capability gap persisted; retry loop stopped",
                           next_action="operator reviews capability gap",
                           db_path=db)
@@ -384,18 +552,18 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
     try:
         h = handler(task, ctx)
     except Exception as _hx:
-        ledger.transition(canonical_id, "FAILED_RETRYABLE", agent=AGENT,
+        _transition(canonical_id, "FAILED_RETRYABLE", agent=AGENT,
                           reason=f"handler init refused: {_hx}"[:200],
                           db_path=db)
         return {"ok": False, "reason": f"HANDLER_REFUSED:{_hx}"[:200]}
 
     # RESEARCHING → evidence persisted
-    ledger.transition(canonical_id, "RESEARCHING", agent=AGENT,
+    _transition(canonical_id, "RESEARCHING", agent=AGENT,
                       reason="handler research start", db_path=db)
     try:
         ev = h["research"]()
     except Exception as _rx:
-        ledger.transition(canonical_id, "FAILED_RETRYABLE", agent=AGENT,
+        _transition(canonical_id, "FAILED_RETRYABLE", agent=AGENT,
                           reason=f"research failed safely: {_rx}"[:200],
                           db_path=db)
         return {"ok": False, "reason": f"RESEARCH_REFUSED:{_rx}"[:200]}
@@ -414,7 +582,7 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
     finally:
         c.close()
     ledger.attach(canonical_id, evidence_id=evidence_id, db_path=db)
-    ledger.transition(canonical_id, "EVIDENCE_READY", agent=AGENT,
+    _transition(canonical_id, "EVIDENCE_READY", agent=AGENT,
                       reason=f"evidence #{evidence_id} persisted",
                       outputs={"evidence_id": evidence_id}, db_path=db)
 
@@ -422,7 +590,7 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
     try:
         prop = h["propose"](ev)
     except Exception as _px:
-        ledger.transition(canonical_id, "FAILED_RETRYABLE", agent=AGENT,
+        _transition(canonical_id, "FAILED_RETRYABLE", agent=AGENT,
                           reason=f"proposal refused safely: {_px}"[:200],
                           db_path=db)
         return {"ok": False, "reason": f"PROPOSE_REFUSED:{_px}"[:200]}
@@ -446,22 +614,22 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
     finally:
         c.close()
     ledger.attach(canonical_id, proposal_id=proposal_id, db_path=db)
-    ledger.transition(canonical_id, "PROPOSING", agent=AGENT,
+    _transition(canonical_id, "PROPOSING", agent=AGENT,
                       reason=f"proposal #{proposal_id} created", db_path=db)
 
     # DEBATING → degraded quorum
-    ledger.transition(canonical_id, "DEBATING", agent=AGENT,
+    _transition(canonical_id, "DEBATING", agent=AGENT,
                       reason="quorum debate start", db_path=db)
     prop["proposal_id"] = proposal_id
     verdict = debate_quorum.run_debate(prop, task["risk_tier"],
                                        model_router=model_router, db_path=db)
     if verdict["verdict"] == "DUPLICATE_SUPPRESSED":
-        ledger.transition(canonical_id, "BLOCKED_TRANSIENT", agent=AGENT,
+        _transition(canonical_id, "BLOCKED_TRANSIENT", agent=AGENT,
                           reason="debate cooldown active — duplicate suppressed",
                           db_path=db)
         return {"ok": False, "reason": "COOLDOWN", "verdict": verdict}
     if not verdict["consensus"]:
-        ledger.transition(canonical_id, "FAILED_RETRYABLE", agent=AGENT,
+        _transition(canonical_id, "FAILED_RETRYABLE", agent=AGENT,
                           reason=f"debate rejected ({verdict['quorum']})",
                           outputs=verdict, db_path=db)
         return {"ok": False, "reason": "DEBATE_REJECTED", "verdict": verdict}
@@ -478,11 +646,11 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
     # compile, smoke-test, rollback and verification path. Tier C never bypasses.
     if tier == "B" and operator_approval.approval_is_valid(canonical_id, db):
         allowed, why = True, "OPERATOR_APPROVED_TIER_B"
-    ledger.transition(canonical_id, "GATED", agent=AGENT,
+    _transition(canonical_id, "GATED", agent=AGENT,
                       reason=f"tier={tier} {why} quorum={verdict['quorum']}",
                       db_path=db)
     if tier == "C":
-        ledger.transition(canonical_id, "FAILED_FINAL", agent=AGENT,
+        _transition(canonical_id, "FAILED_FINAL", agent=AGENT,
                           reason=f"TIER C — never autonomous: {why}", db_path=db)
         return {"ok": False, "reason": "TIER_C_REFUSED"}
     if not allowed:
@@ -498,7 +666,7 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
             c.commit()
         finally:
             c.close()
-        ledger.transition(canonical_id, "NEEDS_OPERATOR", agent=AGENT,
+        _transition(canonical_id, "NEEDS_OPERATOR", agent=AGENT,
                           reason=f"tier {tier}: {why}", db_path=db)
         return {"ok": False, "reason": "NEEDS_OPERATOR", "tier": tier}
 
@@ -507,7 +675,7 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
     if built.get("already_applied"):
         ledger.attach(canonical_id, verification="PASS_ALREADY_APPLIED",
                       db_path=db)
-        ledger.transition(canonical_id, "COMPLETED", agent=AGENT,
+        _transition(canonical_id, "COMPLETED", agent=AGENT,
                           reason="fix already present on target — verified, "
                                  "no redundant patch generated", db_path=db)
         return {"ok": True, "reason": "ALREADY_APPLIED",
@@ -543,7 +711,7 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
     except Exception:
         _inside = False
     if (not _inside) or _resolved.name in _PROTECTED_NAMES:
-        ledger.transition(canonical_id, "BLOCKED_EXTERNAL", agent=AGENT,
+        _transition(canonical_id, "BLOCKED_EXTERNAL", agent=AGENT,
                           reason=(f"BUILD_CONTAINMENT_DENIED target={target} "
                                   f"outside allowlist {[str(r) for r in _ALLOWED_ROOTS]} "
                                   f"or protected module — operator approval required"),
@@ -570,12 +738,12 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
     finally:
         c.close()
     ledger.attach(canonical_id, patch_id=patch_id, db_path=db)
-    ledger.transition(canonical_id, "PATCH_READY", agent=AGENT,
+    _transition(canonical_id, "PATCH_READY", agent=AGENT,
                       reason=f"patch #{patch_id} generated backup={backup.name}",
                       db_path=db)
 
     # APPLYING → backup, write, compile+test, rollback on ANY failure
-    ledger.transition(canonical_id, "APPLYING", agent=AGENT,
+    _transition(canonical_id, "APPLYING", agent=AGENT,
                       reason="backup+write+compile+test", db_path=db)
     shutil.copy2(target, backup)
     test_note = ""
@@ -605,13 +773,13 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
             c.commit()
         finally:
             c.close()
-        ledger.transition(canonical_id, "ROLLED_BACK", agent=AGENT,
+        _transition(canonical_id, "ROLLED_BACK", agent=AGENT,
                           reason=f"apply failed → restored backup: {exc}",
                           db_path=db)
         return {"ok": False, "reason": "ROLLED_BACK", "error": str(exc)[:200]}
 
     # VERIFYING
-    ledger.transition(canonical_id, "VERIFYING", agent=AGENT,
+    _transition(canonical_id, "VERIFYING", agent=AGENT,
                       reason="post-apply verification", db_path=db)
     ok = False
     try:
@@ -629,7 +797,7 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
         c.close()
     if not ok:
         shutil.copy2(backup, target)
-        ledger.transition(canonical_id, "ROLLED_BACK", agent=AGENT,
+        _transition(canonical_id, "ROLLED_BACK", agent=AGENT,
                           reason="post-apply verification failed → rollback",
                           db_path=db)
         return {"ok": False, "reason": "VERIFY_FAILED_ROLLED_BACK"}
@@ -649,12 +817,58 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
         c.commit()
     finally:
         c.close()
-    ledger.transition(canonical_id, "COMPLETED", agent=AGENT,
-                      reason="applied+verified; retrospective written",
-                      outputs={"patch_id": patch_id,
+    ledger.attach(canonical_id, verification="DONE_APPLIED_VERIFIED", db_path=db)
+    _record_verified(canonical_id, patch_id, verdict, db)
+    _record_stage(canonical_id, "APPLYING", reason="patch applied",
+                  outputs={"patch_id": patch_id}, db=db)
+    _transition(canonical_id, "COMPLETED", agent=AGENT,
+                      reason="DONE_APPLIED_VERIFIED: applied+tested+verified; retrospective written",
+                      outputs={"patch_id": patch_id, "terminal_status": "DONE_APPLIED_VERIFIED",
                                "proposal_id": proposal_id}, db_path=db)
-    return {"ok": True, "reason": "COMPLETED", "patch_id": patch_id,
-            "proposal_id": proposal_id, "verdict": verdict}
+    _latch = release_canary_if_verified(canonical_id, db)
+    return {"ok": True, "reason": "DONE_APPLIED_VERIFIED", "patch_id": patch_id,
+            "proposal_id": proposal_id, "verdict": verdict,
+            "build_plane": _latch}
+
+
+def _seed_signoff_canary(db: Path) -> int:
+    """Ensure one deterministic UI-only task exists for next-launch proof.
+
+    Canary mode intentionally does not delete or rewrite operator tasks. It
+    merely creates one canonical, handler-covered task and the ledger claim
+    filter makes it the only runnable task until the operator disables
+    COUNCIL_CANARY_MODE after DONE_APPLIED_VERIFIED is observed.
+    """
+    # COUNCIL_CANARY_LATCH_20260728: seed the canary only while the DURABLE
+    # build plane still requires one. Once released, this is a no-op instead of
+    # re-seeding a canary on every launch.
+    _forced = str(os.getenv("COUNCIL_CANARY_MODE", "")).strip()
+    if _forced != "1":
+        try:
+            from core.council_stage_contract import canary_only_mode as _com
+            _probe = _con(db)
+            try:
+                if not _com(_probe):
+                    return 0
+            finally:
+                _probe.close()
+        except Exception:
+            pass   # contract unavailable -> fail closed, seed the canary
+    c = _con(db)
+    try:
+        now = time.time()
+        cur = c.execute(
+            "INSERT INTO council_task_ledger(source_table,source_id,title,description,"
+            "domain,risk_tier,priority,owner,phase,created_at,updated_at) "
+            "VALUES('SIGNOFF_CANARY',1,'Council stage rail canary',"
+            "'Increment the non-functional CANARY_REVISION in ui/council_build_stage_rail.py; "
+            "compile, verify, retrospect and terminalise.',"
+            "'ui','A',0,'POLARIS','OPEN',?,?) "
+            "ON CONFLICT(source_table,source_id) DO NOTHING", (now, now))
+        c.commit()
+        return max(cur.rowcount, 0)
+    finally:
+        c.close()
 
 
 def run_cycle(db_path: Optional[Path] = None, *,
@@ -664,6 +878,7 @@ def run_cycle(db_path: Optional[Path] = None, *,
     db = Path(db_path or BUILD_DB_PATH)
     if not db.exists():
         return {"ok": False, "reason": "BUILD_DB_MISSING_RUN_MIGRATION"}
+    seeded = _seed_signoff_canary(db)
     reaped = ledger.release_expired_leases(db)
     # Intake is read-only against market truth and writes only to build DB.
     imported = ledger.import_sources(db, source_db_path=MARKET_DB_PATH)
@@ -674,8 +889,8 @@ def run_cycle(db_path: Optional[Path] = None, *,
                 "stagnation": stag, "claimed": None, "result": None}
     result = run_task(candidate["canonical_id"], db_path=db, ctx=ctx,
                       model_router=model_router, get_config=get_config)
-    return {"reaped": reaped, "imported": imported, "stagnation": stag,
-            "claimed": candidate["canonical_id"], "result": result}
+    return {"reaped": reaped, "imported": imported, "seeded_canary": seeded,
+            "stagnation": stag, "claimed": candidate["canonical_id"], "result": result}
 
 
 def main() -> None:
@@ -685,7 +900,7 @@ def main() -> None:
             print(f"[AUTOBUILDER] {json.dumps(out, default=str)[:300]}")
         except Exception as exc:
             print(f"[AUTOBUILDER] cycle error: {exc}")
-        time.sleep(300)
+        time.sleep(max(10, int(os.getenv("COUNCIL_AUTOBUILD_INTERVAL_SEC", "300"))))
 
 
 if __name__ == "__main__":

@@ -1289,7 +1289,7 @@ def render_top_command_nav() -> None:
     except Exception:
         _active = ""
 
-    secs = [("FOREST", "forest"), ("SUBSTRATE NODE", "substrate"), ("INTEL", "intel"), ("BIO·3", "bio"),
+    secs = [("FOREST", "forest"), ("SUBSTRATE NODE", "substrate"), ("INTEL", "intel"),
             ("README", "readme"), ("LAB", "lab"), ("VAULT", "vault"),
             ("POLARIS", "polaris"), ("IVARIS", "ivy")]
     jumps = [("PULSE", "#lore-modules"), ("GLASSBOX", "#glassbox-anchor")]
@@ -10924,7 +10924,6 @@ _HUB_SECTIONS = {
     "forest":    ("🌲 LIVING EXCHANGE FOREST",                   _sec_forest),
     "substrate": ("🌐 SUBSTRATE NODE",                          _sec_substrate),
     "intel":     ("§  INTELLIGENCE - RESEARCH & SELF-EVOLUTION", _sec_intel),
-    "bio":       ("⬡ BIOLOGICAL INTELLIGENCE - LANE 3",         _sec_bio),
     "readme":    ("📋 POLARIZE - README",                        _sec_readme),
     "polaris":   ("❄️ POLARIS — AUTONOMOUS ARCHITECT",          _sec_polaris),
     "ivy":       ("🔥 IVY GENESIS SQUAD",                        _sec_ivy),

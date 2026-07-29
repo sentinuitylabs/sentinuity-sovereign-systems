@@ -27,6 +27,20 @@ from typing import Optional
 # these match, the file is human-only, full stop — even if a safe pattern also
 # matches. Substring patterns so a path anywhere in the tree is caught.
 _MONEY_PATTERNS = [
+    # Build-plane integrity denylist. A build system that can patch its own
+    # gate, ledger, apply policy, rollback authority or launcher has no gate.
+    r"(?:^|/)services/council_execution_spine\.py$",
+    r"(?:^|/)services/council_build_orchestrator\.py$",
+    r"(?:^|/)services/council_autobuilder\.py$",
+    r"(?:^|/)services/council_task_ledger\.py$",
+    r"(?:^|/)services/golden_latch_gate\.py$",
+    r"(?:^|/)services/autonomous_apply_policy\.py$",
+    r"(?:^|/)services/apply_policy\.py$",
+    r"(?:^|/)services/safe_patch_apply\.py$",
+    r"(?:^|/)services/polaris_patch_writer\.py$",
+    r"(?:^|/)services/build_retrospective\.py$",
+    r"(?:^|/)core/schema\.py$",
+    r"(?:^|/)launch/",
     r"execution_engine\.py$",
     r"live_trading\.py$",
     r"live_wallet_sync\.py$",

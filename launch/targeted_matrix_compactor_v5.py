@@ -15,7 +15,10 @@ ACTIVE_STATES = {"OPEN", "ACTIVE", "PENDING", "LIVE", "EXECUTING"}
 KEEP_TAIL = {
     "api_usage_ledger": 200,
     "cognition_log": 300,
-    "copytrade_influence_ledger": 500,
+    # SMART_WALLET_EXPERIMENT_20260728: raised from 500. The A/B spine
+    # needs >=100 DECISION-CHANGING pairs; at 500 total rows the
+    # experiment sample could be trimmed before it reaches the floor.
+    "copytrade_influence_ledger": 20000,
     "council_model_assignments": 200,
     "council_model_evolution_log": 200,
     "council_stalemates": 100,
@@ -43,7 +46,7 @@ KEEP_TAIL = {
     "runner_likelihood_scores": 500,
     "security_events": 200,
     "shadow_runners": 500,
-    "smart_wallet_events": 500,
+    "smart_wallet_events": 5000,
     "smart_wallet_trades": 1000,
     "substrate_council_votes": 300,
     "substrate_execution_audit": 300,

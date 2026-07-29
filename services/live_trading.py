@@ -53,6 +53,22 @@ DEPLOY:
 
 from __future__ import annotations
 
+# PUBLIC_GITHUB_RELEASE_STUB_20260729
+# This public release intentionally disables transaction signing/submission at
+# module level. Paper pricing and read-only route inspection remain available.
+PUBLIC_RELEASE_LIVE_STUB = True
+
+def _public_live_block(operation: str, **extra):
+    result = {
+        "success": False,
+        "submitted": False,
+        "public_release_stub": True,
+        "reason": "PUBLIC_RELEASE_LIVE_EXECUTION_DISABLED",
+        "operation": operation,
+    }
+    result.update(extra)
+    return result
+
 import json
 import logging
 import os
@@ -322,6 +338,8 @@ def _record_latency_telemetry(tx_sig: str, side: str, position_id: Optional[int]
 # ── KEYPAIR LOADER ────────────────────────────────────────────────────────────
 
 def _load_keypair():
+    if PUBLIC_RELEASE_LIVE_STUB:
+        raise RuntimeError("PUBLIC_RELEASE_LIVE_EXECUTION_DISABLED")
     """
     Load Solana keypair from base58 private key string.
     Returns solders.keypair.Keypair or None if unavailable.
@@ -1031,6 +1049,8 @@ def _reverse_sellability_probe(mint: str, quoted_token_raw: int, input_lamports:
 
 
 def preflight_live_buy(mint: str, pos_size_usd: float) -> dict:
+    if PUBLIC_RELEASE_LIVE_STUB:
+        return _public_live_block("preflight_live_buy", mint=mint)
     """Mandatory funded-entry contract: provenance + buy route + reverse route.
 
     This is read-only.  It proves that the mint is a canonical Pump coin rather
@@ -1120,6 +1140,8 @@ def execute_live_buy(
     entry_price_usd: float,
     position_id: int,
 ) -> dict:
+    if PUBLIC_RELEASE_LIVE_STUB:
+        return _public_live_block("execute_live_buy", mint=mint, position_id=position_id)
     """Execute and reconcile a live buy.  Success means chain fill resolved."""
     result = {
         "success": False, "confirmed": False, "tx_sig": None,
@@ -1523,6 +1545,8 @@ def execute_live_sell(
     exit_price_usd: float,
     emergency: bool = False,
 ) -> dict:
+    if PUBLIC_RELEASE_LIVE_STUB:
+        return _public_live_block("execute_live_sell", mint=mint, position_id=position_id)
     """Execute and reconcile a live sell. No theoretical close fallback exists."""
     result = {
         "success": False, "confirmed": False, "tx_sig": None,
@@ -1667,6 +1691,8 @@ def execute_live_sell(
 
 
 def is_live_mode() -> bool:
+    if PUBLIC_RELEASE_LIVE_STUB:
+        return False
     """True when the independent dual live lane is fully armed."""
     try:
         from core.schema import get_config_value

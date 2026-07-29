@@ -86,11 +86,11 @@ CREATE TABLE IF NOT EXISTS council_needs_operator(
 
 
 def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
-    c = sqlite3.connect(str(db_path or DB_PATH), timeout=1.0)
+    c = sqlite3.connect(str(db_path or DB_PATH), timeout=15.0)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA synchronous=NORMAL")
-    c.execute("PRAGMA busy_timeout=750")
+    c.execute("PRAGMA busy_timeout=15000")
     return c
 
 
@@ -262,11 +262,18 @@ def claim(agent: str, canonical_id: Optional[int] = None,
                 "SELECT domain FROM council_task_ledger WHERE claimed_by=? "
                 "ORDER BY updated_at DESC LIMIT 1", (agent,)).fetchone()
             last_dom = last["domain"] if last else ""
+            # COUNCIL_CANARY_LATCH_20260728: the durable build-plane state is
+            # authoritative. The env var may only FORCE canary on; it can no
+            # longer be the reason the system is permanently stuck in it.
+            canary_only = _canary_only_mode(c)
+            canary_clause = " AND lower(title) LIKE '%council stage rail canary%'" if canary_only else ""
             row = c.execute(
                 "SELECT canonical_id FROM council_task_ledger "
                 "WHERE phase IN ('OPEN','FAILED_RETRYABLE','BLOCKED_TRANSIENT') "
+                "AND blocker_code IS NOT 'NO_HANDLER' "
                 "AND (claimed_by IS NULL OR lease_expires_at < ?) "
-                "ORDER BY priority ASC, (domain=?) ASC, created_at ASC LIMIT 1",
+                + canary_clause +
+                " ORDER BY priority ASC, (domain=?) ASC, created_at ASC LIMIT 1",
                 (now, last_dom)).fetchone()
             if not row:
                 return None
@@ -428,3 +435,35 @@ def attach(canonical_id: int, *, evidence_id: Optional[int] = None,
         c.commit()
     finally:
         c.close()
+
+
+# ── DURABLE CANARY GATE (COUNCIL_CANARY_LATCH_20260728) ─────────────────────
+def _canary_only_mode(conn) -> bool:
+    """Read the DURABLE build-plane state, not a hardcoded env default.
+
+    Previously: os.getenv("COUNCIL_CANARY_MODE", "1") -- defaulting to ON in
+    code meant unsetting the environment variable released nothing and the
+    backlog was permanently unclaimable.
+
+    Now: once a canary is verified and the latch is set to BUILD_READY, normal
+    tasks become claimable and STAY claimable across launches. The environment
+    variable is retained only as an explicit override to force canary mode ON
+    (an operator safety brake); it can never be the cause of a permanent stall.
+    """
+    import os as _os
+    try:
+        from core.council_stage_contract import canary_only_mode as _com
+    except Exception:
+        try:
+            from council_stage_contract import canary_only_mode as _com  # type: ignore
+        except Exception:
+            _com = None
+    forced = str(_os.getenv("COUNCIL_CANARY_MODE", "")).strip()
+    if forced == "1":
+        return True          # explicit operator brake
+    if _com is None:
+        return forced == "1"  # contract unavailable: honour explicit value only
+    try:
+        return bool(_com(conn))
+    except Exception:
+        return True          # fail closed

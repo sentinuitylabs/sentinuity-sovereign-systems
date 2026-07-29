@@ -54,7 +54,10 @@ TAIL_POLICIES = {
     "candidate_scores": 500,
     "code_vault_changes": 100,
     "cognition_log": 300,
-    "copytrade_influence_ledger": 500,
+    # SMART_WALLET_EXPERIMENT_20260728: raised from 500. The A/B spine
+    # needs >=100 DECISION-CHANGING pairs; at 500 total rows the
+    # experiment sample could be trimmed before it reaches the floor.
+    "copytrade_influence_ledger": 20000,
     "council_model_assignments": 200,
     "council_model_evolution_log": 200,
     "council_stalemates": 100,
@@ -101,7 +104,7 @@ TAIL_POLICIES = {
     "runner_likelihood_scores": 500,
     "security_events": 200,
     "shadow_runners": 500,
-    "smart_wallet_events": 500,
+    "smart_wallet_events": 5000,
     "smart_wallet_trades": 1000,
     "substrate_copytrade_signals": 300,
     "substrate_council_votes": 300,

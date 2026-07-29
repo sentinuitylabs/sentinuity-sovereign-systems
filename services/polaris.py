@@ -719,6 +719,12 @@ class Polaris:
         return int(cur.lastrowid)
 
     def _claim_due_task(self, conn) -> Optional[dict]:
+        # SIGN-OFF 2026-07-28: installed schemas vary and the build plane is
+        # contention-prone. Keep the claim transaction short and bounded.
+        try:
+            conn.execute("PRAGMA busy_timeout=15000")
+        except sqlite3.Error:
+            pass
         row = conn.execute(
             """
             SELECT *

@@ -26,6 +26,8 @@ import logging
 import os
 import re
 import sys
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -37,10 +39,38 @@ if str(BASE_DIR) not in sys.path:
 log = logging.getLogger("ivaris")
 
 # NIM primary model — read from DB config at call time
-IVARIS_NIM_MODEL_DEFAULT = "qwen/qwen3.5-397b-a17b"
+IVARIS_NIM_MODEL_DEFAULT = "meta/llama-3.3-70b-instruct"
 IVARIS_FALLBACK_MODEL    = "claude-haiku-4-5-20251001"
 
 NIM_BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+
+
+# Provider outage circuit. A dead tether or DNS outage must not trigger a new
+# 30-second NIM/Anthropic request on every Council cycle.
+_PROVIDER_FAILS = {"nim": 0, "anthropic": 0}
+_PROVIDER_BACKOFF_UNTIL = {"nim": 0.0, "anthropic": 0.0}
+
+def _provider_ready(name: str) -> bool:
+    return time.time() >= float(_PROVIDER_BACKOFF_UNTIL.get(name, 0.0))
+
+def _provider_success(name: str) -> None:
+    _PROVIDER_FAILS[name] = 0
+    _PROVIDER_BACKOFF_UNTIL[name] = 0.0
+
+def _provider_failure(name: str) -> float:
+    failures = int(_PROVIDER_FAILS.get(name, 0)) + 1
+    _PROVIDER_FAILS[name] = failures
+    delay = min(1800.0, 60.0 * (2 ** min(failures - 1, 5)))
+    _PROVIDER_BACKOFF_UNTIL[name] = time.time() + delay
+    return delay
+
+def _safe_error(exc: Exception) -> str:
+    text = str(exc)
+    for secret in (os.getenv("NVIDIA_NIM_API_KEY", ""), os.getenv("ANTHROPIC_API_KEY", "")):
+        if secret:
+            text = text.replace(secret, "<redacted>")
+    text = re.sub(r"([?&](?:api[-_]?key|token|key)=)[^&\s]+", r"\1<redacted>", text, flags=re.I)
+    return " ".join(text.split())[:220]
 
 IVARIS_SYSTEM_PROMPT = """You are IVARIS — the immune system of the Sentinuity sovereign trading organism.
 Your role: adversarial critic. Find every reason a proposal could fail.
@@ -52,7 +82,7 @@ Output JSON only: {"verdict": "APPROVE|REJECT|DEBATE", "confidence": 0.0-1.0,
 def _try_nim(system: str, user: str) -> Optional[str]:
     """Call IVARIS through the assigned NIM model and rotate on empty/error."""
     nim_key = os.getenv("NVIDIA_NIM_API_KEY", "").strip()
-    if not nim_key:
+    if not nim_key or not _provider_ready("nim"):
         return None
     try:
         from services.nvidia_model_registry import get_assignment, rotate_after_failure
@@ -89,11 +119,13 @@ def _try_nim(system: str, user: str) -> Optional[str]:
                 data = json.loads(resp.read().decode("utf-8", "replace"))
                 text = str((((data.get("choices") or [{}])[0].get("message") or {}).get("content")) or "").strip()
                 if text:
+                    _provider_success("nim")
                     return text
                 failure = "EMPTY_CONTENT_200"
         except Exception as exc:
-            failure = f"{type(exc).__name__}:{str(exc)[:220]}"
-        log.warning("IVARIS_NIM_MODEL_FAILED model=%s reason=%s", model, failure)
+            failure = f"{type(exc).__name__}:{_safe_error(exc)}"
+        delay = _provider_failure("nim")
+        log.warning("IVARIS_NIM_MODEL_FAILED model=%s backoff=%.0fs reason=%s", model, delay, failure)
         if rotate_after_failure:
             model = rotate_after_failure("IVARIS", model, failure, refresh=(attempt == 1))
         else:
@@ -105,7 +137,7 @@ def _try_anthropic(system: str, user: str) -> Optional[str]:
     """Fallback: call IVARIS via Anthropic Claude Haiku."""
     try:
         ant_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-        if not ant_key:
+        if not ant_key or not _provider_ready("anthropic"):
             return None
 
         payload = json.dumps({
@@ -127,9 +159,12 @@ def _try_anthropic(system: str, user: str) -> Optional[str]:
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode())
-            return data["content"][0]["text"].strip()
+            text = data["content"][0]["text"].strip()
+            _provider_success("anthropic")
+            return text
     except Exception as e:
-        log.debug("Anthropic IVARIS fallback failed: %s", e)
+        delay = _provider_failure("anthropic")
+        log.warning("Anthropic IVARIS fallback failed; backoff=%.0fs: %s", delay, _safe_error(e))
         return None
 
 

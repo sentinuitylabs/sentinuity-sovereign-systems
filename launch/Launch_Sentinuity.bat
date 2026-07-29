@@ -1392,7 +1392,22 @@ start "CouncilChamber" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.
 rem COUNCIL_BUILD_PLANE_20260724: legacy matrix-writing orchestrator disabled.
 rem start "CouncilBuild" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.council_build_orchestrator >> ""%LOG_PATH%\council_build_orchestrator.log"" 2^>^&1"
 
-rem COUNCIL_BUILD_PLANE_20260724 - isolated DB; migration before daemon.
+rem COUNCIL_BUILD_SIGNOFF_CANARY_20260729: durable build-plane latch authority.
+rem Do NOT force COUNCIL_CANARY_MODE=1 here: that would override BUILD_READY
+rem on every boot and permanently trap the normal standing-task backlog.
+set "COUNCIL_AUTOBUILD_INTERVAL_SEC=30"
+
+rem HITL_LAUNCH_GUARD_20260729: verify BEFORE starting any service that can
+rem research, propose, stage or apply code. Failure skips the whole build plane
+rem but leaves read-only console/watchdog observability running.
+"%PY%" "%~dp0stamp_hitl_guard.py" --db "sentinuity_matrix.db" --log "%LOG_PATH%\hitl_guard.log"
+if errorlevel 1 (
+    echo [FATAL] HITL guard could not be verified. Council/autobuilder start ABORTED.
+    echo         See "%LOG_PATH%\hitl_guard.log"
+    goto :SKIP_COUNCIL_START
+)
+
+rem COUNCIL_BUILD_PLANE_20260729 - isolated DB; migration before daemon.
 "%PY%" .\launch\council_autobuild_migrate.py >> "%LOG_PATH%\council_autobuild_migrate.log" 2>&1
 if errorlevel 1 (
   echo [FAIL] Council build-plane migration failed. Autobuilder not started.
@@ -1402,9 +1417,7 @@ if errorlevel 1 (
 
 start "ForgeOrchestrator" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.intelligence_orchestrator >> ""%LOG_PATH%\intelligence_orchestrator.log"" 2^>^&1"
 
-rem Research/debate spine; force HITL so no proposal can auto-apply.
-
-"%PY%" -c "import sqlite3,time; c=sqlite3.connect('sentinuity_matrix.db'); c.execute("INSERT INTO system_config(key,value,updated_at) VALUES('HITL_REQUIRED','1',?) ON CONFLICT(key) DO UPDATE SET value='1',updated_at=excluded.updated_at",(time.time(),)); c.commit(); c.close()" >> "%LOG_PATH%\hitl_guard.log" 2>&1
+rem Research/debate spine; HITL has already been persisted and read back.
 
 start "ForgeResearch" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.forge_research_bridge >> ""%LOG_PATH%\forge_research_bridge.log"" 2^>^&1"
 
@@ -1428,6 +1441,13 @@ start "Replay" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.replay_e
 start "Vault" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.code_vault service >> ""%LOG_PATH%\code_vault.log"" 2^>^&1"
 
 if exist auto_sweep.py start "AutoSweep" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" auto_sweep.py >> ""%LOG_PATH%\auto_sweep.log"" 2^>^&1"
+
+rem HITL_LAUNCH_GUARD_20260728: abort target for a failed HITL stamp.
+rem Everything ABOVE this label can create or auto-apply patches and is
+rem therefore skipped when the guard cannot be verified. Everything BELOW
+rem is read-only observability (console, watchdog, watch) and still starts,
+rem so a failed guard leaves the operator informed rather than blind.
+:SKIP_COUNCIL_START
 
 
 

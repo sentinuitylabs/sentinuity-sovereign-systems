@@ -18,7 +18,9 @@ RUNTIME_DIR.mkdir(exist_ok=True)
 
 DEFAULT_CUTOFF_SECONDS = 600
 MAX_SCAN_ROWS = 100000
-MAX_DELETE_PER_TABLE = 25000
+MAX_DELETE_PER_TABLE = 500
+HOT_PRICE_DB_NAMES = {"sentinuity_matrix.db", "sentinuity_price_truth.db"}
+HOT_PRICE_TABLES = {"market_snapshots", "price_truth_snapshots", "pump_curve_shadow"}
 
 ACTIVE_EXACT_TABLES = {
     "polaris_proposals",
@@ -168,6 +170,33 @@ def backup_dbs(dbs):
         except Exception as e:
             log(f"[WARN] backup failed {db}: {e}")
     log(f"[OK] backed up {copied} db file(s) to {backup_dir}")
+
+NON_TERMINAL_PROPOSAL_STATES = {
+    "open", "researching", "evidence_ready", "debating",
+    "awaiting_approval", "approved", "patch_generated", "staged",
+    "applying", "applied", "verifying", "pending_measurement",
+    "rollback_available",
+}
+TERMINAL_PROPOSAL_STATES = {
+    "rejected_final", "superseded", "rolled_back_final",
+    "measured_complete", "abandoned_by_operator",
+}
+PROPOSAL_TABLES = {"polaris_proposals", "qualified_proposals",
+                   "proposal_queue", "council_build_proposals"}
+
+def proposal_row_is_archivable(row):
+    """F4: only TERMINAL proposals may be archived. A proposal in
+    DEBATING or AWAITING_APPROVAL must survive indefinitely — deleting it
+    also destroys the debate cooldown, which is keyed on proposal_id."""
+    for key in ("lifecycle_state", "status", "state"):
+        v = str(row.get(key) or "").strip().lower()
+        if not v:
+            continue
+        if v in TERMINAL_PROPOSAL_STATES:
+            return True
+        if v in NON_TERMINAL_PROPOSAL_STATES:
+            return False
+    return False          # unknown state => fail closed, keep the row
 
 def should_clean_table(table):
     t = table.lower()
@@ -327,6 +356,9 @@ def clean_table(con, db_label, table, cutoff_seconds, dry_run=False, protected_m
                     continue
             except Exception:
                 pass
+        if table.lower() in PROPOSAL_TABLES and not proposal_row_is_archivable(d):
+            protected_fresh_unscored += 1
+            continue
         should_delete, reason, age, ts_col, ts_val = classify_row(d, time_cols, reason_cols, cutoff_seconds)
         if should_delete:
             stale.append((rid, d, reason, age, ts_col, ts_val))
@@ -406,6 +438,13 @@ def clean_once(cutoff_seconds=DEFAULT_CUTOFF_SECONDS, dry_run=False, backup=Fals
             for table in get_tables(con):
                 if not should_clean_table(table):
                     continue
+                # SIGNOFF_HOT_PRICE_GUARD_20260729: while any position is open,
+                # bulk cleanup of hot marking tables is deferred. The existing
+                # per-mint protection remains, but avoiding the scan/write/checkpoint
+                # entirely prevents contention with the mark loop.
+                if _open_mints and db.name.lower() in HOT_PRICE_DB_NAMES and table.lower() in HOT_PRICE_TABLES:
+                    log(f"[DEFER_HOT_PRICE_TABLE] {db_label}::{table} open_positions={len(_open_mints)}")
+                    continue
                 scanned_tables += 1
                 try:
                     _tbl_cols = {x[1] for x in con.execute(f'pragma table_info("{table}")').fetchall()}
@@ -443,7 +482,10 @@ def clean_once(cutoff_seconds=DEFAULT_CUTOFF_SECONDS, dry_run=False, backup=Fals
                 )
                 con.commit()
                 try:
-                    con.execute("pragma wal_checkpoint(truncate)")
+                    if not (_open_mints and db.name.lower() in HOT_PRICE_DB_NAMES):
+                        con.execute("pragma wal_checkpoint(passive)")
+                    else:
+                        log(f"[DEFER_HOT_DB_CHECKPOINT] {db_label} open_positions={len(_open_mints)}")
                 except Exception:
                     pass
 

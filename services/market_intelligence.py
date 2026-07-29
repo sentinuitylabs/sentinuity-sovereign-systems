@@ -2150,19 +2150,20 @@ def run() -> None:
         t.start()
     log.info("Qualifier and price oracle mycelial threads initialised.")
 
-    if _WS_ORACLE_AVAILABLE:
+    # EDGE_RESTORE_SINGLE_ORACLE_20260727:
+    # Launch_Sentinuity.bat already starts services.ws_price_oracle as the
+    # canonical standalone owner. Starting it again here creates a second
+    # subscription manager, duplicate fallback writes and SQLite lock storms.
+    # Embedded mode remains opt-in only for standalone development runs.
+    _embed_ws = str(os.getenv("MARKET_INTELLIGENCE_EMBED_WS_ORACLE", "0")).strip().lower() in ("1", "true", "yes", "on")
+    if _WS_ORACLE_AVAILABLE and _embed_ws:
         try:
             _start_ws_oracle()
-            log.info(
-                "Harmonic resonance achieved. Sensory pathways clear. "
-                "Helius accountSubscribe oracle started - real-time MTM active."
-            )
+            log.info("Embedded WS oracle explicitly enabled - real-time MTM active.")
         except Exception as _ws_start_err:
-            log.error(
-                "Sensory dissonance detected. Reverting to deep memory polling. "
-                "WS oracle start failed: %s - HTTP polling will cover all open mints.",
-                _ws_start_err,
-            )
+            log.error("Embedded WS oracle start failed: %s - HTTP polling remains active.", _ws_start_err)
+    elif _WS_ORACLE_AVAILABLE:
+        log.info("Standalone WsOracle is canonical; embedded duplicate disabled.")
     else:
         log.warning(
             "Sensory dissonance detected. Reverting to deep memory polling. "

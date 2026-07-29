@@ -27,6 +27,9 @@ except Exception:
             if v and str(v).lower() not in ("n/a","none","unknown",""): return str(v)
         return short_mint(d.get("mint") or d.get("mint_address"))
 
+# LIVING_ORGANISM_WORLD_SIGNOFF_20260729
+# Courier Owl visual deliveries are derived from the same read-only narrative payload.
+# No visual movement creates or mutates backend state.
 # SIGNOFF_WORLD_SINGLE_SOURCE_20260613:
 # Support both layouts used in handoff zips:
 #   repo/ui/sovereign_world_component.py -> root is parent of ui/
@@ -36,7 +39,7 @@ ROOT             = _HERE.parent if _HERE.name.lower() == "ui" else _HERE
 DB_PATH          = ROOT / "sentinuity_matrix.db"
 _WORLD_HTML_PATH = _HERE / "sovereign_world.html"
 
-STATE_VERSION      = 2
+STATE_VERSION      = 4
 
 # ── NARRATIVE ADAPTER — real backend events -> cinematic agent bubbles ────────
 # Read-only. No fabrication. Every bubble derives from a real cognition_log row.
@@ -53,33 +56,33 @@ _NARR_AGENT = {
     "GUARDIAN":  ("SYSTEM",  "HEAL",    "#ffd23f"),
     "HEALTH":    ("SYSTEM",  "HEAL",    "#ffd23f"),
     "POLARIS":   ("POLARIS", "SCORE",   "#39d6ff"),
-    "RUNNER_DUD":("NUGGET",  "DEFEND",  "#ffd23f"),
+    "RUNNER_DUD":("SENTINEL", "REVIEW",  "#ffd23f"),
 }
 
 def _mask_intent(stage, raw):
-    """Convert a raw cognition line into safe cinematic narrative. No SQL, no keys, no traces."""
+    """Translate backend telemetry into neutral, audience-safe operational language."""
     r = (raw or "").upper()
     if "VETO_SIGNAL_TOO_OLD" in r or "SIGNAL_TOO_OLD" in r:
-        return ("warning","VETO","Signal age exceeded safety tolerance. Fork released.")
+        return ("warning","AGE_CHECK","Signal age exceeded tolerance. Candidate returned to observation.")
     if "STALE_SIGNAL" in r or "STALE_BLOCK" in r or "EXECUTION_STALE" in r:
-        return ("warning","STALE_SERVICE","Price truth went quiet. Execution stays sealed until the mark returns.")
+        return ("warning","FRESHNESS_HOLD","Price truth is stale. Execution remains paused until a fresh mark arrives.")
     if "MARKET CAP BELOW" in r or "MCAP" in r:
-        return ("info","VETO","Candidate too thin. Held below the market-cap floor.")
+        return ("info","QUALITY_HOLD","Candidate remains below the configured market-cap floor.")
     if "APPROVED" in r and "EXECUTION" in r:
-        return ("success","LATCH","All gates cleared. Seal armed for execution.")
+        return ("success","READY","All configured checks passed. Candidate is ready for the next authorised step.")
     if "RUNNER HARVESTED" in r or "HARVESTED" in r:
-        return ("success","EXECUTION","Runner banked. Value absorbed into the core.")
+        return ("success","OUTCOME_RECORDED","Position outcome recorded and added to system learning.")
     if "CUT_RECOMMENDATION" in r or "RUNNER_DUD" in r:
-        return ("info","DEFEND","Momentum stalled. Marking the fork for release.")
+        return ("info","RISK_REVIEW","Momentum weakened. Position moved to risk review.")
     if "MTM" in r or "REFRESHED" in r or "PRICE LAYER" in r:
-        return ("info","PRICE_REFRESH","Oracle refreshed the mark. Value path is measurable.")
+        return ("info","PRICE_REFRESH","Price authority refreshed the mark.")
     if "ZERO_HEARTBEAT" in r or "RESTARTED" in r:
-        return ("critical","RECOVERY","A limb went dark. Guardian restarted the service.")
+        return ("critical","SERVICE_RECOVERY","A service heartbeat became stale and the recovery process restarted it.")
     if "MAX_HOLD" in r:
-        return ("info","EXECUTION","Hold window elapsed. Position closed on time discipline.")
-    # generic fallback — still real, just trimmed and de-jargoned
-    txt = (raw or "")[:70]
-    return ("info","INFO", txt)
+        return ("info","TIME_EXIT","The configured holding window elapsed and the position was closed.")
+    txt = re.sub(r"(?i)(api[-_ ]?key|private[-_ ]?key|secret|token)\s*[:=]\s*\S+", r"\1=[redacted]", str(raw or ""))
+    txt = re.sub(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b", "[address]", txt)
+    return ("info","SYSTEM_UPDATE", txt[:96])
 
 def build_world_narrative_events(tel_rows):
     """tel_rows: list of {'stage','message'} dicts already pulled read-only.
@@ -389,9 +392,9 @@ def _fetch_state() -> dict:
                         f"{funnel['latched']} latched / {funnel['qualified']} qualified" if funnel["latched"] > 0 else "Supervisor holding gate",
                         f"min conf {conf_floor}", "supervisor"),
         "EXECUTOR": _ag(s["execution_engine"]["alive"],
-                        "PAPER" if live_blocked else "LIVE",
-                        f"{funnel['open_positions']} open · live blocked" if live_blocked else f"{funnel['open_positions']} open · LIVE armed",
-                        "Paper execution only" if live_blocked else "Managing live positions", "executor"),
+                        "PAPER MODE" if live_blocked else "LIVE MODE",
+                        f"{funnel['open_positions']} open · live authority unavailable" if live_blocked else f"{funnel['open_positions']} open · live authority enabled",
+                        "Processing authorised paper positions" if live_blocked else "Managing authorised live positions", "executor"),
         "COPY":     _ag(copytrade.get("matched", 0) > 0 or copytrade.get("scanner_age") is not None or copytrade.get("broken"),
                         "BROKEN" if copytrade.get("broken") else ("SIGNAL" if copytrade.get("matched", 0) > 0 else "OBSERVING"),
                         ("Conviction scorer import failed" if copytrade.get("broken") else (f"{copytrade.get('matched',0)} wallet matches" if copytrade.get("matched", 0) > 0 else "Copy-trade observing only")),

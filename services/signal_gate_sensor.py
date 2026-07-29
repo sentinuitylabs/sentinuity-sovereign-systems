@@ -178,6 +178,7 @@ def store(d: Dict[str, Any], renew: bool,
     intel = find_intel_db(str(intel_db) if intel_db else None)
     icon = connect_intel_rw(intel)
     try:
+        icon.execute("PRAGMA busy_timeout=15000")
         icon.execute(DDL)
         prev = icon.execute(
             "SELECT state, consecutive_starved FROM signal_gate_state "
@@ -240,26 +241,47 @@ def main() -> int:
     ap.add_argument("--matrix-db", default=None)
     ap.add_argument("--intel-db", default=None)
     a = ap.parse_args()
+    lock_backoff = 0.0
     while True:
-        matrix = find_matrix_db(a.matrix_db)
-        if matrix is None:
-            print("[signal_gate_sensor] matrix DB not found")
-            return 1
-        mcon = connect_ro(matrix)
+        sleep_for = max(10.0, a.interval)
         try:
-            d = diagnose(mcon, time.time())
-        finally:
-            mcon.close()
-        store(d, a.renew,
-              Path(a.intel_db) if a.intel_db else None,
-              Path(a.matrix_db) if a.matrix_db else None)
-        print(f"[gate] {d['state']} — {d['reason']} "
-              f"(fresh {d['fresh_60s']}/{d['fresh_300s']}/{d['fresh_900s']} "
-              f"@60/300/900s, stale {d['stale_count']}, "
-              f"veto {d['vetoed_count']})")
-        if a.once:
-            return 0
-        time.sleep(max(10.0, a.interval))
+            matrix = find_matrix_db(a.matrix_db)
+            if matrix is None:
+                print("[signal_gate_sensor] matrix DB not found")
+                return 1
+            mcon = connect_ro(matrix)
+            try:
+                try:
+                    mcon.execute("PRAGMA busy_timeout=15000")
+                except Exception:
+                    pass
+                d = diagnose(mcon, time.time())
+            finally:
+                mcon.close()
+            store(d, a.renew,
+                  Path(a.intel_db) if a.intel_db else None,
+                  Path(a.matrix_db) if a.matrix_db else None)
+            lock_backoff = 0.0
+            print(f"[gate] {d['state']} — {d['reason']} "
+                  f"(fresh {d['fresh_60s']}/{d['fresh_300s']}/{d['fresh_900s']} "
+                  f"@60/300/900s, stale {d['stale_count']}, "
+                  f"veto {d['vetoed_count']})")
+            if a.once:
+                return 0
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            lock_backoff = min(300.0, max(30.0, lock_backoff * 2.0 if lock_backoff else 30.0))
+            sleep_for = max(sleep_for, lock_backoff)
+            print(f"[signal_gate_sensor] DB_LOCK_BACKOFF sleep={lock_backoff:.0f}s: {exc}")
+            if a.once:
+                return 2
+        except Exception as exc:
+            print(f"[signal_gate_sensor] ERROR {type(exc).__name__}: {exc}")
+            if a.once:
+                return 2
+            sleep_for = max(sleep_for, 60.0)
+        time.sleep(sleep_for)
 
 
 if __name__ == "__main__":

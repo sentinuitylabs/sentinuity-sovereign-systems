@@ -24,6 +24,7 @@ boundary (paper cash is still an accounting truth):
 """
 
 import json
+import sqlite3
 import time
 from typing import Any, Dict, Optional
 
@@ -57,6 +58,13 @@ def _ensure_lifecycle_cols(con) -> None:
     _ensure_col(con, "substrate_positions", "mark_source", "TEXT")
     _ensure_col(con, "substrate_positions", "mark_status", "TEXT")
     _ensure_col(con, "substrate_positions", "marked_at", "REAL")
+    # ---- V4 EXPOSURE GUARD (SUBSTRATE_DUPLICATE_GUARD_20260728) -------------
+    _ensure_col(con, "substrate_positions", "timeframe_or_regime", "TEXT")
+    _ensure_col(con, "substrate_positions", "scale_in_parent_id", "INTEGER")
+    _ensure_col(con, "substrate_positions", "scale_in_reason", "TEXT")
+    _ensure_col(con, "substrate_positions", "aggregate_exposure_before", "REAL")
+    _ensure_col(con, "substrate_positions", "aggregate_exposure_after", "REAL")
+    _ensure_col(con, "substrate_positions", "max_allowed_asset_exposure", "REAL")
     con.execute(
         "CREATE TABLE IF NOT EXISTS substrate_strategy_scores("
         " strategy_id TEXT PRIMARY KEY,"
@@ -64,9 +72,112 @@ def _ensure_lifecycle_cols(con) -> None:
         " losses INTEGER DEFAULT 0, realized_pnl REAL DEFAULT 0,"
         " last_close_at REAL, updated_at REAL)"
     )
+    _ensure_exposure_index(con)
 
 
-def open_paper_position_from_opportunity(opportunity_id: int) -> Dict[str, Any]:
+# ── DUPLICATE EXPOSURE GUARD (SUBSTRATE_DUPLICATE_GUARD_20260728) ────────────
+# Restores the signed-off protection removed in V3. A pre-insert SELECT alone
+# is vulnerable to a race between two concurrent openers, so the authoritative
+# control is a PARTIAL UNIQUE INDEX enforced by SQLite itself. The SELECT below
+# exists only to return a clean, auditable rejection before we reach the index.
+#
+# Exposure key: asset_symbol + side + strategy_id + timeframe_or_regime
+# Root positions (scale_in_parent_id IS NULL) must be unique on that key while
+# OPEN. Controlled scale-ins carry a parent id and are exempt from the index,
+# but are separately bounded by the aggregate asset exposure cap.
+EXPOSURE_INDEX_NAME = "ux_substrate_open_root_exposure"
+DEFAULT_TIMEFRAME = "DEFAULT"
+MAX_ASSET_EXPOSURE_USD_DEFAULT = 100.0
+
+
+def _ensure_exposure_index(con) -> bool:
+    """Create the partial unique index. Returns False if pre-existing duplicate
+    rows block creation -- in that case the pre-insert SELECT is the only line
+    of defence and the caller is warned via the audit trail."""
+    try:
+        con.execute(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {EXPOSURE_INDEX_NAME} "
+            "ON substrate_positions("
+            "  asset_symbol, side, strategy_id, COALESCE(timeframe_or_regime,'DEFAULT')"
+            ") WHERE mode='PAPER' AND state='OPEN' AND scale_in_parent_id IS NULL"
+        )
+        return True
+    except Exception:
+        # Legacy duplicates already present. Do not crash the ledger; the
+        # SELECT-based guard still rejects new duplicates.
+        return False
+
+
+def _exposure_key(asset: str, side: str, strategy_id: str, timeframe: str) -> tuple:
+    return (str(asset or "").upper(), str(side or "LONG").upper(),
+            str(strategy_id or DEFAULT_STRATEGY_ID),
+            str(timeframe or DEFAULT_TIMEFRAME))
+
+
+def find_open_exposure(con, asset: str, side: str, strategy_id: str,
+                       timeframe: str = DEFAULT_TIMEFRAME) -> Optional[int]:
+    """Return the id of an existing OPEN root position on this exposure key."""
+    a, s, st, tf = _exposure_key(asset, side, strategy_id, timeframe)
+    try:
+        row = con.execute(
+            "SELECT id FROM substrate_positions "
+            " WHERE mode='PAPER' AND state='OPEN' AND scale_in_parent_id IS NULL"
+            "   AND UPPER(COALESCE(asset_symbol,''))=?"
+            "   AND UPPER(COALESCE(side,'LONG'))=?"
+            "   AND COALESCE(strategy_id,?)=?"
+            "   AND COALESCE(timeframe_or_regime,'DEFAULT')=?"
+            " ORDER BY id LIMIT 1",
+            (a, s, DEFAULT_STRATEGY_ID, st, tf),
+        ).fetchone()
+        return int(row["id"]) if row else None
+    except Exception:
+        return None
+
+
+def aggregate_asset_exposure(con, asset: str) -> float:
+    """Total USD currently deployed in OPEN paper positions for this asset,
+    across every strategy, side and scale-in leg."""
+    try:
+        row = con.execute(
+            "SELECT COALESCE(SUM(COALESCE(size_usd,0)),0) t FROM substrate_positions "
+            " WHERE mode='PAPER' AND state='OPEN' AND UPPER(COALESCE(asset_symbol,''))=?",
+            (str(asset or "").upper(),),
+        ).fetchone()
+        return float(row["t"] or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _validate_scale_in(con, parent_id: int, asset: str, side: str,
+                       strategy_id: str, timeframe: str) -> tuple[bool, str]:
+    """A scale-in is only valid against a live parent on the SAME exposure key."""
+    try:
+        row = con.execute(
+            "SELECT id, asset_symbol, side, strategy_id, state, mode, "
+            "       COALESCE(timeframe_or_regime,'DEFAULT') tf "
+            "FROM substrate_positions WHERE id=?",
+            (int(parent_id),),
+        ).fetchone()
+    except Exception as exc:
+        return False, f"scale_in_parent_lookup_failed:{exc}"
+    if not row:
+        return False, "scale_in_parent_not_found"
+    if str(row["mode"] or "").upper() != "PAPER":
+        return False, "scale_in_parent_not_paper"
+    if str(row["state"] or "").upper() != "OPEN":
+        return False, "scale_in_parent_not_open"
+    if _exposure_key(row["asset_symbol"], row["side"], row["strategy_id"], row["tf"]) != \
+       _exposure_key(asset, side, strategy_id, timeframe):
+        return False, "scale_in_parent_exposure_key_mismatch"
+    return True, "ok"
+
+
+def open_paper_position_from_opportunity(
+    opportunity_id: int,
+    *,
+    scale_in_parent_id: Optional[int] = None,
+    scale_in_reason: Optional[str] = None,
+) -> Dict[str, Any]:
     ensure_schema()
     con = connect()
     try:
@@ -125,12 +236,63 @@ def open_paper_position_from_opportunity(opportunity_id: int) -> Dict[str, Any]:
         now = time.time()
         qty = size / px
         strategy_id = str(opp.get("strategy_id") or DEFAULT_STRATEGY_ID)
-        cur = con.execute(
+
+        # ── DUPLICATE EXPOSURE GUARD ─────────────────────────────────────────
+        asset = str(opp.get("asset_symbol") or "")
+        side = "LONG"
+        timeframe = str(opp.get("timeframe_or_regime") or DEFAULT_TIMEFRAME)
+
+        if scale_in_parent_id is None:
+            existing = find_open_exposure(con, asset, side, strategy_id, timeframe)
+            if existing is not None:
+                _audit(con, False, "duplicate_open_exposure", opp)
+                con.commit()
+                return {
+                    "ok": False,
+                    "reason": "duplicate_open_exposure",
+                    "existing_position_id": existing,
+                    "exposure_key": {
+                        "asset_symbol": asset, "side": side,
+                        "strategy_id": strategy_id, "timeframe_or_regime": timeframe,
+                    },
+                }
+        else:
+            if not str(scale_in_reason or "").strip():
+                _audit(con, False, "scale_in_reason_required", opp)
+                con.commit()
+                return {"ok": False, "reason": "scale_in_reason_required"}
+            valid, why = _validate_scale_in(con, int(scale_in_parent_id), asset,
+                                            side, strategy_id, timeframe)
+            if not valid:
+                _audit(con, False, why, opp)
+                con.commit()
+                return {"ok": False, "reason": why}
+
+        # Aggregate asset exposure cap applies to BOTH root opens and scale-ins.
+        max_asset_exposure = cfg_float(con, "SUBSTRATE_MAX_ASSET_EXPOSURE_USD",
+                                       MAX_ASSET_EXPOSURE_USD_DEFAULT)
+        exposure_before = aggregate_asset_exposure(con, asset)
+        exposure_after = exposure_before + size
+        if exposure_after > max_asset_exposure:
+            _audit(con, False, "aggregate_asset_exposure_exceeded", opp)
+            con.commit()
+            return {
+                "ok": False,
+                "reason": "aggregate_asset_exposure_exceeded",
+                "aggregate_exposure_before": exposure_before,
+                "would_be_exposure": exposure_after,
+                "maximum_allowed_asset_exposure": max_asset_exposure,
+            }
+        try:
+            cur = con.execute(
             "INSERT INTO substrate_positions(opportunity_id,mode,state,status,"
             "chain,asset_symbol,symbol,side,size_usd,position_size,"
             "entry_price_usd,entry_price,current_price,quantity,source,"
-            "opened_at,updated_at,raw_json,strategy_id,entry_price_status) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "opened_at,updated_at,raw_json,strategy_id,entry_price_status,"
+            "timeframe_or_regime,scale_in_parent_id,scale_in_reason,"
+            "aggregate_exposure_before,aggregate_exposure_after,"
+            "max_allowed_asset_exposure) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 int(opportunity_id), "PAPER", "OPEN", "OPEN", opp.get("chain"),
                 opp.get("asset_symbol"), opp.get("asset_symbol"), "LONG",
@@ -141,8 +303,20 @@ def open_paper_position_from_opportunity(opportunity_id: int) -> Dict[str, Any]:
                             "entry_route_provider": opp.get("route_provider")},
                            sort_keys=True),
                 strategy_id, (price_status or "UNRECORDED"),
+                timeframe, (int(scale_in_parent_id) if scale_in_parent_id is not None else None),
+                (str(scale_in_reason) if scale_in_reason else None),
+                exposure_before, exposure_after, max_asset_exposure,
             ),
-        )
+            )
+        except sqlite3.IntegrityError:
+            # Lost a race against a concurrent opener. The DB-level partial
+            # unique index is the authoritative guard; report the same reason.
+            con.rollback()
+            existing = find_open_exposure(con, asset, side, strategy_id, timeframe)
+            _audit(con, False, "duplicate_open_exposure", opp)
+            con.commit()
+            return {"ok": False, "reason": "duplicate_open_exposure",
+                    "existing_position_id": existing, "race_detected": True}
         position_id = int(cur.lastrowid)
         try:
             from services.substrate_position_persistence import (
