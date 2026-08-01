@@ -46,9 +46,11 @@ def main():
 
     if mode in {"live","dual"}:
         settings = {
-            "TRADING_MODE":"paper","DUAL_MODE_ENABLED":"1","DUAL_MODE_ARMED":"1",
+            # Requested dual/live posture is persisted, but funded execution remains
+            # fail-closed until launch/set_live_mode.py completes canonical wallet sync.
+            "TRADING_MODE":"live","DUAL_MODE_ENABLED":"1","DUAL_MODE_ARMED":"0",
             "PAPER_TRADING_ENABLED":"1","LIVE_TRADING_ENABLED":"1",
-            "LIVE_MODE_B_ENABLED":"1","LIVE_ARMED":"1","LIVE_MONEY_MODE":"1","EXECUTION_ARMED":"1",
+            "LIVE_MODE_B_ENABLED":"0","LIVE_ARMED":"0","LIVE_MONEY_MODE":"0","EXECUTION_ARMED":"0",
             "PAPER_MAX_OPEN_POSITIONS":max_pos,"LIVE_MAX_OPEN_POSITIONS":"1",
             "LIVE_POSITION_SIZE_USD":size,"LIVE_TRADE_AMOUNT_USD":size,
             "LIVE_MAX_POSITION_USD":size,"MAX_LIVE_POSITION_USD":size,
@@ -62,7 +64,7 @@ def main():
             "PATTERN_LIVE_ARMING_MODE":"advisory",
             "PATTERN_LIVE_ARMING_REQUIRED":"0",
         }
-        desc = "operator-confirmed dual mode: paper alongside gated live Mode B"
+        desc = "dual/live requested; funded lane held fail-closed pending canonical wallet sync"
     else:
         settings = {
             "TRADING_MODE":"paper","DUAL_MODE_ENABLED":"0","DUAL_MODE_ARMED":"0","PAPER_TRADING_ENABLED":"1",

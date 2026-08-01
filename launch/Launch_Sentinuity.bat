@@ -1014,7 +1014,16 @@ if errorlevel 1 echo   [WARN] momentum launch guard failed - executor will still
 
 if "!CFG_MODE!"=="live" (
 
-  if exist "!SETLIVE_PY!" "%PY%" "!SETLIVE_PY!" >> "%LOG_PATH%\set_live_mode.log" 2^>^&1
+  if not exist "!SETLIVE_PY!" (
+    echo   [ERROR] Missing funded-mode helper: !SETLIVE_PY!
+    exit /b 1
+  )
+  "%PY%" "!SETLIVE_PY!" "!LIVE_SIZE!" >> "%LOG_PATH%\set_live_mode.log" 2^>^&1
+  if errorlevel 1 (
+    echo   [ERROR] Canonical wallet sync or funded arming failed. Launch aborted before trading services start.
+    call :SHOW_LOG_TAIL "%LOG_PATH%\set_live_mode.log"
+    exit /b 1
+  )
 
 )
 
@@ -1264,6 +1273,9 @@ start "PaperWalletRefresher" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m ser
 
 start "SmartWalletTradeIngester" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.smart_wallet_trade_ingester >> ""%LOG_PATH%\smart_wallet_trade_ingester.log"" 2^>^&1"
 
+rem Calibration/outcome measurement spine: observe admitted and rejected candidates.
+start "EdgeShadowTracker" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.edge_shadow_tracker >> ""%LOG_PATH%\edge_shadow_tracker.log"" 2^>^&1"
+
 REM GMGN roster intake is handled by services.wallet_scout using the real rank endpoint and optional operator CF clearance.
 
 
@@ -1273,9 +1285,16 @@ echo  Starting OpenClaw gateway and trading spine...
 
 if "%START_GATEWAY%"=="1" (
 
+  rem Historical exceptional-period contract: keep the gateway visible and
+  rem persistent. Do not stop the task or launch via cmd /c, which can close
+  rem immediately and leave only Sentinel Shield visible.
   where openclaw >nul 2^>^&1
-
-  if not errorlevel 1 start "Gateway" cmd /k "cd /d ""%ROOT_PATH%"" && openclaw gateway"
+  if not errorlevel 1 (
+    start "OpenClaw Gateway" cmd /k "cd /d ""%ROOT_PATH%"" && openclaw gateway"
+    echo   [OK] OpenClaw gateway launch dispatched in persistent console.
+  ) else (
+    echo   [WARN] openclaw command not found; gateway skipped.
+  )
 
 )
 
@@ -1312,6 +1331,10 @@ start "MarketTide" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.pump
 timeout /t 1 /nobreak >nul
 
 start "Ingest" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.ingest_pipeline >> ""%LOG_PATH%\ingest_pipeline.log"" 2^>^&1"
+
+REM SINGLE_WRITER_ORACLE_CONTRACT: standalone ws_price_oracle owns WS/MTM writes.
+REM market_intelligence keeps HTTP fallback/read logic but must not create a second WS writer.
+set "MARKET_INTELLIGENCE_EMBED_WS_ORACLE=0"
 
 start "MktIntel" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.market_intelligence >> ""%LOG_PATH%\market_intelligence.log"" 2^>^&1"
 

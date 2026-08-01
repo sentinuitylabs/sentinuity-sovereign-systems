@@ -528,6 +528,32 @@ def _write_qualifier_result(
     quality_reason: str,
 ) -> None:
     now = time.time()
+
+    # SIGNOFF_CONFIDENCE_SPINE_20260731:
+    # The profitable-era bridge used mint_confidence (identity certainty) as
+    # trading confidence. The edge restoration correctly removed that shortcut,
+    # but left no producer for the real trading-confidence columns, making the
+    # supervisor/executor mathematically unable to approve candidates. Reconnect
+    # the existing multi-factor calibrator here, after market enrichment and
+    # before latch/execution. This uses liquidity, freshness, velocity, regime,
+    # risk and historical evidence; it never treats the *pump suffix as alpha.
+    trading_confidence = 0.0
+    confidence_source = "calibrator_unavailable"
+    # EDGE_MEASUREMENT_SPINE_20260801: diagnostics for the measurement ledger.
+    _cal_evidence = None
+    _cal_risk = None
+    if quality_status == "qualified":
+        try:
+            from services.tx_resolver import calibrate_confidence
+            _cal = calibrate_confidence(metrics)
+            trading_confidence = max(0.0, min(1.0, float(_cal.calibrated_confidence)))
+            confidence_source = str(_cal.confidence_source or "multi_factor")
+            _cal_evidence = getattr(_cal, "evidence_count", None)
+            _cal_risk = getattr(_cal, "risk_penalty", None)
+        except Exception as _conf_exc:
+            # Fail closed: a missing calibrator never falls back to mint identity.
+            trading_confidence = 0.0
+            confidence_source = f"calibrator_error:{type(_conf_exc).__name__}"
     try:
         with get_connection() as conn:
             if quality_status == "qualified":
@@ -547,9 +573,12 @@ def _write_qualifier_result(
                         token_age_seconds=?, token_liquidity_usd=?,
                         holder_count=?, top10_holder_pct=?,
                         market_cap_usd=?, is_tradeable=1,
-                        confidence_score=MAX(COALESCE(confidence_score,0), COALESCE(mint_confidence,0), COALESCE(calibrated_confidence,0), COALESCE(confidence,0)),
-                        calibrated_confidence=MAX(COALESCE(calibrated_confidence,0), COALESCE(mint_confidence,0), COALESCE(confidence,0), COALESCE(confidence_score,0)),
-                        confidence=MAX(COALESCE(confidence,0), COALESCE(mint_confidence,0), COALESCE(calibrated_confidence,0), COALESCE(confidence_score,0)),
+                        -- SIGNOFF_CONFIDENCE_SPINE_20260731: one canonical
+                        -- multi-factor confidence, recomputed from current evidence.
+                        -- Never MAX with stale values and never inherit mint_confidence.
+                        confidence_score=?,
+                        calibrated_confidence=?,
+                        confidence=?,
                         source_note=?,
                         curve_progress_pct=?, curve_sol_reserves=?,
                         observed_price=CASE WHEN ? IS NOT NULL THEN ? ELSE observed_price END,
@@ -568,7 +597,8 @@ def _write_qualifier_result(
                         metrics.get("holder_count"),
                         metrics.get("top10_holder_pct"),
                         metrics.get("market_cap_usd"),
-                        metrics.get("source_note", "dexscreener"),
+                        trading_confidence, trading_confidence, trading_confidence,
+                        f"{metrics.get('source_note', 'dexscreener')}|confidence={confidence_source}",
                         metrics.get("curve_progress_pct"),
                         metrics.get("curve_sol_reserves"),
                         entry_price_usd, entry_price_usd,
@@ -640,6 +670,26 @@ def _write_qualifier_result(
              success=(quality_status == "qualified"),
              failure_reason=None if quality_status == "qualified"
              else str(quality_reason)[:200])
+    except Exception:
+        pass
+
+    # EDGE_MEASUREMENT_SPINE_20260801:
+    # One durable audit row per evaluated candidate -- admitted OR rejected.
+    # Measurement only. Writes solely to edge_confidence_ledger. Changes no
+    # gate, no threshold, no timestamp, and no entry behaviour. Fail-safe by
+    # construction: a ledger fault must never become a qualification fault.
+    try:
+        from services.edge_ledger import record_candidate as _edge_record
+        _edge_record(
+            snapshot_id=row_id,
+            metrics=metrics,
+            quality_status=quality_status,
+            quality_reason=quality_reason,
+            calibrated_confidence=trading_confidence,
+            confidence_source=confidence_source,
+            evidence_count=_cal_evidence,
+            risk_penalty=_cal_risk,
+        )
     except Exception:
         pass
 
@@ -733,6 +783,17 @@ def _derive_quality_metrics(best_pair: Dict[str, Any]) -> Dict[str, Any]:
     price_change_5m  = float((best_pair.get("priceChange") or {}).get("m5") or 0)
     price_change_1h  = float((best_pair.get("priceChange") or {}).get("h1") or 0)
 
+    # SIGNOFF_EDGE_METRIC_SPINE_20260801:
+    # DexScreener transaction pressure is independent trading evidence.  The
+    # previous confidence-spine patch invoked the calibrator without copying
+    # these fields into its input, leaving buy-pressure evidence permanently
+    # absent and making the 0.65 latch floor unreachable for otherwise sound
+    # candidates.
+    tx_5m = (best_pair.get("txns") or {}).get("m5") or {}
+    buys_5m = float(tx_5m.get("buys") or 0)
+    sells_5m = float(tx_5m.get("sells") or 0)
+    buy_sell_ratio = buys_5m / max(sells_5m, 1.0) if (buys_5m > 0 or sells_5m > 0) else None
+
     # Regime classification based on mcap + age
     regime = "UNKNOWN"
     if token_age_seconds is not None and mcap > 0:
@@ -762,8 +823,12 @@ def _derive_quality_metrics(best_pair: Dict[str, Any]) -> Dict[str, Any]:
         "vol_acceleration":         vol_accel,
         "price_change_5m":          price_change_5m,
         "price_change_1h":          price_change_1h,
-        "vol_5m_usd":               vol_5m,    # raw 5-minute volume USD
+        "vol_5m_usd":               vol_5m,    # persisted schema alias
+        "volume_5m_usd":            vol_5m,    # calibrator canonical input
         "vol_24h":                  vol_24h,   # also stored as vol_24h_usd in schema
+        "buys_5m":                  buys_5m,
+        "sells_5m":                 sells_5m,
+        "buy_sell_ratio":           buy_sell_ratio,
         "regime_classification":    regime,
     }
 
@@ -962,10 +1027,15 @@ def _qualify_one(session: requests.Session, row: Dict[str, Any]) -> Tuple[str, s
     snap_created = float(row.get("operational_ts") or row.get("created_at") or 0)
     token_age_seconds = max(0.0, time.time() - snap_created) if snap_created > 0 else None
 
+    _now_for_age = time.time()
+    _price_ts = float(row.get("price_updated_at") or 0.0)
     metrics = {
         "market_cap_usd":      curve_mcap_usd,
         "token_liquidity_usd": None,
         "token_age_seconds":   token_age_seconds,
+        # Trading freshness is pipeline/discovery age, not token lifetime.
+        "signal_age_seconds":  max(0.0, _now_for_age - snap_created) if snap_created > 0 else None,
+        "price_age_seconds":   max(0.0, _now_for_age - _price_ts) if _price_ts > 0 else None,
         "holder_count":        None,
         "top10_holder_pct":    None,
         "source_note":         "bonding_curve_rpc",
@@ -989,6 +1059,21 @@ def _qualify_one(session: requests.Session, row: Dict[str, Any]) -> Tuple[str, s
                     # Always prefer DexScreener pairCreatedAt (true on-chain token age)
                     # over snap_created (weaver insert time = pipeline latency, not token age).
                     metrics["token_age_seconds"] = dex_metrics["token_age_seconds"]
+
+                # SIGNOFF_EDGE_METRIC_SPINE_20260801:
+                # Preserve the complete enrichment contract for confidence
+                # calibration.  The prior patch copied only mcap/liquidity/age,
+                # silently dropping price momentum, volume acceleration, raw
+                # volume and buy/sell pressure before calibrate_confidence().
+                for _key in (
+                    "vol_acceleration", "price_change_5m", "price_change_1h",
+                    "vol_5m_usd", "volume_5m_usd", "vol_24h", "buys_5m", "sells_5m",
+                    "buy_sell_ratio", "liquidity_balance_score",
+                    "paid_boost_detected", "boost_amount",
+                    "regime_classification",
+                ):
+                    if _key in dex_metrics and dex_metrics[_key] is not None:
+                        metrics[_key] = dex_metrics[_key]
                 metrics["source_note"] = "bonding_curve_rpc+dexscreener"
                 enriched_status, enriched_reason = _evaluate_quality(metrics)
                 if enriched_status == "qualified":

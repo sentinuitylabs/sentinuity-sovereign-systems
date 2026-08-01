@@ -92,36 +92,50 @@ def _derive_wallet_address() -> tuple[str, Any]:
     return str(kp.pubkey()), kp
 
 
-def _rpc_url() -> str:
+def _rpc_urls() -> list[tuple[str, str]]:
+    """Configured RPCs in deterministic failover order, without duplicates."""
     _load_env()
-    return (
-        os.getenv("QUICKNODE_RPC")
-        or os.getenv("SOLANA_RPC_URL")
-        or os.getenv("HELIUS_RPC")
-        or ""
-    ).strip()
+    candidates = [
+        ("QUICKNODE_RPC", os.getenv("QUICKNODE_RPC", "")),
+        ("SOLANA_RPC_URL", os.getenv("SOLANA_RPC_URL", "")),
+        ("HELIUS_RPC", os.getenv("HELIUS_RPC", "")),
+    ]
+    seen: set[str] = set()
+    result: list[tuple[str, str]] = []
+    for label, raw in candidates:
+        url = str(raw or "").strip()
+        if url and url not in seen:
+            seen.add(url)
+            result.append((label, url))
+    return result
 
 
 def _fetch_sol_balance(address: str) -> float:
     import requests
-    rpc = _rpc_url()
-    if not rpc:
+    rpcs = _rpc_urls()
+    if not rpcs:
         raise RuntimeError("SOLANA_RPC_NOT_SET")
-    response = requests.post(
-        rpc,
-        json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getBalance",
-            "params": [address, {"commitment": "confirmed"}],
-        },
-        timeout=8,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if payload.get("error"):
-        raise RuntimeError(f"RPC_GET_BALANCE:{payload['error']}")
-    return float(payload["result"]["value"]) / 1_000_000_000.0
+    failures: list[str] = []
+    payload_request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getBalance",
+        "params": [address, {"commitment": "confirmed"}],
+    }
+    for label, rpc in rpcs:
+        try:
+            response = requests.post(rpc, json=payload_request, timeout=8)
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("error"):
+                raise RuntimeError(f"RPC_ERROR:{payload['error']}")
+            return float(payload["result"]["value"]) / 1_000_000_000.0
+        except Exception as exc:
+            # Never include credential-bearing endpoint URLs in logs/errors.
+            failures.append(f"{label}:{type(exc).__name__}")
+            log.warning("[WALLET_SYNC_RPC_FAILOVER] provider=%s error=%s",
+                        label, type(exc).__name__)
+    raise RuntimeError("RPC_GET_BALANCE_ALL_FAILED|" + "|".join(failures))
 
 
 def _fetch_sol_usd() -> tuple[float, str]:

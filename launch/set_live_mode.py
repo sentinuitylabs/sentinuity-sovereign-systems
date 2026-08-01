@@ -33,10 +33,25 @@ def main() -> int:
         return 2
     size_s = format(size, ".8g")
 
+    # Fail closed before touching any funded arming flag. sync_once(force=True)
+    # deliberately does not require the live lane to be armed.
+    try:
+        from services.live_wallet_sync import sync_once
+        if not sync_once(force=True):
+            print("[BLOCKED] canonical live wallet sync failed; funded flags remain disarmed")
+            con.close()
+            return 3
+        print("[OK] canonical live wallet synced")
+    except Exception as exc:
+        print(f"[BLOCKED] canonical live wallet sync error: {type(exc).__name__}: {exc}")
+        con.close()
+        return 3
+
     pairs = {
-        "TRADING_MODE":"paper", "PAPER_TRADING_ENABLED":"1",
+        "TRADING_MODE":"live", "PAPER_TRADING_ENABLED":"1",
         "DUAL_MODE_ENABLED":"1", "DUAL_MODE_ARMED":"1",
         "LIVE_TRADING_ENABLED":"1", "LIVE_MODE_B_ENABLED":"1", "LIVE_ARMED":"1",
+        "LIVE_MONEY_MODE":"1", "EXECUTION_ARMED":"1",
         "LIVE_POSITION_SIZE_USD":size_s, "LIVE_TRADE_AMOUNT_USD":size_s,
         "LIVE_MAX_POSITION_USD":size_s, "MAX_LIVE_POSITION_USD":size_s,
         "LIVE_MAX_TOTAL_EXPOSURE_USD":size_s, "LIVE_MAX_OPEN_POSITIONS":"1",
@@ -45,9 +60,22 @@ def main() -> int:
         "MAX_ROUND_TRIP_SLIPPAGE_PCT":"8", "LIVE_PAPER_SHADOW_ON_BLOCK":"1",
         "OPERATOR_LIVE_POSITION_SIZE_USD":size_s,
     }
-    for k,v in pairs.items():
-        cur.execute("INSERT INTO system_config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(k,v))
-    con.commit()
+
+    # Atomic arming transaction occurs only after canonical wallet truth exists.
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        for k, v in pairs.items():
+            cur.execute(
+                "INSERT INTO system_config(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (k, v),
+            )
+        con.commit()
+    except Exception:
+        con.rollback()
+        con.close()
+        raise
+
     for k in sorted(pairs):
         print(f"{k:36} {pairs[k]}")
     con.close()
