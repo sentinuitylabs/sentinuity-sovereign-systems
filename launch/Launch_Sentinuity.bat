@@ -1014,16 +1014,7 @@ if errorlevel 1 echo   [WARN] momentum launch guard failed - executor will still
 
 if "!CFG_MODE!"=="live" (
 
-  if not exist "!SETLIVE_PY!" (
-    echo   [ERROR] Missing funded-mode helper: !SETLIVE_PY!
-    exit /b 1
-  )
-  "%PY%" "!SETLIVE_PY!" "!LIVE_SIZE!" >> "%LOG_PATH%\set_live_mode.log" 2^>^&1
-  if errorlevel 1 (
-    echo   [ERROR] Canonical wallet sync or funded arming failed. Launch aborted before trading services start.
-    call :SHOW_LOG_TAIL "%LOG_PATH%\set_live_mode.log"
-    exit /b 1
-  )
+  if exist "!SETLIVE_PY!" "%PY%" "!SETLIVE_PY!" "!LIVE_SIZE!" >> "%LOG_PATH%\set_live_mode.log" 2^>^&1
 
 )
 
@@ -1103,7 +1094,7 @@ for %%T in (
 
   "PaperWalletRefresher" "SmartWalletTradeIngester" "OpenClaw Security Sentinel"
 
-  "ActivePipelineCleaner10m" "PriceEnricher" "PeriodicRefresh" "WinnerArchiver" "ShadowTracker"
+  "ActivePipelineCleaner10m" "PriceEnricher" "PeriodicRefresh" "WinnerArchiver" "ShadowTracker" "EdgeShadowTracker"
 
   "MacroPriceFeed" "MacroChannel" "GithubScout" "SecuritySentinel" "AutoSweep"
 
@@ -1267,14 +1258,27 @@ if exist "!WALCK_PY!" "%PY%" "!WALCK_PY!" >> "%LOG_PATH%\wal_checkpoint.log" 2^>
 
 echo.
 
+REM FINAL_DISTRIBUTION_POSTURE_AUTHORITY_20260804
+REM Runs after every configuration writer/restamp and before any trading service.
+if "!CFG_MODE!"=="live" (
+  "%PY%" tools\apply_launch_safety_pins.py --requested dual --size "!LIVE_SIZE!" >> "%LOG_PATH%\final_posture.log" 2^>^&1
+) else (
+  "%PY%" tools\apply_launch_safety_pins.py --requested paper --size "!PAPER_SIZE!" >> "%LOG_PATH%\final_posture.log" 2^>^&1
+)
+if errorlevel 1 (
+  echo   [FATAL] Final launch posture verification failed.
+  call :SHOW_LOG_TAIL "%LOG_PATH%\final_posture.log"
+  exit /b 1
+)
+call :SHOW_LOG_TAIL "%LOG_PATH%\final_posture.log"
+
+echo.
+
 echo  Starting observer services after wallet/config reset...
 
 start "PaperWalletRefresher" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.paper_wallet_refresher >> ""%LOG_PATH%\paper_wallet_refresher.log"" 2^>^&1"
 
 start "SmartWalletTradeIngester" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.smart_wallet_trade_ingester >> ""%LOG_PATH%\smart_wallet_trade_ingester.log"" 2^>^&1"
-
-rem Calibration/outcome measurement spine: observe admitted and rejected candidates.
-start "EdgeShadowTracker" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.edge_shadow_tracker >> ""%LOG_PATH%\edge_shadow_tracker.log"" 2^>^&1"
 
 REM GMGN roster intake is handled by services.wallet_scout using the real rank endpoint and optional operator CF clearance.
 
@@ -1374,6 +1378,7 @@ start "PeriodicRefresh" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services
 start "WinnerArchiver" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.winner_snapshot_archiver >> ""%LOG_PATH%\winner_snapshot_archiver.log"" 2^>^&1"
 
 start "ShadowTracker" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.shadow_runner_tracker >> ""%LOG_PATH%\shadow_runner_tracker.log"" 2^>^&1"
+start "EdgeShadowTracker" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.edge_shadow_tracker >> ""%LOG_PATH%\edge_shadow_tracker.log"" 2^>^&1"
 
 start "MacroPriceFeed" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.macro_price_feed >> ""%LOG_PATH%\macro_price_feed.log"" 2^>^&1"
 
@@ -1384,7 +1389,10 @@ start "SubstrateScanner" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m service
 start "SubstrateSupervisor" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.substrate_portfolio_supervisor >> ""%LOG_PATH%\substrate_portfolio_supervisor.log"" 2^>^&1"
 start "SubstrateCopyBridge" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.substrate_copytrade_bridge_loop >> ""%LOG_PATH%\substrate_copytrade_bridge_loop.log"" 2^>^&1"
 
-start "SubstrateTrader" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.substrate_paper_trader >> ""%LOG_PATH%\substrate_paper_trader.log"" 2^>^&1"
+REM FINAL_SUBSTRATE_SINGLE_OWNER_SIGNOFF_20260802: compatibility trader disabled.
+REM substrate_paper_trader delegates to the same supervise_once() used by SubstrateSupervisor;
+REM launching both creates concurrent admission/mark/close loops. Canonical owner is SubstrateSupervisor.
+REM start "SubstrateTrader" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.substrate_paper_trader >> ""%LOG_PATH%\substrate_paper_trader.log"" 2^>^&1"
 
 start "MacroChannel" /b cmd /c "cd /d ""%ROOT_PATH%"" && ""%PY%"" -m services.macro_channel >> ""%LOG_PATH%\macro_channel.log"" 2^>^&1"
 

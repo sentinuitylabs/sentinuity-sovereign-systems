@@ -53,22 +53,6 @@ DEPLOY:
 
 from __future__ import annotations
 
-# PUBLIC_GITHUB_RELEASE_STUB_20260729
-# This public release intentionally disables transaction signing/submission at
-# module level. Paper pricing and read-only route inspection remain available.
-PUBLIC_RELEASE_LIVE_STUB = True
-
-def _public_live_block(operation: str, **extra):
-    result = {
-        "success": False,
-        "submitted": False,
-        "public_release_stub": True,
-        "reason": "PUBLIC_RELEASE_LIVE_EXECUTION_DISABLED",
-        "operation": operation,
-    }
-    result.update(extra)
-    return result
-
 import json
 import logging
 import os
@@ -92,6 +76,27 @@ _PRIVATE_KEY_B58  = os.getenv("SOLANA_PRIVATE_KEY", "").strip()
 _LIVE_MAX_POS_USD_ENV = os.getenv("LIVE_MAX_POSITION_USD", "").strip()
 _JUPITER_KEY      = os.getenv("JUPITER_PRICE_API_KEY", "").strip()
 _RPC_URL          = os.getenv("QUICKNODE_RPC") or os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+
+# PUBLIC_DUAL_STUB / FAMILY_LIVE_CANARY distribution boundary.
+_PRIVATE_LIVE_MARKER = _P(__file__).resolve().parent.parent / "runtime" / "family_live.enable"
+_PRIVATE_LIVE_ACK = "I_ACCEPT_REAL_LOSS"
+
+def _real_submission_contract() -> tuple[bool, str]:
+    """Hard final guard: public GitHub checkout remains unable to submit."""
+    try:
+        from core.schema import get_connection
+        with get_connection() as conn:
+            g=lambda k:(lambda r:str(r[0]).strip() if r and r[0] is not None else "")(conn.execute("SELECT value FROM system_config WHERE key=?",(k,)).fetchone())
+            posture=g("DECLARED_POSTURE")
+            backend=g("LIVE_SUBMISSION_BACKEND")
+    except Exception as exc:
+        return False, f"posture_read_error:{type(exc).__name__}"
+    if posture != "FAMILY_LIVE_CANARY": return False, f"declared_posture={posture or 'missing'}"
+    if backend != "real": return False, f"submission_backend={backend or 'missing'}"
+    if not _PRIVATE_LIVE_MARKER.is_file(): return False, "private_marker_missing"
+    if os.getenv("SENTINUITY_PRIVATE_LIVE_ENABLE", "").strip() != _PRIVATE_LIVE_ACK:
+        return False, "private_ack_missing"
+    return True, "family_live_canary"
 
 # SOL mint address (always the input token for buys)
 _SOL_MINT  = "So11111111111111111111111111111111111111112"
@@ -338,8 +343,6 @@ def _record_latency_telemetry(tx_sig: str, side: str, position_id: Optional[int]
 # ── KEYPAIR LOADER ────────────────────────────────────────────────────────────
 
 def _load_keypair():
-    if PUBLIC_RELEASE_LIVE_STUB:
-        raise RuntimeError("PUBLIC_RELEASE_LIVE_EXECUTION_DISABLED")
     """
     Load Solana keypair from base58 private key string.
     Returns solders.keypair.Keypair or None if unavailable.
@@ -367,6 +370,12 @@ def get_live_wallet_balance() -> Optional[float]:
     Fetch real SOL balance from chain for the trading wallet.
     Returns balance in USD (SOL * current price) or None on failure.
     """
+    _submit_ok, _submit_reason = _real_submission_contract()
+    if not _submit_ok:
+        result["error"] = "live_submission_stubbed:" + _submit_reason
+        result["mode"] = "stub"
+        log.warning("[LIVE_SELL_STUBBED] pos=%s mint=%s reason=%s", position_id, str(mint)[:16], _submit_reason)
+        return result
     kp = _load_keypair()
     if not kp:
         return None
@@ -1049,8 +1058,6 @@ def _reverse_sellability_probe(mint: str, quoted_token_raw: int, input_lamports:
 
 
 def preflight_live_buy(mint: str, pos_size_usd: float) -> dict:
-    if PUBLIC_RELEASE_LIVE_STUB:
-        return _public_live_block("preflight_live_buy", mint=mint)
     """Mandatory funded-entry contract: provenance + buy route + reverse route.
 
     This is read-only.  It proves that the mint is a canonical Pump coin rather
@@ -1140,8 +1147,6 @@ def execute_live_buy(
     entry_price_usd: float,
     position_id: int,
 ) -> dict:
-    if PUBLIC_RELEASE_LIVE_STUB:
-        return _public_live_block("execute_live_buy", mint=mint, position_id=position_id)
     """Execute and reconcile a live buy.  Success means chain fill resolved."""
     result = {
         "success": False, "confirmed": False, "tx_sig": None,
@@ -1150,6 +1155,12 @@ def execute_live_buy(
         "timings": {},
     }
     started = time.perf_counter()
+    _submit_ok, _submit_reason = _real_submission_contract()
+    if not _submit_ok:
+        result["error"] = "live_submission_stubbed:" + _submit_reason
+        result["mode"] = "stub"
+        log.warning("[LIVE_BUY_STUBBED] pos=%s mint=%s reason=%s", position_id, str(mint)[:16], _submit_reason)
+        return result
 
     # FINAL FUNDED-ENTRY CHOKEPOINT.  Upstream Mode-B checks are useful but may
     # be conditional; no caller can bypass this provenance + reverse-route gate.
@@ -1545,8 +1556,6 @@ def execute_live_sell(
     exit_price_usd: float,
     emergency: bool = False,
 ) -> dict:
-    if PUBLIC_RELEASE_LIVE_STUB:
-        return _public_live_block("execute_live_sell", mint=mint, position_id=position_id)
     """Execute and reconcile a live sell. No theoretical close fallback exists."""
     result = {
         "success": False, "confirmed": False, "tx_sig": None,
@@ -1691,8 +1700,6 @@ def execute_live_sell(
 
 
 def is_live_mode() -> bool:
-    if PUBLIC_RELEASE_LIVE_STUB:
-        return False
     """True when the independent dual live lane is fully armed."""
     try:
         from core.schema import get_config_value
