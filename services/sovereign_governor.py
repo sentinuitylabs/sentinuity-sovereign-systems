@@ -87,6 +87,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Optional
+from services.telemetry_redaction import redact as _redact_telemetry, warn_once as _warn_once
 
 from dotenv import load_dotenv
 
@@ -110,11 +111,11 @@ POLL_INTERVAL  = 15          # raised from 60 — was missing entire launch wind
 
 # ── MODEL EVOLUTION TABLE (Grok-confirmed) ────────────────────────────────────
 MODEL_EVOLUTION = {
-    1: {"polaris": "gpt-5.4",              "ivaris": "claude-haiku-4-5-20251001",
+    1: {"polaris": "gpt-5.4-mini",              "ivaris": "NIM_AUTO",
         "nugget": "meta/llama-3.3-70b-instruct", "grok": "grok-3"},
-    2: {"polaris": "gpt-5.4",              "ivaris": "claude-sonnet-4-5-20251001",
+    2: {"polaris": "gpt-5.4-mini",              "ivaris": "claude-sonnet-4-5-20251001",
         "nugget": "meta/llama-3.3-70b-instruct", "grok": "grok-3"},
-    3: {"polaris": "gpt-5.5",                  "ivaris": "claude-sonnet-4-5-20251001",
+    3: {"polaris": "gpt-5.4-mini",                  "ivaris": "claude-sonnet-4-5-20251001",
         "nugget": "meta/llama-3.3-70b-instruct", "grok": "grok-4.3"},
 }
 
@@ -138,7 +139,7 @@ OWNER_ID   = int(os.getenv("TELEGRAM_OWNER_ID", "0") or "0")
 
 # NOTE: This constant is intentionally NOT used by _call_ivaris, _call_anthropic,
 # or _call_gemini. The live model is always resolved at call time from system_config
-# via get_config_value("IVARIS_MODEL", "claude-haiku-4-5-20251001").
+# via the NVIDIA model registry (IVARIS_NIM_MODEL).
 # This leftover constant from the pre-routing era is kept only to avoid breaking
 # any external references, but has been renamed to make its orphan status explicit.
 _IVARIS_MODEL_LEGACY_UNUSED = "gemini-2.5-flash"  # orphaned — NOT the live routing value
@@ -1763,7 +1764,7 @@ def _tg_post(method: str, payload: dict, timeout: int = 10) -> Optional[dict]:
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        log.warning("Telegram %s failed: %s", method, e)
+        _warn_once(log, f"telegram_governor_{method}", "Telegram %s failed: %s", method, _redact_telemetry(e))
         return None
 
 
@@ -1874,25 +1875,13 @@ def _call_ivaris(
     user_message: str,
     max_tokens: int = 3000,
 ) -> Optional[str]:
-    """
-    IVARIS routing — NIM is PRIMARY, Anthropic is fallback.
-      1. NIM Mistral Large — primary (always tried first)
-      2. Anthropic (Claude) — fallback only if NIM fails
-    """
-    # NIM primary — always try first
-    log.info("IVARIS ROUTING: provider=nim model=%s (registry)", _nim_assignment("IVARIS", "qwen/qwen3.5-397b-a17b"))
+    """IVARIS routing — NVIDIA NIM only. Registry rotation supplies fallback models."""
+    _model = _nim_assignment("IVARIS", "qwen/qwen3.5-397b-a17b")
+    log.info("IVARIS ROUTING: provider=nim model=%s (registry)", _model)
     result = _call_nim_ivaris(system_prompt, user_message, max_tokens)
     if result is not None:
         return result
-
-    # Anthropic fallback — only if NIM failed
-    _ant_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    _ant_model = str(get_config_value("IVARIS_MODEL", "claude-haiku-4-5-20251001")).strip()
-    if _ant_key:
-        log.warning("IVARIS: NIM failed — falling back to Anthropic/%s", _ant_model)
-        return _call_anthropic_direct(system_prompt, user_message, _ant_model, max_tokens)
-
-    log.error("IVARIS: both NIM and Anthropic unavailable")
+    log.error("IVARIS: NIM model pool unavailable; critic fails closed")
     return None
 
 
@@ -1944,39 +1933,85 @@ def _call_nim_ivaris(
     user_message: str,
     max_tokens: int = 1500,
 ) -> Optional[str]:
-    """IVARIS via NIM — model read from DB config, defaults to llama-3.1-8b-instruct."""
+    """IVARIS via NVIDIA NIM.
+
+    SIGNOFF_3H_NIM_410_RECOVERY_20260811:
+    The 3-hour runtime repeatedly returned HTTP 410 Gone for IVARIS while the
+    debate chamber retried the same retired assignment. A 404/410 is model
+    invalidation evidence, not a reason to self-approve or switch provider.
+    Quarantine/rotate through the NVIDIA registry once, then fail closed.
+    Network/DNS/429/5xx failures do not mutate model identity.
+    """
     _nim_key = os.getenv("NVIDIA_NIM_API_KEY", "").strip()
     _nim_base = os.getenv("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1").strip()
     if not _nim_key:
         log.error("IVARIS: NVIDIA_NIM_API_KEY not set — IVARIS unavailable")
         return None
-    # Read model from DB config so it can be changed without redeploying
-    _nim_model = _nim_assignment("IVARIS", "qwen/qwen3.5-397b-a17b")
+
+    import json as _j, urllib.request as _ur, urllib.error as _ue
     try:
-        import json as _j, urllib.request as _ur
-        _pl = _j.dumps({
-            "model": _nim_model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_message},
-            ],
-            "max_tokens": max_tokens,
-            "temperature": 0.4,
-        }).encode()
-        _rq = _ur.Request(
-            _nim_base + "/chat/completions",
-            data=_pl,
-            headers={"Authorization": f"Bearer {_nim_key}",
-                     "Content-Type": "application/json"},
-            method="POST",
-        )
-        with _ur.urlopen(_rq, timeout=90) as _r:
-            text = _j.loads(_r.read().decode())["choices"][0]["message"]["content"].strip()
-        log.info("IVARIS: responded via NIM/%s", _nim_model)
-        return text
-    except Exception as e:
-        log.error("IVARIS NIM call failed: %s", e)
-        return None
+        from services.nvidia_model_registry import rotate_after_failure as _nim_rotate
+    except Exception:
+        _nim_rotate = None
+
+    attempted = set()
+    _nim_model = _nim_assignment("IVARIS", "qwen/qwen3.5-397b-a17b")
+    for _attempt in range(2):
+        _nim_model = str(_nim_model or "").strip()
+        if not _nim_model or _nim_model in attempted:
+            break
+        attempted.add(_nim_model)
+        try:
+            _pl = _j.dumps({
+                "model": _nim_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_message},
+                ],
+                "max_tokens": max_tokens,
+                "temperature": 0.4,
+            }).encode()
+            _rq = _ur.Request(
+                _nim_base + "/chat/completions",
+                data=_pl,
+                headers={"Authorization": f"Bearer {_nim_key}",
+                         "Content-Type": "application/json"},
+                method="POST",
+            )
+            with _ur.urlopen(_rq, timeout=90) as _r:
+                text = _j.loads(_r.read().decode())["choices"][0]["message"]["content"].strip()
+            if not text:
+                log.error("IVARIS NIM returned empty content via %s", _nim_model)
+                return None
+            log.info("IVARIS: responded via NIM/%s", _nim_model)
+            return text
+        except _ue.HTTPError as e:
+            log.error("IVARIS NIM call failed: HTTP Error %s: %s", e.code, e.reason)
+            if e.code in (404, 410) and _nim_rotate is not None and _attempt == 0:
+                try:
+                    _next = _nim_rotate(
+                        "IVARIS", _nim_model,
+                        f"HTTP {e.code}: model endpoint unavailable",
+                        refresh=True,
+                    )
+                except Exception as _rotate_exc:
+                    log.error("IVARIS NIM model rotation failed: %s: %s", type(_rotate_exc).__name__, _rotate_exc)
+                    _next = ""
+                if _next and _next not in attempted:
+                    log.warning(
+                        "IVARIS NIM retired/unavailable model rotated %s -> %s",
+                        _nim_model, _next,
+                    )
+                    _nim_model = _next
+                    continue
+            return None
+        except Exception as e:
+            # DNS, transport and provider-wide outages are not model-quality
+            # evidence. Keep the assignment and fail closed so a later retry can
+            # recover without poisoning the catalogue.
+            log.error("IVARIS NIM call failed: %s", e)
+            return None
+    return None
 
 
 def _call_anthropic(
@@ -2137,15 +2172,11 @@ Output JSON."""
     text = _call_ivaris(_active_system_prompt, message)
 
     if not text:
-        _provider = str(get_config_value("IVARIS_PROVIDER", "nim")).strip().lower()
-        _ant_key  = bool(os.getenv("ANTHROPIC_API_KEY", "").strip())
-        _nim_key  = bool(os.getenv("NVIDIA_NIM_API_KEY", "").strip())
-        if not _ant_key and not _nim_key:
-            _cause = "ANTHROPIC_API_KEY and NVIDIA_NIM_API_KEY both missing"
-        elif not _ant_key:
-            _cause = "ANTHROPIC_API_KEY missing — NIM fallback also failed (check NIM key/quota)"
+        _nim_key = bool(os.getenv("NVIDIA_NIM_API_KEY", "").strip())
+        if not _nim_key:
+            _cause = "NVIDIA_NIM_API_KEY missing"
         else:
-            _cause = f"API call returned no text via {_provider} (check logs above)"
+            _cause = "NIM model pool returned no usable critic response (check registry/provider logs)"
         log.error("IVARIS _ivaris_critique: aborting — %s", _cause)
         return {
             "consensus": False, "confidence": 0.0,
@@ -2307,7 +2338,7 @@ def _get_polaris_rebuttal(
             f"| {str(nugget_verdict.get('reason',''))[:120]}\n"
         )
     log.info(
-        "POLARIS REBUTTAL: routing to OpenAI gpt-4o-mini "
+        "POLARIS REBUTTAL: routing through signed OpenAI model policy "
         "(proposal_type=%s, ivaris_confidence=%.2f)",
         proposal.get("proposal_type", "?"),
         float(ivaris_critique.get("confidence", 0)),
@@ -2360,7 +2391,7 @@ adjusted_action AND code_block MUST be complete Python. No prose. Output JSON on
                 "Content-Type": "application/json",
             },
             json={
-                "model": "gpt-5.4",
+                "model": "gpt-5.4-mini",
                 "max_completion_tokens": 2500,
                 "response_format": {"type": "json_object"},
                 "messages": [
@@ -2984,7 +3015,7 @@ def run_debate(proposal: dict) -> dict:
         polaris_genesis = {
             "verdict": f"POLARIS {_debate_mode} INITIATION",
             "mode": _debate_mode,
-            "model": get_models_for_round(1).get("polaris", "gpt-5.4"),
+            "model": get_models_for_round(1).get("polaris", "gpt-5.4-mini"),
             "source_file": current_state.get("source_file"),
             "func_name": current_state.get("func_name"),
             "source_grounded": current_state.get("source_grounded"),
@@ -2997,7 +3028,7 @@ def run_debate(proposal: dict) -> dict:
         polaris_genesis = {
             "verdict": f"POLARIS {_debate_mode} INITIATION",
             "mode": _debate_mode,
-            "model": get_models_for_round(1).get("polaris", "gpt-5.4"),
+            "model": get_models_for_round(1).get("polaris", "gpt-5.4-mini"),
             "evidence_sources": _evidence_packet.get("sources_queried", []),
             "evidence_count": len(_evidence_packet.get("findings", [])),
             "evidence_confidence": _evidence_packet.get("confidence", 0.0),
@@ -4533,33 +4564,26 @@ def run() -> None:
             "NVIDIA_NIM_API_KEY and OPENAI_API_KEY both unavailable — governor cannot start",
         )
         return
-    # IVARIS key check — provider-aware
-    _ivaris_provider = str(get_config_value("IVARIS_PROVIDER", "nim")).strip().lower()
-    if _ivaris_provider == "anthropic" and not os.getenv("ANTHROPIC_API_KEY", "").strip():
-        log.error("ANTHROPIC_API_KEY not set — IVARIS cannot critique (provider=anthropic)")
-        update_heartbeat(SERVICE_NAME, "ERROR", "ANTHROPIC_API_KEY not set — governor cannot start")
+    # IVARIS is NIM-only. Legacy provider/model config may remain in old DB rows,
+    # but it has no routing authority.
+    _ivaris_provider = "nim"
+    if not os.getenv("NVIDIA_NIM_API_KEY", "").strip():
+        log.error("NVIDIA_NIM_API_KEY not set — IVARIS cannot critique")
+        update_heartbeat(SERVICE_NAME, "ERROR", "NVIDIA_NIM_API_KEY not set — governor cannot start")
         return
-    if _ivaris_provider == "gemini":
-        log.warning("Retired IVARIS provider 'gemini' found in system_config; normalising runtime route to NIM")
-        _ivaris_provider = "nim"
 
     log.info("SOVEREIGN GOVERNOR ONLINE")
     log.info("Max rounds: %d | Consensus floor: %.2f", MAX_ROUNDS, CONSENSUS_FLOOR)
     log.info("ORACLE (external evidence): %s", "ACTIVE" if BRAVE_KEY else "NOT CONFIGURED")
     log.info("HITL Required: %s", str(get_config_value("HITL_REQUIRED", "1")))
 
-    # Task E — startup sanity check: resolve and log the live IVARIS routing config.
-    # This is the single source of truth for which provider will be used at runtime.
-    # Check happens AFTER the key-presence guard above so we know the key exists.
-    _startup_provider = str(get_config_value("IVARIS_PROVIDER", "nim")).strip().lower()
-    _startup_model    = str(get_config_value("IVARIS_MODEL",    "claude-haiku-4-5-20251001")).strip()
+    # Startup sanity: runtime authority is the NIM registry, not legacy Claude config rows.
+    _startup_provider = "nim"
+    _startup_model = _nim_assignment("IVARIS", "qwen/qwen3.5-397b-a17b")
     log.info(
-        "IVARIS STARTUP CONFIG: provider=%s model=%s "
-        "ANTHROPIC_API_KEY_present=%s NIM_API_KEY_present=%s "
+        "IVARIS STARTUP CONFIG: provider=nim model=%s NIM_API_KEY_present=%s "
         "soft_cap=%d/hr hard_cap=%d/hr",
-        _startup_provider,
         _startup_model,
-        bool(os.getenv("ANTHROPIC_API_KEY", "").strip()),
         bool(os.getenv("NVIDIA_NIM_API_KEY", "").strip()),
         IVARIS_SOFT_CAP_PER_HOUR,
         IVARIS_HARD_CAP_PER_HOUR,
@@ -4575,16 +4599,6 @@ def run() -> None:
         NUGGET_REPAIR_ALWAYS_ESC,
         NUGGET_ACT_CONFIDENCE,
     )
-    if _startup_provider == "anthropic" and _startup_model.startswith("gemini"):
-        log.warning(
-            "IVARIS CONFIG MISMATCH: provider=anthropic but model=%s looks like a Gemini model. "
-            "Update IVARIS_MODEL in system_config to a Claude model name.",
-            _startup_model,
-        )
-    if _startup_provider == "gemini":
-        log.warning(
-            "IVARIS provider=gemini is retired; runtime uses NIM. Update IVARIS_PROVIDER to nim.",
-        )
 
     # Ensure HITL_REQUIRED config row exists
     try:

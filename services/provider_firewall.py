@@ -27,11 +27,19 @@ log = logging.getLogger("provider_firewall")
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH  = BASE_DIR / "sentinuity_matrix.db"
 
+# Shared GitHub auth-state contract; import this instead of duplicating magic strings.
+GITHUB_AUTH_INVALID_ANONYMOUS = "GITHUB_AUTH_INVALID_ANONYMOUS"
+GITHUB_AUTH_REVALIDATE = "GITHUB_AUTH_REVALIDATE"
+
 # ── BUDGET LIMITS ─────────────────────────────────────────────────────────────
 LIMITS = {
     "x":    {"24h": 12,   "30d": 350,  "cooldown_402h": 24},
     "brave":{"24h": 72,   "30d": 1000, "cooldown_402h": 1},
     "gmgn": {"24h": 100,  "30d": 2000, "cooldown_402h": 1},
+    # GitHub research is text-only reconnaissance.  The prior generic 50-call/day
+    # fallback could exhaust during a single multi-repository expedition and was
+    # indistinguishable from a legitimate zero-result search in the UI.
+    "github": {"24h": 500, "30d": 10000, "cooldown_402h": 1},
 }
 
 
@@ -98,10 +106,27 @@ def check_provider(provider: str, caller: str = "unknown") -> tuple[bool, str]:
         ).fetchone()
 
         if row:
-            # Check cooldown
+            status = str(row["status"] or "")
+            updated_at = float(row["updated_at"] or 0)
+
+            # GitHub is special: a bad personal token must not poison public
+            # read-only reconnaissance forever.  During the short auth backoff we
+            # explicitly allow anonymous public-API use; after five minutes we
+            # allow one authenticated revalidation attempt so a refreshed token
+            # can heal provider_health by returning 200.
+            if provider == "github" and status == "INVALID_TOKEN":
+                age = max(0.0, now - updated_at) if updated_at else 999999.0
+                if age < 300:
+                    c.close()
+                    return True, GITHUB_AUTH_INVALID_ANONYMOUS
+                c.close()
+                return True, GITHUB_AUTH_REVALIDATE
+
+            # Check cooldown for provider-wide failures.
             cooldown = float(row["cooldown_until"] or 0)
             if cooldown > now:
-                remaining = int((cooldown - now) / 3600)
+                remaining = max(1, int((cooldown - now + 3599) / 3600))
+                c.close()
                 return False, f"COOLDOWN_{remaining}h_remaining"
 
             # Check 24h limit
@@ -113,9 +138,10 @@ def check_provider(provider: str, caller: str = "unknown") -> tuple[bool, str]:
             if int(row["requests_30d"] or 0) >= limits["30d"]:
                 return False, f"30D_LIMIT_REACHED_{limits['30d']}"
 
-            # Check status
-            status = str(row["status"] or "")
+            # Check provider-wide terminal status.  INVALID_TOKEN is handled
+            # above for GitHub so public unauthenticated research can continue.
             if status in ("CREDITS_DEPLETED", "BANNED", "INVALID_TOKEN"):
+                c.close()
                 return False, status
 
         c.close()
@@ -175,7 +201,10 @@ def log_api_call(
                         provider, limits["cooldown_402h"])
         elif status_code == 401:
             status = "INVALID_TOKEN"
-            cooldown_until = now + 3600
+            # GitHub can continue against public repositories anonymously and
+            # should re-test a refreshed token promptly. Other providers retain
+            # the conservative one-hour auth cooldown.
+            cooldown_until = now + (300 if provider == "github" else 3600)
         elif status_code == 429:
             status = "RATE_LIMITED"
             cooldown_until = now + 900  # 15 min

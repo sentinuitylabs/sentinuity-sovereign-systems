@@ -119,6 +119,36 @@ except ImportError:
 
 import sys as _sys
 from pathlib import Path as _Path
+
+
+# --- SIGNED_PATCH_20260731: token identity guard (additive) -------------------
+try:
+    from services.token_identity_guard import safe_display_for_row as _sx_ident
+except Exception:  # pragma: no cover
+    try:
+        from token_identity_guard import safe_display_for_row as _sx_ident
+    except Exception:
+        def _sx_ident(row, metadata_name=None):
+            try:
+                d = dict(row)
+            except Exception:
+                d = row if isinstance(row, dict) else {}
+            v = d.get("token_name") or d.get("symbol") or d.get("token_symbol")
+            s = str(v).strip() if v is not None else ""
+            if s and s.lower() not in ("n/a", "na", "none", "null", "unknown", "-"):
+                return s
+            m = str(d.get("mint_address") or d.get("mint") or "").strip()
+            return (m if len(m) <= 12 else m[:4] + "\u2026" + m[-4:]) or "unknown"
+
+
+def _sx_row_label(_r, _selected=None):
+    """Position-feed label. Never returns a bare n/a, blank or mint fragment."""
+    try:
+        return _sx_ident(_r)
+    except Exception:
+        return "unknown"
+# --- end SIGNED_PATCH_20260731 -----------------------------------------------
+
 _ROOT = _Path(__file__).resolve().parent.parent
 if str(_ROOT) not in _sys.path:
     _sys.path.insert(0, str(_ROOT))
@@ -260,6 +290,15 @@ st.markdown(r"""
 try:
     from ui.theme import semantic_css as _sent_semantic_css
     st.markdown(_sent_semantic_css(), unsafe_allow_html=True)
+except Exception:
+    pass
+
+# SIGNOFF_VISUAL_TOKEN_LAYER_20260808
+# Presentation-only closed semantic palette. ABSENCE is deliberately separate
+# from CORAL so missing/plumbing evidence cannot look like a market refusal.
+try:
+    from ui.sentinuity_tokens import tokens_css as _snt_tokens_css
+    st.markdown(_snt_tokens_css(), unsafe_allow_html=True)
 except Exception:
     pass
 
@@ -1289,8 +1328,12 @@ def render_top_command_nav() -> None:
     except Exception:
         _active = ""
 
+    # SIGNOFF_UI_TRUTH_20260810: LAB is intentionally not a primary command-rail
+    # destination.  The section remains reachable contextually from INTEL / by
+    # its existing section route, but the top rail no longer advertises it as a
+    # first-class operator surface.
     secs = [("FOREST", "forest"), ("SUBSTRATE NODE", "substrate"), ("INTEL", "intel"),
-            ("README", "readme"), ("LAB", "lab"), ("VAULT", "vault"),
+            ("README", "readme"), ("VAULT", "vault"),
             ("POLARIS", "polaris"), ("IVARIS", "ivy")]
     jumps = [("PULSE", "#lore-modules"), ("GLASSBOX", "#glassbox-anchor")]
 
@@ -3255,187 +3298,26 @@ def render_intelligence_substrate_panel():
 
 
 @st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def fetch_live_open_positions_breathe(db_path_str: str, refresh_bucket: int) -> list:
-    """
-    SIGN-OFF OPEN POSITION TRUTH SOURCE.
+    """Canonical read-only open-position presentation payloads.
 
-    Visible open-position PnL is sourced from paper_positions.live_exec_* only.
-    market_snapshots is retained only as structural context / optional snap metadata.
-    If execution has not written live_exec data, the UI shows NO_EXEC_DATA instead
-    of synthesising fake micro-movement from snapshots.
-
-    SAME-EYES ENHANCEMENT: Also reads mtm_ticks from sentinuity_intelligence.db
-    directly - the same Tier-1 source the executor uses - so the UI sees the real
-    live price without waiting for the executor write cycle. This closes the gap
-    where positions close at 79% but the meter only ever showed 0% because the
-    executor hadn't written live_exec_pct yet.
+    LIVING_TRUTH_INSTRUMENT_20260809: no UI-side MTM override, no promotion
+    from row-write recency, and no duplicated PnL derivation. Every open-position
+    surface consumes services.position_truth_payload.
     """
-    import time
     try:
-        conn = sqlite3.connect(db_path_str, check_same_thread=False, timeout=2.0)
-        conn.row_factory = sqlite3.Row
-
-        # Cache oracle gate config in session_state so render_living_trade_meter
-        # can read it without a separate DB query per render cycle.
+        from services.position_truth_payload import build_open_position_truth_payloads
+        return build_open_position_truth_payloads(matrix_db=db_path_str)
+    except Exception as e:
         try:
-            _gate_row = conn.execute(
-                "SELECT value FROM system_config WHERE key='ORACLE_LIVENESS_GATE_SEC'"
-            ).fetchone()
-            if _gate_row:
-                st.session_state["_cfg_oracle_gate"] = float(_gate_row[0])
+            _hub_log.warning(
+                f"Canonical position truth payload unavailable: {type(e).__name__}: {e}"
+            )
         except Exception:
             pass
-
-        rows = conn.execute("""
-            SELECT p.*,
-                   COALESCE(m.observed_price, p.entry_price) AS snap_price,
-                   COALESCE(m.price_updated_at, p.last_marked_at) AS snap_marked_at
-            FROM paper_positions p
-            LEFT JOIN (
-                SELECT mint_address, observed_price, price_updated_at
-                FROM market_snapshots
-                WHERE candidate_state = 'mtm' AND observed_price > 0
-                GROUP BY mint_address
-                HAVING price_updated_at = MAX(price_updated_at)
-            ) m ON p.mint_address = m.mint_address
-            WHERE p.status = 'OPEN'
-            ORDER BY p.opened_at DESC
-        """).fetchall()
-        conn.close()
-
-        # Build Intel DB price map - same Tier-1 source as executor
-        # Keyed by mint_address → {price, age_sec}
-        _intel_prices: dict = {}
-        for _intel_path in INTEL_DB_PATHS:
-            try:
-                _ic = sqlite3.connect(str(_intel_path), timeout=1.0)
-                _ic.row_factory = sqlite3.Row
-                _iticks = _ic.execute(
-                    "SELECT mint_address, price_usd, ts_ms "
-                    "FROM mtm_ticks "
-                    "ORDER BY ts_ms DESC LIMIT 200"
-                ).fetchall()
-                _ic.close()
-                _inow = time.time()
-                for _t in _iticks:
-                    _m = str(_t["mint_address"] or "")
-                    if _m and _m not in _intel_prices:
-                        _ip = float(_t["price_usd"] or 0)
-                        _ia = _inow - float(_t["ts_ms"] or 0) / 1000.0
-                        if _ip > 0 and _ia >= 0:
-                            _intel_prices[_m] = {"price": _ip, "age": _ia}
-                break  # first working intel DB is enough
-            except Exception:
-                pass
-
-        now = time.time()
-        payload = []
-        seen_ids = set()
-
-        for r in rows:
-            _pos_id = r["id"]
-            if _pos_id in seen_ids:
-                continue
-            seen_ids.add(_pos_id)
-
-            _keys = set(r.keys()) if hasattr(r, "keys") else set()
-
-            def _get(key, default=None):
-                try:
-                    return r[key] if key in _keys else default
-                except Exception:
-                    return default
-
-            entry = float(_get("entry_price", 0.0) or 0.0)
-            size  = float(_get("position_size_usd", 0.0) or 0.0)
-
-            # Execution engine owns live visible truth.
-            _lep     = float(_get("live_exec_price", 0.0) or 0.0)
-            _lect_raw = _get("live_exec_pct", None)
-            _leu     = float(_get("live_exec_updated_at", 0.0) or 0.0)
-            _can_exit = int(_get("live_exec_can_exit", 0) or 0)
-
-            # SAME-EYES: if executor hasn't written live_exec yet (new position),
-            # read directly from Intel DB mtm_ticks - same Tier-1 source as executor.
-            # This closes the gap where meter shows 0% until executor catches up.
-            _mint = str(_get("mint_address", "") or "")
-            _opened_at = float(_get("opened_at", 0.0) or 0.0)
-            _intel = _intel_prices.get(_mint)
-            if (_intel and _intel["price"] > 0 and _intel["age"] < 120
-                    and (_lect_raw is None or _can_exit != 1)):
-                _ip  = _intel["price"]
-                _ia  = _intel["age"]
-                _ep2 = float(_get("entry_price", 0.0) or 0.0)
-                if _ep2 > 0 and _ip > 0:
-                    _intel_pct = (_ip - _ep2) / _ep2 * 100.0
-                    _lep      = _ip
-                    _lect_raw = _intel_pct
-                    _leu      = now - _ia
-                    _can_exit = 1 if _ia < 120 else 0
-
-            if _lep > 0 and _lect_raw is not None and _can_exit == 1:
-                pnl_pct = float(_lect_raw)
-                pnl = size * (pnl_pct / 100.0) if size > 0 else 0.0
-                mark_age = int(now - _leu) if _leu > 0 else 9999
-                is_fresh = mark_age < 15
-                age_str = f"{mark_age}s"
-                src_badge = "EXEC_FRESH" if is_fresh else "STALE_EXEC"
-            elif _lep > 0 and _lect_raw is not None and _can_exit != 1:
-                # Price exists but router says not executable - show ?? not fake %
-                pnl_pct = None
-                pnl = 0.0
-                mark_age = int(now - _leu) if _leu > 0 else 9999
-                is_fresh = False
-                age_str = f"{mark_age}s"
-                src_badge = "GATE_BLOCKED"
-            else:
-                pnl_pct = None
-                pnl = 0.0
-                mark_age = 9999
-                is_fresh = False
-                age_str = "NO EXEC"
-                src_badge = "NO_EXEC_DATA"
-
-            _ss_key = f"_prev_pct_{_pos_id}"
-            _prev = st.session_state.get(_ss_key)
-            if pnl_pct is not None:
-                st.session_state[_ss_key] = pnl_pct
-
-            # Post-entry tick count from Intel DB for coverage display
-            _tick_count = 0
-            try:
-                import sqlite3 as _sq3
-                _idb_path = str(_Path(__file__).resolve().parent.parent / "sentinuity_intelligence.db")
-                _ic = _sq3.connect(_idb_path, timeout=1.0)
-                _tc_row = _ic.execute(
-                    "SELECT COUNT(*) FROM mtm_ticks WHERE mint_address=? AND ts_ms>=?",
-                    (str(_get("mint_address", "") or ""), float(_get("opened_at", 0) or 0) * 1000)
-                ).fetchone()
-                _ic.close()
-                _tick_count = int(_tc_row[0]) if _tc_row else 0
-            except Exception:
-                pass
-
-            payload.append({
-                "id":                 _pos_id,
-                "token":              display_name(token_name=_get("token_name", ""), mint=_get("mint_address", ""))[:18],
-                "pnl":                pnl,
-                "pnl_pct":            pnl_pct,
-                "prev_pnl_pct":       _prev,
-                "is_fresh":           is_fresh,
-                "age_str":            age_str,
-                "src_badge":          src_badge,
-                "resolved_price":     _lep if _lep > 0 else None,
-                "resolved_updated_at": _leu if _leu > 0 else None,
-                "tick_count":         _tick_count,
-                "raw_row":            dict(r),
-            })
-
-        return payload
-
-    except Exception as e:
-        _hub_log.warning(f"UI Breathe failed: {e}")
         return []
+
 
 @st.cache_data(ttl=20, show_spinner=False)
 def _fetch_all_dashboard_data():
@@ -4480,292 +4362,236 @@ def render_runner_observability_panel(_db_path=None) -> None:
             pass
 # END SENTINUITY_RUNNER_SUBSTRATE_UI_20260621
 
-def render_living_trade_meter(row: dict) -> None:
+def render_living_trade_meter(payload: dict) -> None:
+    """Living Price-Truth Instrument.
+
+    Pure renderer: consumes the canonical position_truth_payload and computes no
+    authority, freshness policy, sellability, divergence gate, or trading state.
     """
-    EVOLVED PRESSURE GAUGE - centre equilibrium, SL bleeds left (red),
-    TP expands right (green), price breathes at centre. Organism stress visible.
-    """
-    import time as _mt
     try:
-        _pct     = float(row.get("pnl_pct") or 0.0)
-        _pnl     = float(row.get("pnl") or 0.0)
-        _badge   = str(row.get("src_badge","STALE"))
-        _token   = str(row.get("token","?"))[:14]
-        _age     = str(row.get("age_str","?"))
-        _fresh   = row.get("is_fresh", False)
-        _tp_pct  = float(row.get("take_profit_pct") or 25.0)  # ALIGN: TAKE_PROFIT_PCT seed=25
-        _sl_pct  = float(row.get("stop_loss_pct") or 4.0)  # ALIGN: STOP_LOSS_PCT/HARD_STOP=4 (hard floor)
+        import html as _h
+        import math as _math
+        from services.position_truth_payload import (
+            AXIS_DATUM_PCT, SOCK_OCCUPIED, SOCK_REJECTED,
+            SOCK_VERIFYING, reason_text,
+        )
 
-        # Normalise: centre = 0%, full left = -SL%, full right = +TP%
-        _range   = _tp_pct + _sl_pct  # total range
-        _centre  = _sl_pct / _range * 100  # centre line position %
-        _price_pos = (_pct + _sl_pct) / _range * 100  # 0-100
-        _price_pos = max(1, min(99, _price_pos))
-
-        # Colour logic
-        # RUNNER_GOLD_20260621: a true runner (>= target + 75% of target, i.e. well
-        # past TP) turns GOLD, distinct from an ordinary "approaching target" green.
-        # Previously a +1270% runner stayed green because it only checked
-        # _pct > _tp_pct*0.7 - every winner looked the same. Gold marks the runners.
-        _runner_threshold = _tp_pct * 1.75  # target + 75% beyond it
-        _is_runner = _pct >= _runner_threshold
-        if _is_runner:
-            _state = "RUNNER"; _state_col = "#FFD700"
-        elif _pct > _tp_pct * 0.7:
-            _state = "APPROACHING TARGET"; _state_col = "#14F195"
-        elif _pct < -_sl_pct * 0.7:
-            _state = "CRITICAL LOSS"; _state_col = "#FF073A"
-        elif abs(_pct) < 2:
-            _state = "EQUILIBRIUM"; _state_col = "#FFD700"
-        else:
-            _state = "BUILDING"; _state_col = "#8EF9FF"
-        # the tp-fill bar uses runner gold when running, else green
-        _tp_fill_col = "#FFD700" if _is_runner else "#14F195"
-
-        _badge_col = "#14F195" if _badge=="LIVE" else ("#FF073A" if "STALE" in _badge else "#FFD700")
-        _pnl_col   = "#14F195" if _pnl >= 0 else "#FF073A"
-        _pulse_anim= "animation:meterPulse 1.8s ease-in-out infinite;" if _fresh else ""
-
-        # Build gauge
-        _sl_fill  = max(0, min(_centre, _centre - _price_pos)) if _price_pos < _centre else 0
-        _tp_fill  = max(0, _price_pos - _centre) if _price_pos > _centre else 0
-        _tp_col = "#FFD700" if _state == "RUNNER" else "#14F195"
-
-        # SENTINUITY_RUNNER_GOLD_20260621_V3: visual-only runner colour override.
-
-        # If this render scope has _pct/_state/_state_col, runners at >=75% PnL turn gold.
-
-        try:
-
-            _runner_gold_pct = 75.0
-
+        def _f(v):
             try:
-
-                if isinstance(locals().get("row"), dict):
-
-                    _runner_gold_pct = float(locals().get("row", {}).get("runner_gold_pct") or 75.0)
-
+                x=float(v)
+                return x if _math.isfinite(x) else None
             except Exception:
+                return None
 
-                _runner_gold_pct = 75.0
+        def _pc(v):
+            x=_f(v)
+            return "·" if x is None else f"{x:+.1f}%"
 
-            if "_pct" in locals() and "_state_col" in locals() and float(_pct) >= float(_runner_gold_pct):
+        def _decay(age):
+            a=_f(age)
+            if a is None: return "decay-unknown"
+            if a < 5: return "decay-live"
+            if a < 15: return "decay-recent"
+            if a < 60: return "decay-ageing"
+            return "decay-stale"
 
-                _state = "RUNNER"
+        token=_h.escape(str(payload.get("token_name") or payload.get("token") or "?")[:32])
+        pid=payload.get("position_id") or payload.get("id") or "—"
+        hero=_f(payload.get("hero_pnl_pct"))
+        hero_stage=str(payload.get("hero_stage") or "NONE").upper()
+        qualified=bool(payload.get("hero_qualified"))
+        usd=_f(payload.get("hero_pnl_usd"))
+        auth=str(payload.get("authority_stage") or "NONE").upper()
+        reason=str(payload.get("reason_code") or "")
+        obs=payload.get("stage_observed") or payload.get("D_observation") or {}
+        exe=payload.get("stage_executable") or payload.get("C_exec") or {}
+        trs=payload.get("stage_trusted") or {}
+        flr=payload.get("stage_protected") or {}
+        pool=payload.get("A_pool") or {}
+        tape=payload.get("B_tape") or {}
+        div=_f(payload.get("obs_exec_divergence_pct"))
+        strength=_f(payload.get("obs_exec_divergence_strength"))
+        strength=0.0 if strength is None else max(0.0,min(1.0,strength))
+        cov=int(payload.get("evidence_coverage_have") or 0)
+        cov_total=int(payload.get("evidence_coverage_total") or 4)
 
-                _state_col = "#FFD700"
+        css=r"""<style>
+.lpt{--c:var(--snt-cy-hi);position:relative;margin:6px 0 8px;padding:9px 10px 8px;
+ border:1px solid var(--snt-crystal-edge);border-radius:7px;overflow:hidden;
+ background:linear-gradient(145deg,rgba(18,8,42,.38),rgba(3,1,10,.76) 62%);
+ box-shadow:inset 0 0 28px rgba(153,69,255,.035);}
+.lpt.protected{border-color:rgba(255,215,0,.28);box-shadow:inset 0 0 30px rgba(255,215,0,.025),0 0 15px rgba(255,215,0,.025)}
+.lpt-top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:3px}
+.lpt-name{font:500 13px var(--snt-f-mono);letter-spacing:.06em;color:var(--snt-ink-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lpt-state{font:600 10px var(--snt-f-mono);letter-spacing:.22em;color:var(--c);text-transform:uppercase}
+.lpt-hero{display:flex;align-items:baseline;gap:8px;min-width:0}
+.lpt-fig{font:500 29px/1 var(--snt-f-mono);letter-spacing:.025em;white-space:nowrap}
+.lpt-fig.hollow{color:transparent;-webkit-text-stroke:1.15px var(--snt-cy-hi);text-shadow:0 0 8px rgba(95,211,224,.17)}
+.lpt-fig.solid{color:var(--snt-em-hi);text-shadow:0 0 9px rgba(20,241,149,.16)}
+.lpt-figlab{font:500 10px var(--snt-f-mono);letter-spacing:.18em;color:var(--snt-ink-3);text-transform:uppercase}
+.lpt-usd{margin-left:auto;font:500 10px var(--snt-f-mono);color:var(--snt-em-hi);white-space:nowrap}
+.lpt-usd.unverified{color:var(--snt-cy);opacity:.72}
+.lpt-sub{display:flex;align-items:center;gap:10px;min-height:15px;margin:2px 0 6px;font:600 9px var(--snt-f-mono);letter-spacing:.11em}
+.lpt-div{color:var(--snt-coral-hi)} .lpt-lock{color:var(--snt-gold-hi);text-shadow:0 0 7px rgba(255,215,0,.25)}
+.lpt-chan{position:relative;height:28px;border-radius:4px;
+ background:radial-gradient(120% 190% at 50% -60%,rgba(153,69,255,.14),transparent 62%),linear-gradient(180deg,rgba(1,0,4,.97),rgba(7,3,18,.90) 46%,rgba(12,6,28,.82));
+ border:1px solid rgba(154,132,232,.30);border-top-color:rgba(154,132,232,.10);border-bottom-color:rgba(199,125,255,.34);
+ box-shadow:inset 0 4px 9px rgba(0,0,0,.85),inset 0 -2px 0 rgba(199,125,255,.16),inset 2px 0 3px rgba(0,0,0,.62),inset -2px 0 3px rgba(0,0,0,.62),0 1px 0 rgba(199,125,255,.10),0 0 14px rgba(153,69,255,.07)}
+.lpt-chan::before{content:"";position:absolute;left:1px;right:1px;bottom:1px;height:36%;border-radius:0 0 3px 3px;z-index:1;background:linear-gradient(180deg,transparent,rgba(95,211,224,.045))}
+.lpt-chan::after{content:"";position:absolute;inset:0;border-radius:4px;pointer-events:none;z-index:1;background:repeating-linear-gradient(90deg,rgba(154,132,232,.055) 0 1px,transparent 1px 15px);mask-image:linear-gradient(180deg,transparent,#000 38%,#000 62%,transparent);-webkit-mask-image:linear-gradient(180deg,transparent,#000 38%,#000 62%,transparent)}
+.lpt-datum{position:absolute;top:-3px;bottom:-3px;width:1px;background:var(--snt-datum);box-shadow:0 0 9px rgba(207,199,232,.55);opacity:.84;z-index:2}
+.lpt-datum::after{content:"";position:absolute;left:-2px;top:-4px;width:5px;height:5px;background:var(--snt-datum);transform:rotate(45deg);opacity:.70}
+.lpt-m{position:absolute;transform:translateX(-50%);pointer-events:none}
+.lpt-obs{top:8px;width:12px;height:12px;border:1.4px solid var(--snt-cy-hi);transform:translateX(-50%) rotate(45deg);background:transparent;z-index:5;box-shadow:0 0 9px rgba(95,211,224,.40)}
+.lpt-exec{top:8px;width:14px;height:14px;background:var(--snt-em-hi);z-index:7;clip-path:polygon(50% 0,100% 100%,0 100%);filter:drop-shadow(0 0 3px rgba(1,0,4,.95)) drop-shadow(0 0 8px rgba(20,241,149,.60))}
+.lpt-peak{top:5px;width:8px;height:18px;background:var(--snt-vio-hi);z-index:6;clip-path:polygon(50% 0,100% 27%,100% 100%,0 100%,0 27%);filter:drop-shadow(0 0 6px rgba(199,125,255,.45))}
+.lpt-floor{top:5px;width:7px;height:18px;z-index:6;background:linear-gradient(180deg,var(--snt-gold-hi),rgba(232,184,76,.72));clip-path:polygon(50% 0,100% 26%,100% 100%,0 100%,0 26%);filter:drop-shadow(0 0 7px rgba(255,215,0,.50))}
+.lpt-rej{top:7px;width:13px;height:13px;border:1px solid var(--snt-coral-hi);z-index:5;background:repeating-linear-gradient(135deg,transparent 0 3px,rgba(255,92,110,.55) 3px 4px)}
+.lpt-rej::after{content:"";position:absolute;left:-2px;right:-2px;top:6px;height:1px;background:var(--snt-coral-hi);transform:rotate(-22deg)}
+.lpt-doubt{position:absolute;top:3px;bottom:3px;z-index:2;background:repeating-linear-gradient(135deg,rgba(255,92,110,.60) 0 1px,transparent 1px 5px);border-left:1px solid rgba(255,92,110,.28);border-right:1px solid rgba(255,92,110,.28)}
+.lpt-floorwash{position:absolute;top:1px;bottom:1px;border-radius:3px;z-index:0;background:linear-gradient(180deg,rgba(255,215,0,.055),rgba(255,215,0,.015))}
+.lpt-floorseg{position:absolute;bottom:3px;height:3px;border-radius:2px;z-index:3;background:linear-gradient(90deg,var(--snt-gold-hi),rgba(255,215,0,.62) 55%,rgba(232,184,76,.16));box-shadow:0 0 11px rgba(255,215,0,.52),0 0 3px rgba(255,215,0,.85)}
+.decay-ageing{opacity:.63;filter:saturate(.62)} .decay-stale{opacity:.42;filter:saturate(.30)} .decay-unknown{opacity:.35}
+.lpt-rail{display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin:3px 1px 5px}
+.lpt-cell{min-width:0;font:500 9px/1.25 var(--snt-f-mono);color:var(--snt-ink-4);letter-spacing:.08em}
+.lpt-cell b{display:block;font-weight:500;color:var(--snt-ink-3);white-space:nowrap}.lpt-cell i{display:block;font-style:normal;font-variant-numeric:tabular-nums;color:var(--snt-ink-2)}
+.lpt-tray{display:grid;grid-template-columns:repeat(4,1fr);gap:3px;border-top:1px dashed rgba(86,80,115,.24);padding-top:2px}
+.lpt-sock{padding:5px 2px 3px;text-align:center;border-radius:0 0 3px 3px;font:500 9px var(--snt-f-mono);letter-spacing:.08em;background:linear-gradient(180deg,rgba(0,0,0,.52),rgba(0,0,0,.10));box-shadow:inset 0 3px 6px rgba(0,0,0,.72);border-top:1.5px solid var(--snt-abs-edge)}
+.lpt-sock .k{color:var(--snt-ink-4);display:block}.lpt-sock .v{display:block;margin-top:2px;font-variant-numeric:tabular-nums}
+.sock-occ{border-top-color:var(--sc)}.sock-occ .v{color:var(--sc)}
+.sock-rej{border-top-color:var(--snt-coral-edge)}.sock-rej .v{color:var(--snt-coral-hi);text-decoration:line-through}
+.sock-ver{border-top:1.5px dashed var(--snt-cy-edge)}.sock-ver .v{color:var(--snt-cy)}
+.sock-una{border-top:1.5px dashed rgba(86,80,115,.30);opacity:.72}.sock-una .v{color:var(--snt-abs)}
+.lpt-spine{margin-top:5px;padding-top:5px;border-top:1px solid rgba(154,132,232,.11);font:600 9px var(--snt-f-mono);letter-spacing:.09em;color:var(--snt-ink-3);white-space:normal}
+.ok{color:var(--snt-em-hi)} .no{color:var(--snt-coral-hi)} .wait{color:var(--snt-abs)}
+.lpt-reason{margin-top:4px;font:500 9px var(--snt-f-mono);letter-spacing:.04em;color:var(--snt-ink-3)}
+@media(max-width:430px){.lpt{padding:8px 8px 7px}.lpt-fig{font-size:27px}.lpt-figlab{font-size:9px}.lpt-cell,.lpt-sock,.lpt-spine,.lpt-reason{font-size:9px}}
+</style>"""
 
-        except Exception:
+        if hero is None:
+            fig_txt="—"; fig_cls="hollow"; fig_lab="NO PRICE"
+        elif qualified:
+            fig_txt=f"{hero:+.1f}%"; fig_cls="solid"; fig_lab="EXECUTABLE NOW"
+        else:
+            fig_txt=f"{hero:+.1f}%"; fig_cls="hollow"; fig_lab="OBSERVED ONLY"
 
-            pass
+        if usd is None: usd_txt=""
+        elif qualified: usd_txt=f"<span class='lpt-usd'>${usd:+,.2f}</span>"
+        else: usd_txt=f"<span class='lpt-usd unverified'>~${usd:+,.2f} UNVERIFIED</span>"
+
+        state_col="var(--snt-gold-hi)" if auth=="PROTECTED" else ("var(--snt-em-hi)" if qualified else "var(--snt-cy-hi)")
+        div_txt="" if div is None else f"<span class='lpt-div'>OBS↔EXEC {div:+.1f}pts</span>"
+        floor_pct=_f(flr.get("pnl_pct"))
+        lock_chip=(f"<span class='lpt-lock'>🔒 {floor_pct:+.1f}% PROTECTED FLOOR</span>"
+                   if flr.get("socket_state")==SOCK_OCCUPIED and floor_pct is not None else "")
+
+        parts=[f"<div class='lpt-datum' style='left:{AXIS_DATUM_PCT:.2f}%'></div>"]
+        # Doubt band is only geometry; authority/rejection has already been decided upstream.
+        ox=_f(obs.get("axis_pct")); ex=_f(exe.get("axis_pct"))
+        if ox is not None and ex is not None and abs(ox-ex)>.15:
+            lo,hi=sorted((ox,ex)); op=.15+.36*strength
+            parts.append(f"<div class='lpt-doubt' style='left:{lo:.2f}%;width:{max(.4,hi-lo):.2f}%;opacity:{op:.2f}'></div>")
+
+        def _marker(stage, cls, age_key=True):
+            x=_f(stage.get("axis_pct"))
+            if x is None: return
+            sock=str(stage.get("socket_state") or "")
+            if sock==SOCK_REJECTED:
+                parts.append(f"<div class='lpt-m lpt-rej' style='left:{x:.2f}%'></div>"); return
+            if sock!=SOCK_OCCUPIED: return
+            decay=_decay(stage.get("age_sec")) if age_key else ""
+            parts.append(f"<div class='lpt-m {cls} {decay}' style='left:{x:.2f}%'></div>")
+
+        _marker(obs,"lpt-obs")
+        _marker(exe,"lpt-exec")
+        _marker(trs,"lpt-peak",False)
+        _marker(flr,"lpt-floor",False)
+
+        if flr.get("socket_state")==SOCK_OCCUPIED and floor_pct is not None:
+            fx=_f(flr.get("axis_pct"))
+            hx=_f(payload.get("hero_axis_pct"))
+            if fx is not None:
+                end=max(fx,hx if hx is not None else fx)
+                lo=min(fx,end)
+                parts.append(f"<div class='lpt-floorwash' style='left:{lo:.2f}%;width:{max(.6,end-lo):.2f}%'></div>")
+                parts.append(f"<div class='lpt-floorseg' style='left:{lo:.2f}%;width:{max(.6,end-lo):.2f}%'></div>")
+
+        def _cell(label, stg):
+            return (f"<div class='lpt-cell'><b>{label}</b>"
+                    f"<i>{_pc(stg.get('pnl_pct'))}</i></div>")
+        rail="<div class='lpt-rail'>"+_cell("A POOL",pool)+_cell("B TAPE",tape)+_cell("C EXEC",exe)+_cell("D OBS",obs)+"</div>"
+
+        def _sock(label, stg, color):
+            ss=str(stg.get("socket_state") or "UNAVAILABLE")
+            cls={"OCCUPIED":"sock-occ","REJECTED":"sock-rej","VERIFYING":"sock-ver"}.get(ss,"sock-una")
+            val=_pc(stg.get("pnl_pct"))
+            if ss=="UNAVAILABLE": val="·"
+            elif ss=="VERIFYING" and stg.get("pnl_pct") is None: val="VERIFYING"
+            return f"<div class='lpt-sock {cls}' style='--sc:{color}'><span class='k'>{label}</span><span class='v'>{val}</span></div>"
+        tray="<div class='lpt-tray'>"+_sock("OBSERVED",obs,"var(--snt-cy-hi)")+_sock("EXECUTABLE",exe,"var(--snt-em-hi)")+_sock("TRUSTED",trs,"var(--snt-vio-hi)")+_sock("PROTECTED",flr,"var(--snt-gold-hi)")+"</div>"
+
+        lane_ok=bool(payload.get("spine_lane_ok"))
+        mode_ok=bool(payload.get("spine_mode_ok"))
+        exec_ok=bool(payload.get("spine_exec_ok"))
+        lane=str(payload.get("spine_lane") or "SIM")
+        capital=str(payload.get("spine_capital") or "WAITING")
+        spine=(f"<div class='lpt-spine'>LANE <span class='{'ok' if lane_ok else 'no'}'>{'✓' if lane_ok else '✕'}</span> "
+               f"{_h.escape(lane)} &nbsp; MODE <span class='{'ok' if mode_ok else 'no'}'>{'✓' if mode_ok else '✕'}</span> "
+               f"&nbsp; EXEC <span class='{'ok' if exec_ok else 'no'}'>{'✓' if exec_ok else '✕'}</span> "
+               f"&nbsp; <span class='wait'>{_h.escape(capital)}</span> &nbsp; COV {cov}/{cov_total}</div>")
+
+        reason_txt=reason_text(reason)
+        reason_html=f"<div class='lpt-reason'>{_h.escape(reason_txt)}</div>" if reason_txt else ""
+        status_label="PROTECTED" if auth=="PROTECTED" else ("EXECUTABLE" if qualified else "OBSERVED")
+        klass=" protected" if auth=="PROTECTED" else ""
+
+        html_out=(css+f"<div class='lpt{klass}' style='--c:{state_col}'>"
+                  f"<div class='lpt-top'><span class='lpt-name'>{token}</span><span class='lpt-state'>{status_label}</span></div>"
+                  f"<div class='lpt-hero'><span class='lpt-fig {fig_cls}'>{fig_txt}</span><span class='lpt-figlab'>{fig_lab}</span>{usd_txt}</div>"
+                  f"<div class='lpt-sub'>{div_txt}{lock_chip}</div>"
+                  f"<div class='lpt-chan'>{''.join(parts)}</div>{rail}{tray}{spine}{reason_html}</div>")
+        st.markdown(html_out,unsafe_allow_html=True)
+    except Exception as exc:
+        st.markdown(
+            f"<div style='color:var(--snt-coral-hi);font-size:var(--snt-t-label)'>"
+            f"INSTRUMENT ERR: {html.escape(str(exc)[:90])}</div>",
+            unsafe_allow_html=True,
+        )
 
 
-        _html = f"""
-<style>
-@keyframes meterPulse{{0%,100%{{opacity:.85}}50%{{opacity:1}}}}
-@keyframes centrePulse{{0%,100%{{box-shadow:0 0 4px #FFD700}}50%{{box-shadow:0 0 12px #FFD700}}}}
-</style>
-<div style="padding:8px 12px 10px;border-left:2px solid {_state_col};
-  background:rgba(5,2,16,0.6);margin-bottom:6px;border-radius:0 6px 6px 0;{_pulse_anim}">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;
-    font-family:Share Tech Mono,monospace;font-size:0.66rem;letter-spacing:1px;">
-    <span style="color:#8EF9FF;">{_token}</span>
-    <span style="color:{_state_col};letter-spacing:2px;">{_state}</span>
-    <span style="color:{_badge_col};font-size:0.66rem;">[{_badge} {_age}]</span>
-  </div>
-  <!-- PRESSURE GAUGE BAR -->
-  <div style="position:relative;height:16px;border-radius:8px;
-    background:linear-gradient(90deg,#FF073A22 0%,#1a0a0a 40%,#0a1a0a 60%,#14F19522 100%);
-    border:1px solid rgba(255,255,255,0.08);overflow:visible;">
-    <!-- SL pressure bleed (left red fill) -->
-    <div style="position:absolute;left:0;top:0;height:100%;border-radius:8px 0 0 8px;
-      width:{min(_centre,100-_price_pos+_centre) if _price_pos<_centre else 0:.1f}%;
-      background:linear-gradient(90deg,#FF073A,#FF073A44);opacity:.8;"></div>
-    <!-- TP expansion (right green fill) -->
-    <div style="position:absolute;left:{_centre:.1f}%;top:0;height:100%;
-      width:{max(0,_price_pos-_centre):.1f}%;
-      background:linear-gradient(90deg,{_tp_fill_col}44,{_tp_fill_col});opacity:.85;"></div>
-    <!-- Centre equilibrium line -->
-    <div style="position:absolute;top:-2px;left:{_centre:.1f}%;width:2px;height:20px;
-      background:#FFD700;animation:centrePulse 2s ease-in-out infinite;
-      transform:translateX(-50%);border-radius:1px;"></div>
-    <!-- Price cursor -->
-    <div style="position:absolute;top:-3px;left:{_price_pos:.1f}%;width:10px;height:22px;
-      background:{_state_col};border-radius:3px;transform:translateX(-50%);
-      box-shadow:0 0 8px {_state_col};transition:left .5s ease;"></div>
-    <!-- SL label -->
-    <div style="position:absolute;left:4px;top:50%;transform:translateY(-50%);
-      font-family:Share Tech Mono;font-size:0.66rem;color:#FF073A99;">SL</div>
-    <!-- TP label -->
-    <div style="position:absolute;right:4px;top:50%;transform:translateY(-50%);
-      font-family:Share Tech Mono;font-size:0.66rem;color:{_tp_col}99;">TP</div>
-  </div>
-  <!-- PnL readout beneath gauge -->
-  <div style="display:flex;justify-content:space-between;margin-top:4px;
-    font-family:Share Tech Mono,monospace;font-size:0.66rem;">
-    <span style="color:#555;">-{_sl_pct:.0f}%</span>
-    <span style="color:{_pnl_col};font-weight:700;">{_pct:+.2f}%&nbsp;&nbsp;${_pnl:+.3f}</span>
-    <span style="color:#555;">+{_tp_pct:.0f}%</span>
-  </div>
-</div>"""
-        st.markdown(_html, unsafe_allow_html=True)
-    except Exception as _me:
-        st.markdown(f"<div style='color:#FF073A;font-size:0.66rem;'>METER ERR: {html.escape(str(_me)[:40])}</div>", unsafe_allow_html=True)
 
 
 def truth_lens_modal(row):
-    import time as _time
-    import sqlite3 as _sqlite3
-
-    # FORCE LIVE READ - bypass 12s cache on dashboard data
-    # Truth Lens must show current DB state not stale snapshot
-    _pos_id = row.get("id")
-    if _pos_id:
-        try:
-            _lconn = _sqlite3.connect(str(DB_PATH), timeout=2.0)
-            _lconn.row_factory = _sqlite3.Row
-            _fresh = _lconn.execute(
-                "SELECT * FROM paper_positions WHERE id=? LIMIT 1",
-                (_pos_id,)
-            ).fetchone()
-            _lconn.close()
-            if _fresh:
-                row = dict(_fresh)
-        except Exception:
-            pass  # fall through to cached row if DB read fails
-
-    mint      = str(row.get("mint_address", ""))
-    token     = str(row.get("token_name", ""))
-    entry     = float(row.get("entry_price", 0) or 0)
-    size      = float(row.get("position_size_usd", 0) or 0)
-    status    = str(row.get("status", "CLOSED")).upper()
-
-    # ── Prefer execution-aligned live_exec_* columns (written by execution engine) ──
-    def _sf(v):
-        try:
-            if v is None: return None
-            f = float(v)
-            return None if f != f else f
-        except Exception:
-            return None
-    live_exec_price   = _sf(row.get("live_exec_price"))
-    live_exec_pct     = _sf(row.get("live_exec_pct"))
-    live_exec_band    = row.get("live_exec_band") or "UNKNOWN"
-    live_exec_src     = str(row.get("live_exec_source") or "execution-engine")
-    live_exec_updated = _sf(row.get("live_exec_updated_at"))
-
-    # Determine data source and freshness
-    using_exec_data = (
-        status == 'OPEN'
-        and live_exec_price is not None
-        and live_exec_pct is not None
-        and float(live_exec_price) > 0
-    )
-
-    if using_exec_data:
-        current   = float(live_exec_price)
-        pct_moved = float(live_exec_pct)
-        pnl       = size * (pct_moved / 100.0) if size > 0 else 0.0
-        raw_delta = current - entry if entry > 0 else 0.0
-        exec_age  = int(_time.time() - float(live_exec_updated)) if live_exec_updated else 9999
-        src_label = {
-            "mtm": "EXEC-MTM", "intel-mtm": "EXEC-INTEL",
-            "unscoped": "EXEC-SNAP", "dex-stale": "EXEC-DEX",
-            "engine-fallback": "EXEC-FALLBACK",
-        }.get(live_exec_src, "EXEC")
-        data_source = f"{src_label} ({exec_age}s)"
-        if exec_age < 10:
-            freshness = "LIVE"
-            age_col   = C_GREEN
-        elif exec_age < 30:
-            freshness = "LIVE"
-            age_col   = C_GREEN
-        elif exec_age < 60:
-            freshness = "STALE"
-            age_col   = C_GOLD
-        else:
-            # Gemini fix: oracle dark >60s → treat as DEAD → show ?? not fake %
-            freshness = "DEAD"
-            age_col   = C_RED
-        age_str = f"{exec_age}s"
-    else:
-        # Fallback to oracle MTM for display
-        mtm       = _latest_mtm_for_mint(mint)
-        current   = mtm["price"]
-        pct_moved = ((current - entry) / entry * 100.0) if entry > 0 and current > 0 else 0.0
-        pnl       = size * (pct_moved / 100.0) if size > 0 else 0.0
-        raw_delta = (current - entry) if entry > 0 and current > 0 else 0.0
-        age_str   = f"{mtm['age_seconds']}s" if mtm["age_seconds"] is not None else "NO DATA"
-        age_col   = C_GREEN if mtm["is_fresh"] else (C_GOLD if mtm["age_seconds"] and mtm["age_seconds"] < 120 else C_RED)
-        data_source = f"oracle-mtm"
-        live_exec_band = "UNKNOWN"
-        if status != "OPEN":
-            freshness = "HISTORICAL"
-            age_col   = "#888888"
-            age_str   = f"CLOSED - {age_str}"
-        elif mtm["is_fresh"]:
-            freshness = "LIVE"
-        elif mtm["age_seconds"] and mtm["age_seconds"] < 120:
-            freshness = "STALE"
-        else:
-            freshness = "DEAD"
-            age_col = C_RED
-
-    pcol = C_GREEN if pnl >= 0 else C_RED
-
-    # Band colour
-    band_col = {
-        "TAKE_PROFIT_READY":   C_GREEN,
-        "TAKE_PROFIT_ARMING":  C_GOLD,
-        "STOP_LOSS_READY":     C_RED,
-        "STOP_LOSS_ARMING":    "#FF6B35",
-        "FLAT":                "#888888",
-        "LIVE":                C_PURPLE,
-        "HISTORICAL":          "#888888",
-    }.get(live_exec_band, C_PURPLE)
-    # SENTINUITY_RUNNER_GOLD_20260621_V3: visual-only runner colour override.
-    # If this render scope has _pct/_state/_state_col, runners at >=75% PnL turn gold.
+    """Read-only Truth Lens using the exact same canonical payload as the hero."""
     try:
-        _runner_gold_pct = 75.0
-        try:
-            if isinstance(locals().get("row"), dict):
-                _runner_gold_pct = float(locals().get("row", {}).get("runner_gold_pct") or 75.0)
-        except Exception:
-            _runner_gold_pct = 75.0
-        if "_pct" in locals() and "_state_col" in locals() and float(_pct) >= float(_runner_gold_pct):
-            _state = "RUNNER"
-            _state_col = "#FFD700"
-    except Exception:
-        pass
+        from services.position_truth_payload import build_position_truth_payload, reason_text
+        _pid=(row.get("position_id") or row.get("id")) if isinstance(row,dict) else None
+        if not _pid:
+            st.caption("Truth Lens unavailable: no position id"); return
+        payload=build_position_truth_payload(int(_pid),matrix_db=str(DB_PATH))
+        _token=str(payload.get("token_name") or "?")
+        _mint=str(payload.get("mint_address") or "")
+        _entry=float(payload.get("entry_price") or 0.0)
+        _obs=payload.get("observed_pnl_pct")
+        _exec=payload.get("executable_pnl_pct")
+        _reason=str(payload.get("reason_code") or "")
+        st.markdown(
+            f"""<div style="font-family:'VT323',monospace;padding:10px;">
+            <h2 style="color:{C_PURPLE};">{html.escape(_token)}</h2>
+            <code style="color:{C_GOLD};background:rgba(0,0,0,.5);padding:5px;">MINT: {html.escape(_mint)}</code>
+            <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px;">
+              <div style="border-top:1px solid {C_CYAN};padding:8px;text-align:center;">OBSERVED<br><span style="color:{C_CYAN};">{'n/a' if _obs is None else f'{float(_obs):+.2f}%'}</span></div>
+              <div style="border-top:1px solid {C_GREEN};padding:8px;text-align:center;">EXECUTABLE<br><span style="color:{C_GREEN};">{'n/a' if _exec is None else f'{float(_exec):+.2f}%'}</span></div>
+              <div style="border-top:1px solid {C_GOLD};padding:8px;text-align:center;">AUTHORITY<br><span style="color:{C_GOLD};">{html.escape(str(payload.get('authority_stage') or 'NONE'))}</span></div>
+            </div>
+            <div style="font-size:.72rem;color:#888;margin-top:8px;">entry ${_entry:.10f} · {html.escape(reason_text(_reason))}</div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+        render_living_trade_meter(payload)
+    except Exception as e:
+        st.caption(f"Truth Lens unavailable: {type(e).__name__}")
 
-    st.markdown(f"""<div style="font-family:'VT323',monospace;padding:10px;">
-        <h2 style="color:{C_PURPLE};">{token}</h2>
-        <code style="color:{C_GOLD};background:rgba(0,0,0,0.5);padding:5px;">MINT: {mint}</code>
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:20px;">
-            <div style="border:1px solid {C_GREEN}55;padding:12px;border-radius:8px;text-align:center;">
-                ENTRY<br><span style="color:{C_GREEN};font-size:0.75rem;">${entry:.10f}</span>
-            </div>
-            <div style="border:1px solid {C_GOLD}55;padding:12px;border-radius:8px;text-align:center;">
-                EXEC PRICE<br><span style="color:{C_GOLD};font-size:0.75rem;">${current:.10f}</span>
-            </div>
-            <div style="border:1px solid {age_col}55;padding:12px;border-radius:8px;text-align:center;">
-                STATUS [{freshness}]<br><span style="color:{age_col};font-size:0.82rem;">{age_str}</span>
-                <div style="font-size:0.66rem;color:#888;margin-top:2px;">{data_source}</div>
-            </div>
-        </div>
-        <div style="margin-top:15px;padding:24px;background:{pcol}22;border:2px solid {pcol};border-radius:12px;text-align:center;">
-            <div style="font-size:0.85rem;opacity:0.8;letter-spacing:2px;">EXECUTION MOVE</div>
-            <div style="font-size:3rem;font-weight:bold;color:{pcol};line-height:1.1;">{pct_moved:+.2f}%</div>
-            <div style="font-size:1.6rem;color:{pcol};margin-top:4px;">${pnl:+.2f} USD</div>
-            <div style="margin-top:10px;padding:6px 12px;background:{band_col}33;border:1px solid {band_col};border-radius:6px;display:inline-block;">
-                <span style="color:{band_col};font-size:0.8rem;letter-spacing:2px;">{live_exec_band}</span>
-            </div>
-            <div style="font-size:0.66rem;color:#888;margin-top:8px;opacity:0.7;">RAW DELTA: {raw_delta:+.10f}</div>
-        </div>
-    </div>""", unsafe_allow_html=True)
-
-    # Living trade meter - visual interpolation layer, no DB writes
-    render_living_trade_meter(row)
 
 def compile_truth_stream(proposals_df: pd.DataFrame, debate_df: pd.DataFrame) -> list[dict]:
     if proposals_df.empty: return []
@@ -5102,7 +4928,7 @@ def _fetch_feed_rows_inline(db_path) -> list:
                     "side": "BUY",
                     "src": "paper_positions",
                     "mode": mode,
-                    "name": _s(_cell(r, selected, "token_name", "")),
+                    "name": _sx_row_label(r, selected),
                     "symbol": _s(_cell(r, selected, "token_symbol", "")),
                     "mint": mint,
                     "status": _s(_cell(r, selected, "status", "OPEN")),
@@ -5204,7 +5030,7 @@ def _fetch_feed_rows_inline(db_path) -> list:
                     "side": "SELL",
                     "src": "paper_positions",
                     "mode": mode,
-                    "name": _s(_cell(r, selected, "token_name", "")),
+                    "name": _sx_row_label(r, selected),
                     "symbol": _s(_cell(r, selected, "token_symbol", "")),
                     "mint": _s(_cell(r, selected, "mint_address", "")),
                     "status": "CLOSED",
@@ -5339,7 +5165,7 @@ def _fetch_feed_rows_inline(db_path) -> list:
                     "side": side,
                     "src": "paper_executions",
                     "mode": mode,
-                    "name": _s(r["token_name"]),
+                    "name": _sx_row_label(r),
                     "symbol": _s(r["token_symbol"]),
                     "mint": mint,
                     "status": status,
@@ -5784,21 +5610,11 @@ def render_unified_execution_lanes() -> None:
         _pcol   = "#14F195" if _pct >= 0 else "#FF073A"
         _bcol   = "#14F195" if _badge == "LIVE" else (
                   "#FF073A" if _badge in ("STALE","STALE_EXEC","NO_DATA","NO_EXEC_DATA") else "#FFD700")
-        st.markdown(
-            f"<div style='display:flex;justify-content:space-between;"
-            f"align-items:center;padding:6px 12px;margin-bottom:2px;"
-            f"border-radius:6px;border-left:3px solid {_pcol};"
-            f"background:rgba(255,255,255,0.02);"
-            f"font-family:Share Tech Mono,monospace;font-size:0.72rem;'>"
-            f"<span style='color:#8EF9FF;'>{html.escape(_token)}</span>"
-            f"<span style='color:{_pcol};font-weight:bold;'>"
-            f"{(_pct_raw is not None and f'{_pct:+.2f}%&nbsp;&nbsp;{chr(36)}{_pnl:+.3f}' or ('?? GATE BLOCKED' if _badge == 'GATE_BLOCKED' else 'NO EXEC DATA'))}</span>"
-            f"<span style='color:{_bcol};font-size:0.66rem;'>"
-            f"[{_badge}&nbsp;{_age}]</span>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-        # PRESSURE GAUGE METER — SL(red)→→TP(green) per trade
+        # SIGNOFF_UI_SINGLE_LIVE_CARD_20260808:
+        # render_living_trade_meter already contains token, PnL, freshness/source
+        # badge and the SL→TP path. The former compact row repeated the same
+        # position immediately above it, producing the visible double-card bug.
+        # Keep one canonical representation only.
         render_living_trade_meter(_t_row)
 
     render_runner_observability_panel(DB_PATH)
@@ -8257,6 +8073,211 @@ def render_living_cortex():
                 )
             _debate_html += "</div>"
             st.markdown(_debate_html, unsafe_allow_html=True)
+
+            # ── GITHUB DISCOVERY EXPEDITION ─────────────────────────────────
+            # SENTINUITY_GITHUB_EXPEDITION_20260810
+            # This is a read-only view over github_scout provenance. It sits
+            # directly beneath the Debate Chamber so the operator can follow
+            # the Council from curiosity -> inspection -> abstraction -> build.
+            # Fieldcraft scores are temporary model-era reconnaissance scores;
+            # they NEVER alter Council authority, quorum or Golden Latch policy.
+            try:
+                _gx_state = pd.DataFrame()
+                _gx_find = pd.DataFrame()
+                _gx_scores = pd.DataFrame()
+                with sqlite3.connect(str(DB_PATH), timeout=2.0) as _gx_conn:
+                    _gx_tables = {str(r[0]) for r in _gx_conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                if "github_expedition_state" in _gx_tables:
+                    _gx_state = query_db("SELECT * FROM github_expedition_state WHERE singleton=1")
+                if "github_discovery_ledger" in _gx_tables:
+                    _gx_find = query_db("""
+                        SELECT discovery_id,created_at,cycle_no,mode,project_key,topic,
+                               found_by,model_id,repository,repository_url,commit_sha,
+                               licence,stars,language,files_examined,extracted_principle,
+                               relevance_reason,safety_status,safety_findings,score,
+                               colour_band,value_label,disposition,inspiration_id
+                        FROM github_discovery_ledger
+                        ORDER BY created_at DESC, score DESC LIMIT 18
+                    """)
+                if "github_agent_field_score" in _gx_tables:
+                    _gx_scores = query_db("""
+                        SELECT agent_name,model_id,discoveries,high_value,noise_rejected,
+                               cumulative_score,last_score,last_cycle,updated_at
+                        FROM github_agent_field_score
+                        ORDER BY updated_at DESC LIMIT 8
+                    """)
+
+                _gx_colours = {
+                    'GREEN': '#14F195', 'GOLD': '#FFD700', 'CYAN': '#8EF9FF',
+                    'AMBER': '#FFB347', 'RED': '#FF073A', 'GREY': '#777B88'
+                }
+                _gx_mode_colours = {
+                    'BUILDOUT': '#FFD700', 'EDGE_HUNT': '#14F195', 'FRONTIER': '#8EF9FF'
+                }
+                _gx_mode_names = {
+                    'BUILDOUT': 'BUILDING THE ORGANISM',
+                    'EDGE_HUNT': 'HUNTING FOR TRANSFERABLE EDGE',
+                    'FRONTIER': 'SCOUTING THE FRONTIER'
+                }
+                _gx_stage_names = {
+                    'LEAVING THE TRAILHEAD': 'LEAVING THE TRAILHEAD',
+                    'FOLLOWING A NEW TRAIL': 'FOLLOWING A NEW TRAIL',
+                    'LOOKING CLOSER': 'LOOKING CLOSER',
+                    'BACK AT COUNCIL CAMP': 'BACK AT COUNCIL CAMP',
+                    'WAITING FOR GITHUB ACCESS': 'WAITING FOR GITHUB ACCESS'
+                }
+
+                if _gx_state is not None and not _gx_state.empty:
+                    _gs = _gx_state.iloc[0]
+                    _gm = str(_gs.get('current_mode','BUILDOUT') or 'BUILDOUT').upper()
+                    _gmc = _gx_mode_colours.get(_gm, '#8EF9FF')
+                    _gml = _gx_mode_names.get(_gm, str(_gs.get('mode_label',_gm) or _gm))
+                    _gst = str(_gs.get('status','TRAILHEAD') or 'TRAILHEAD').upper()
+                    _gstl = _gx_stage_names.get(_gst, _gst.replace('_',' '))
+                    _gquery = html.escape(str(_gs.get('active_query','') or ''))
+                    _gproj = html.escape(str(_gs.get('current_project','') or '').replace('_',' '))
+                    _gnote = html.escape(str(_gs.get('last_note','') or ''))
+                    try: _gseen = int(_gs.get('repositories_seen',0) or 0)
+                    except Exception: _gseen = 0
+                    try: _gdisc = int(_gs.get('discoveries_recorded',0) or 0)
+                    except Exception: _gdisc = 0
+                    try: _gcycle = int(_gs.get('total_cycles',0) or 0)
+                    except Exception: _gcycle = 0
+                    try: _gboot = int(_gs.get('bootstrap_remaining',0) or 0)
+                    except Exception: _gboot = 0
+
+                    _journey_steps = ['TRAILHEAD','SEARCHING','CLOSE INSPECTION','COUNCIL CAMP','FORGE']
+                    _stage_i = 0
+                    if 'TRAIL' in _gst: _stage_i = 0
+                    elif 'FOLLOWING' in _gst: _stage_i = 1
+                    elif 'CLOSER' in _gst: _stage_i = 2
+                    elif 'COUNCIL CAMP' in _gst: _stage_i = 3
+                    _journey = ""
+                    for _ji, _jl in enumerate(_journey_steps):
+                        _jc = _gmc if _ji <= _stage_i else 'rgba(142,249,255,.18)'
+                        _journey += (
+                            f"<span style='color:{_jc};font-family:Share Tech Mono,monospace;"
+                            f"font-size:.66rem;letter-spacing:1.2px;white-space:nowrap;'>{_jl}</span>"
+                            + ("<span style='color:rgba(142,249,255,.18);padding:0 7px;'>→</span>" if _ji < len(_journey_steps)-1 else "")
+                        )
+
+                    _gx_html = (
+                        "<div style='margin:-1px 0 12px;border:1px solid rgba(142,249,255,.18);border-top-color:rgba(153,69,255,.24);"
+                        "border-radius:0 0 12px 12px;background:radial-gradient(circle at 8% 0%,rgba(153,69,255,.10),transparent 34%),linear-gradient(135deg,rgba(5,15,15,.84),rgba(8,3,19,.76));overflow:hidden;box-shadow:0 18px 46px rgba(0,0,0,.18);'>"
+                        "<div style='padding:10px 12px;border-bottom:1px solid rgba(142,249,255,.09);'>"
+                        "<div style='display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;'>"
+                        "<div><div style='font-family:Orbitron,sans-serif;font-size:.68rem;letter-spacing:2.8px;color:#8EF9FF;'>"
+                        "EXPEDITION THREAD · THE COUNCIL GOES BEYOND THE TREE</div>"
+                        "<div style='color:#8f8a9d;font-family:Share Tech Mono,monospace;font-size:.67rem;margin-top:4px;line-height:1.55;'>"
+                        "This is part of the Debate Chamber: NUGGET follows the trail · IVARIS challenges the find · RHIZA connects it · POLARIS decides whether it deserves a build · Forge writes Sentinuity-native logic. External code is never executed.</div></div>"
+                        f"<div style='text-align:right;'><span style='display:inline-block;color:{_gmc};border:1px solid {_gmc}66;"
+                        f"background:{_gmc}11;padding:4px 9px;border-radius:999px;font-family:Share Tech Mono,monospace;"
+                        f"font-size:.66rem;letter-spacing:1px;'>GITHUB MODE · {_gml}</span>"
+                        f"<div style='color:#777;font-family:Share Tech Mono,monospace;font-size:.66rem;margin-top:4px;'>EXPEDITION {_gcycle} · {_gstl}</div></div></div>"
+                        f"<div style='display:flex;align-items:center;flex-wrap:wrap;margin-top:10px;'>{_journey}</div>"
+                        "</div>"
+                        "<div style='display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:rgba(142,249,255,.08);'>"
+                        f"<div style='background:rgba(4,9,11,.96);padding:8px 10px;'><div style='color:#666;font-size:.62rem;letter-spacing:1px;'>REPOSITORIES SEEN</div><b style='color:#D8D8E8'>{_gseen}</b></div>"
+                        f"<div style='background:rgba(4,9,11,.96);padding:8px 10px;'><div style='color:#666;font-size:.62rem;letter-spacing:1px;'>DISCOVERIES RECORDED</div><b style='color:{_gmc}'>{_gdisc}</b></div>"
+                        f"<div style='background:rgba(4,9,11,.96);padding:8px 10px;'><div style='color:#666;font-size:.62rem;letter-spacing:1px;'>CURRENT TRAIL</div><b style='color:#B8A7FF;font-size:.72rem'>{_gproj or 'between trails'}</b></div>"
+                        f"<div style='background:rgba(4,9,11,.96);padding:8px 10px;'><div style='color:#666;font-size:.62rem;letter-spacing:1px;'>BOOTSTRAP EXPEDITIONS LEFT</div><b style='color:#FFB347'>{_gboot}</b></div>"
+                        "</div>"
+                    )
+                    if _gquery:
+                        _gx_html += (
+                            "<div style='padding:8px 12px;border-top:1px solid rgba(255,255,255,.035);font-family:Share Tech Mono,monospace;font-size:.7rem;color:#8f8a9d;'>"
+                            f"THE QUESTION THEY ARE FOLLOWING · <span style='color:#cfdce0'>{_gquery}</span></div>"
+                        )
+                    elif _gnote:
+                        _gx_html += (
+                            "<div style='padding:8px 12px;border-top:1px solid rgba(255,255,255,.035);font-family:Share Tech Mono,monospace;font-size:.7rem;color:#8f8a9d;'>"
+                            f"FIELD NOTE · <span style='color:#cfdce0'>{_gnote[:520]}</span></div>"
+                        )
+
+                    _quest = {
+                        'BUILDOUT': 'BUILD QUEST · turn discoveries into visible Intelligence / Substrate / self-building organism improvements',
+                        'EDGE_HUNT': 'EDGE QUEST · extract hypotheses for Solana entry, smart-money, copytrade and launch logic — then prove them on our own outcomes',
+                        'FRONTIER': 'FRONTIER QUEST · borrow mature architecture patterns for memory, provenance, orchestration and self-repair',
+                    }.get(_gm, 'COUNCIL QUEST · inspect, debate, adapt, measure')
+                    _gx_html += (
+                        f"<div style='margin:8px 10px 0;padding:8px 10px;border:1px solid {_gmc}22;border-radius:7px;"
+                        f"background:{_gmc}08;color:#cfdce0;font-family:Share Tech Mono,monospace;font-size:.68rem;line-height:1.5;'>"
+                        f"<span style='color:{_gmc};letter-spacing:1px;'>CURRENT QUEST</span> · {html.escape(_quest)}</div>"
+                    )
+
+                    if _gx_find is not None and not _gx_find.empty:
+                        _gx_html += "<div style='padding:8px 10px 10px;'>"
+                        for _, _gf in _gx_find.head(8).iterrows():
+                            _band = str(_gf.get('colour_band','GREY') or 'GREY').upper()
+                            _bc = _gx_colours.get(_band, '#777B88')
+                            _vl = html.escape(str(_gf.get('value_label','DISCOVERY') or 'DISCOVERY'))
+                            _repo = html.escape(str(_gf.get('repository','Unknown repository') or 'Unknown repository'))
+                            _url = str(_gf.get('repository_url','') or '')
+                            _principle = html.escape(str(_gf.get('extracted_principle','') or ''))
+                            _reason = html.escape(str(_gf.get('relevance_reason','') or ''))
+                            _lic = html.escape(str(_gf.get('licence','NOT RESOLVED') or 'NOT RESOLVED'))
+                            _safe = html.escape(str(_gf.get('safety_status','UNSCREENED') or 'UNSCREENED'))
+                            _files = html.escape(str(_gf.get('files_examined','') or 'repository metadata only'))
+                            _finder = html.escape(str(_gf.get('found_by','NUGGET') or 'NUGGET'))
+                            _model = html.escape(str(_gf.get('model_id','') or 'current reconnaissance model'))
+                            _sha = html.escape(str(_gf.get('commit_sha','') or 'not resolved')[:12])
+                            _disp = html.escape(str(_gf.get('disposition','COUNCIL_REVIEW') or 'COUNCIL_REVIEW').replace('_',' '))
+                            try: _score = float(_gf.get('score',0) or 0)
+                            except Exception: _score = 0.0
+                            try: _stars = int(_gf.get('stars',0) or 0)
+                            except Exception: _stars = 0
+                            _repo_link = f"<a href='{html.escape(_url)}' target='_blank' rel='noopener noreferrer' style='color:#D8D8E8;text-decoration:none;'>{_repo}</a>" if _url.startswith('http') else _repo
+                            _gx_html += (
+                                f"<details style='margin:5px 0;border:1px solid {_bc}33;border-left:3px solid {_bc};"
+                                "border-radius:7px;background:rgba(255,255,255,.018);'>"
+                                "<summary style='cursor:pointer;list-style:none;padding:8px 10px;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;'>"
+                                f"<span style='min-width:0;'><span style='display:block;color:{_bc};font-family:Share Tech Mono,monospace;font-size:.64rem;letter-spacing:1px;'>{_vl}</span>"
+                                f"<span style='display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:Share Tech Mono,monospace;font-size:.78rem;'>{_repo_link}</span></span>"
+                                f"<span style='color:{_bc};font-family:Orbitron,sans-serif;font-size:.72rem;white-space:nowrap;'>{_score:.0f} / 100</span></summary>"
+                                "<div style='padding:0 10px 10px 12px;border-top:1px solid rgba(255,255,255,.04);'>"
+                                f"<div style='margin:7px 0;color:#C6D5D8;font-size:.78rem;line-height:1.55;'>{_principle}</div>"
+                                f"<div style='color:#8f8a9d;font-family:Share Tech Mono,monospace;font-size:.66rem;line-height:1.65;'>"
+                                f"FOUND BY {_finder} · MODEL {_model}<br>WHY IT MATTERS · {_reason}<br>"
+                                f"LICENCE · {_lic} · SAFETY SCREEN · {_safe} · COMMIT · {_sha} · STARS · {_stars}<br>"
+                                f"FILES LOOKED AT · {_files}<br>"
+                                f"COUNCIL CAMP · {_disp} · if promoted, Forge rewrites the principle against Sentinuity's own contracts and evidence</div></div></details>"
+                            )
+                        _gx_html += "</div>"
+
+                    if _gx_scores is not None and not _gx_scores.empty:
+                        _gx_html += (
+                            "<div style='padding:8px 10px;border-top:1px solid rgba(142,249,255,.08);'>"
+                            "<div style='color:#777;font-family:Share Tech Mono,monospace;font-size:.62rem;letter-spacing:1.2px;margin-bottom:5px;'>"
+                            "FIELDCRAFT SCORE · PATTERN RECOGNITION ONLY · DOES NOT CHANGE COUNCIL AUTHORITY</div>"
+                            "<div style='display:flex;gap:6px;flex-wrap:wrap;'>"
+                        )
+                        for _, _sf in _gx_scores.head(6).iterrows():
+                            _sm = html.escape(str(_sf.get('model_id','model') or 'model'))
+                            try: _sd = int(_sf.get('discoveries',0) or 0)
+                            except Exception: _sd = 0
+                            try: _sh = int(_sf.get('high_value',0) or 0)
+                            except Exception: _sh = 0
+                            try:
+                                _avg = float(_sf.get('cumulative_score',0) or 0) / max(1,_sd)
+                            except Exception: _avg = 0.0
+                            _sc = '#14F195' if _avg >= 70 else ('#FFD700' if _avg >= 55 else '#8EF9FF')
+                            _gx_html += (
+                                f"<span style='border:1px solid {_sc}33;background:{_sc}0d;border-radius:999px;padding:4px 8px;"
+                                f"color:#BFC9CC;font-family:Share Tech Mono,monospace;font-size:.64rem;'>"
+                                f"NUGGET · {_sm} · {_avg:.0f} average · {_sh} high-value</span>"
+                            )
+                        _gx_html += "</div></div>"
+                    _gx_html += "</div>"
+                    st.markdown(_gx_html, unsafe_allow_html=True)
+                else:
+                    st.markdown(
+                        "<div style='margin:0 0 12px;padding:10px 12px;border:1px solid rgba(142,249,255,.12);"
+                        "border-radius:8px;background:rgba(5,12,14,.52);color:#777;font-family:Share Tech Mono,monospace;"
+                        "font-size:.68rem;letter-spacing:1px;'>THE TRAIL BEYOND · GITHUB DISCOVERY EXPEDITION · "
+                        "AWAITING FIRST SCOUT CYCLE</div>", unsafe_allow_html=True)
+            except Exception as _gx_exc:
+                st.caption(f"GitHub discovery expedition unavailable: {type(_gx_exc).__name__}")
 
 
             # Compact Council Workstream — all functionality retained, card wall removed.

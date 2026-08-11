@@ -1321,7 +1321,14 @@ def _render_genesis_macro_map(query_db) -> None:
     p2_pct = min(100, int((p2_debates / 15) * 100)) if p1_pct >= 25 else 0
     p3_pct = min(100, int((p3_proofs / 20) * 100)) if p2_pct >= 25 else 0
     p4_pct = min(100, int((p4_sims / 50) * 100)) if p3_pct >= 25 else 0
-    p5_pct = 100 if is_live else (35 if p4_pct >= 50 else 0)
+
+    # SIGNOFF_UI_TRUTH_20260810: PH5 is an operating MODE, not a completion
+    # percentage.  A live-mode bit must never manufacture a green 100% readiness
+    # bar above incomplete prerequisite phases.  Keep a conservative readiness
+    # contribution for ETA math only; the PH5 row itself is rendered as state.
+    prereq_pcts = [p1_pct, p2_pct, p3_pct, p4_pct]
+    prereq_done = sum(1 for _pct in prereq_pcts if _pct >= 100)
+    p5_pct = 100 if (is_live and prereq_done == 4) else 0
 
     phase_pcts = [p1_pct, p2_pct, p3_pct, p4_pct, p5_pct]
     total_pct = sum(phase_pcts) / max(1, len(phase_pcts))
@@ -1369,9 +1376,10 @@ def _render_genesis_macro_map(query_db) -> None:
         {
             "name": "SOVEREIGN DEPLOYMENT",
             "pct": p5_pct,
-            "desc": "Live-readiness, approval gate, capital authorization",
+            "desc": "Operating mode state; prerequisite completion is reported separately",
             "agents": "GOVERNOR / OPERATOR",
-            "metric": f"mode: {trading_mode.upper() or 'PAPER'}",
+            "metric": f"MODE: {trading_mode.upper() or 'PAPER'} · PREREQUISITES {prereq_done}/4",
+            "state_only": True,
         },
     ]
 
@@ -1577,11 +1585,19 @@ def _render_genesis_macro_map(query_db) -> None:
     rows_html = []
     for i, ph in enumerate(phases):
         pct = max(0, min(100, int(ph["pct"])))
+        state_only = bool(ph.get("state_only"))
         is_done = pct >= 100
         is_active = i == active_idx and not is_done
-        is_blocked = bool(blocker_msg) and is_active
+        is_blocked = bool(blocker_msg) and is_active and not state_only
         cls = "blocked" if is_blocked else ("done" if is_done else ("active" if is_active else ""))
-        accent = "#FF4500" if is_blocked else ("#00FF66" if is_done else ("#FF00FF" if is_active else "#BBBBBB"))
+        if state_only:
+            # MODE=LIVE is exposure/state, not evidence of readiness.  Ember
+            # until every prerequisite phase is complete; only then may it use
+            # the healthy green register.
+            accent = "#00FF66" if (is_live and prereq_done == 4) else ("#FFB347" if is_live else "#BBBBBB")
+            cls = "done" if (is_live and prereq_done == 4) else ""
+        else:
+            accent = "#FF4500" if is_blocked else ("#00FF66" if is_done else ("#FF00FF" if is_active else "#BBBBBB"))
         margin = min(i * 24, 96)
         blocker_html = ""
         if is_blocked:
@@ -1590,6 +1606,16 @@ def _render_genesis_macro_map(query_db) -> None:
                 + html.escape(blocker_msg[:160])
                 + "<br>→ Submit required data via the OPERATOR PETITION MEMBRANE below.</div>"
             )
+        metric_html = (
+            "<div class='gen-metric'>{}</div>".format(html.escape(ph["metric"]))
+            if state_only else
+            "<div class='gen-metric'>{} · {}%</div>".format(html.escape(ph["metric"]), pct)
+        )
+        track_html = "" if state_only else (
+            "<div class='gen-track'><div class='gen-fill {}' style='width:{}%;'></div></div>".format(
+                "done" if is_done else "", pct
+            )
+        )
         rows_html.append(
             "<div class='gen-row' style='margin-left:{margin}px;'>"
             "<div class='gen-num'>PH {num}</div>"
@@ -1599,9 +1625,7 @@ def _render_genesis_macro_map(query_db) -> None:
             "<div class='gen-agent'>{agents}</div>"
             "</div>"
             "<div class='gen-desc'>{desc}</div>"
-            "<div class='gen-metric'>{metric} · {pct}%</div>"
-            "<div class='gen-track'><div class='gen-fill {done_cls}' style='width:{pct}%;'></div></div>"
-            "{blocker}"
+            "{metric_html}{track_html}{blocker}"
             "</div></div>".format(
                 margin=margin,
                 num=i + 1,
@@ -1610,9 +1634,8 @@ def _render_genesis_macro_map(query_db) -> None:
                 name=html.escape(ph["name"]),
                 agents=html.escape(ph["agents"]),
                 desc=html.escape(ph["desc"]),
-                metric=html.escape(ph["metric"]),
-                pct=pct,
-                done_cls="done" if is_done else "",
+                metric_html=metric_html,
+                track_html=track_html,
                 blocker=blocker_html,
             )
         )

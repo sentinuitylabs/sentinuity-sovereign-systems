@@ -49,8 +49,8 @@ CANONICAL_COUNCIL = [
         "policy": {
             "low": "gpt-5.4-nano",
             "medium": "gpt-5.4-mini",
-            "high": "gpt-5.5",
-            "live_or_execution": "gpt-5.5",
+            "high": "gpt-5.4-mini",
+            "live_or_execution": "gpt-5.4-mini",
         },
     },
     {
@@ -61,16 +61,16 @@ CANONICAL_COUNCIL = [
         "authority_level": "reviewer",
         "can_apply_code": 0,
         "can_block": 1,
-        "model_family": "anthropic",
-        "default_model": "claude-opus",
-        "current_model": "claude-opus",
+        "model_family": "nvidia-nim",
+        "default_model": "qwen/qwen3.5-397b-a17b",
+        "current_model": "qwen/qwen3.5-397b-a17b",
         "model_tier": "critic",
-        "evolution_state": "baseline",
+        "evolution_state": "registry-managed",
         "policy": {
-            "low": "claude-sonnet",
-            "medium": "claude-opus",
-            "high": "claude-opus",
-            "live_or_execution": "claude-opus",
+            "low": "NIM_AUTO",
+            "medium": "NIM_AUTO",
+            "high": "NIM_AUTO",
+            "live_or_execution": "NIM_AUTO",
         },
     },
     {
@@ -549,6 +549,15 @@ def choose_model(agent: dict[str, Any], task: sqlite3.Row) -> tuple[str, str, st
     risk = str(task["risk_level"] or "LOW").upper()
     text = " ".join(str(task[k] or "") for k in ["target_tab", "task_type", "title", "description"]).lower()
     policy = agent.get("policy", {})
+    if agent.get("agent_name") == "IVARIS":
+        try:
+            from services.nvidia_model_registry import get_assignment
+            selected = str(get_assignment("IVARIS", agent.get("default_model", "qwen/qwen3.5-397b-a17b"))
+                           or agent.get("default_model", "qwen/qwen3.5-397b-a17b"))
+        except Exception:
+            selected = str(agent.get("default_model", "qwen/qwen3.5-397b-a17b"))
+        tier = "critical" if risk == "HIGH" or any(word in text for word in ["execution", "live", "wallet", "signing", "swap", "engine"]) else ("signoff" if risk == "MEDIUM" else "critic")
+        return selected, tier, "registry-managed", f"NVIDIA NIM registry; risk={risk}; task={task['task_type']}; target={task['target_tab']}"
     if risk == "HIGH" or any(word in text for word in ["execution", "live", "wallet", "signing", "swap", "engine"]):
         selected = policy.get("live_or_execution") or policy.get("high") or agent["default_model"]
         tier = "critical"
@@ -596,6 +605,20 @@ def seed_roles(conn: sqlite3.Connection) -> None:
             agent["evolution_state"], json.dumps(agent["policy"]),
             "Canonical six-node council seat. Model may evolve/devolve per task; name stays fixed.", now,
         ))
+    # Cost-policy migration: older DBs may still advertise an automatically
+    # evolved Polaris frontier model. Keep the UI/registry truthful by bringing
+    # those persisted automatic assignments back to the signed baseline.
+    _allow_frontier = str(os.getenv("POLARIS_ALLOW_FRONTIER_AUTO", "0")).strip().lower() in {"1","true","yes","on"}
+    if not _allow_frontier:
+        conn.execute("""
+            UPDATE council_role_registry
+            SET current_model='gpt-5.4-mini', default_model='gpt-5.4-mini',
+                model_tier=CASE WHEN model_tier='fast' THEN 'signoff' ELSE model_tier END,
+                updated_at=?
+            WHERE agent_name='POLARIS'
+              AND lower(COALESCE(current_model,'')) IN ('gpt-5.5','gpt-5.4','gpt-4o','gpt-4o-mini')
+        """, (now,))
+
     for name, svc, role in SUPPORT_SYSTEMS:
         conn.execute("""
             INSERT INTO support_system_registry(name, service_name, role, updated_at)

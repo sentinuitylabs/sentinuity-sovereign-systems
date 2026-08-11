@@ -53,6 +53,32 @@ def _is_db_lock(exc: BaseException) -> bool:
         "database is locked" in blob or "database table is locked" in blob or "sqlite_busy" in blob
     )
 
+def _publish_substrate_build_active() -> None:
+    """Set SUBSTRATE_BUILD_ACTIVE when the trading lane is idle. Fail-silent."""
+    try:
+        _db = sqlite3.connect("sentinuity_matrix.db", timeout=5)
+        try:
+            _db.execute("PRAGMA busy_timeout=5000")
+            _db.row_factory = sqlite3.Row
+            _open_pos = _db.execute(
+                "SELECT COUNT(*) FROM paper_positions WHERE UPPER(COALESCE(status,''))='OPEN'"
+            ).fetchone()[0]
+            _recent_cog = _db.execute(
+                "SELECT COUNT(*) FROM cognition_log "
+                "WHERE CAST(COALESCE(timestamp,0) AS REAL) >= ?", (time.time() - 300,)
+            ).fetchone()[0]
+            _db.execute(
+                "INSERT INTO system_config(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("SUBSTRATE_BUILD_ACTIVE", "1" if (_open_pos == 0 and _recent_cog < 5) else "0"),
+            )
+            _db.commit()
+        finally:
+            _db.close()
+    except Exception:
+        pass
+
+
 # Stage pipeline order
 STAGES = ["RESEARCH", "DESIGN", "BUILD", "TEST", "SHADOW_SIMULATION", "REVIEW"]
 # Human gate required for these transitions
@@ -85,13 +111,34 @@ def _get_active_projects() -> list[dict]:
     return [dict(r) for r in rows]
 
 def _get_open_forge_count() -> int:
+    """Count unresolved Forge work, including dependency-blocked proposals.
+
+    SIGNOFF_10H_COUNCIL_BACKPRESSURE_20260811:
+    critic_unavailable is still active work waiting on a mandatory dependency.
+    Treating only status='open' as queued made every critic outage look like an
+    empty queue and generated duplicate RESEARCH proposals roughly every poll.
+    """
     with get_connection() as db:
         return db.execute("""
             SELECT COUNT(*) FROM polaris_proposals
             WHERE proposal_domain='FORGE'
-              AND status='open'
-              AND COALESCE(cooldown_until, 0) < ?
-        """, (time.time(),)).fetchone()[0]
+              AND status IN ('open','debating','critic_unavailable','debate_retryable','debate_error')
+        """).fetchone()[0]
+
+
+def _equivalent_unresolved_exists(project_key: str, stage: str) -> bool:
+    """True when the same project/stage already has unresolved work."""
+    with get_connection() as db:
+        row = db.execute("""
+            SELECT id FROM polaris_proposals
+            WHERE proposal_domain='FORGE'
+              AND project_key=?
+              AND stage=?
+              AND status IN ('open','debating','critic_unavailable','debate_retryable','debate_error')
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (project_key, stage)).fetchone()
+    return row is not None
 
 def _get_project_stage(project_key: str) -> str:
     with get_connection() as db:
@@ -205,6 +252,14 @@ def _generate_curiosity_proposal(project: dict) -> int | None:
     stage = project["current_stage"]
     if stage not in STAGE_PROMPTS:
         log.warning("Project %s in unknown stage %s", project["project_key"], stage)
+        return None
+
+    # Never manufacture a new row merely because the mandatory critic/provider
+    # is offline.  The existing proposal remains the canonical work item and is
+    # eligible for debate-engine/governor retry when its dependency recovers.
+    if _equivalent_unresolved_exists(project["project_key"], stage):
+        log.info("Curiosity backpressure: unresolved %s/%s proposal already exists",
+                 project["project_key"], stage)
         return None
 
     evidence = _compress_evidence(project["project_key"])
@@ -427,6 +482,12 @@ def run() -> None:
 
             if generated > 0:
                 log.info("Curiosity: generated %d new forge proposals", generated)
+
+            # EDGE_RESTORE_20260727: the SUBSTRATE_BUILD_ACTIVE writer was deleted
+            # together with the old traceback handler. Nothing else sets the flag, so
+            # the build lane stayed dormant and produced no meaningful output. It is
+            # restored here on the SUCCESS path (never inside an exception handler).
+            _publish_substrate_build_active()
 
             lock_backoff = LOCK_BACKOFF_MIN
             time.sleep(POLL_INTERVAL)
