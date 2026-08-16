@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SENTINUITY OFFLINE RETENTION + VACUUM V8
+SENTINUITY OFFLINE RETENTION + VACUUM V11
 
 Purpose
 -------
@@ -38,13 +38,28 @@ PROTECTED_TABLES = {
     "tax_reserve", "substrate_ledger", "paper_learning_state", "score_performance",
     "security_baseline", "security_lockdown_state", "substrate_strategy_registry",
     "council_role_registry", "support_system_registry", "smart_wallet_profiles",
-    "smart_wallet_sources", "smart_wallet_performance_snapshots",
+    "smart_wallet_sources",
     "wallet_entry_fingerprints", "copytrade_calibration",
     "watched_wallets", "wallet_links", "mint_blacklist", "known_rings",
     "substrate_wallet_state", "db_lights_state", "signal_gate_state",
     "lilypad_harvest_state", "swti_wallet_cursor", "sovereign_aliases",
     "standing_tasklist", "standing_tasks", "polaris_standing_tasks",
     "forge_projects", "code_patches", "patch_apply_journal",
+    # PRICE_TRUTH_SIGNOFF_20260803: never global-tail-trim active or recent
+    # price evidence. execution_engine already applies a bounded time policy.
+    "mark_tape", "mark_quarantine",
+    # Price-truth singleton/health state is durable; telemetry rows below are archived.
+    "price_truth_health",
+}
+
+# High-volume tables with domain-specific retention semantics. These are not
+# generic tails: V11 compacts them with source-aware rules so the hot matrix can
+# stay inside the 10-20 MB operating band without deleting active/live state.
+SPECIAL_COMPACTION_TABLES = {
+    "smart_wallet_performance_snapshots",
+    "mark_quarantine_overflow",
+    "mark_tape",
+    "substrate_price_marks",
 }
 
 TAIL_POLICIES = {
@@ -78,8 +93,9 @@ TAIL_POLICIES = {
     "live_lane_feature_snapshots": 500,
     "live_lane_shadow_candidates": 500,
     "live_shadow_ledger": 500,
+    "paper_live_parity": 400,
+    "fill_provenance": 750,
     "mark_quarantine": 250,
-    "mark_tape": 750,
     "mark_truth_candidate_peaks": 500,
     "market_snapshots": 500,
     "mode_b_decision_ledger": 750,
@@ -98,6 +114,17 @@ TAIL_POLICIES = {
     "polaris_trade_reviews": 300,
     "post_exit_observations": 500,
     "post_exit_ticks": 750,
+    # PRICE_TRUTH_RETENTION_20260809: explicit policies for the dedicated
+    # sentinuity_price_truth.db.  These tables are high-frequency evidence, not
+    # durable control state.  Rows are archive-first, so the hot DB remains
+    # bounded without discarding historical evidence.
+    "price_truth_snapshots": 1500,
+    "peak_executable_quotes": 2000,
+    "peak_onchain_state": 1500,
+    "peak_trade_tape": 1500,
+    "peak_truth_candidates": 1000,
+    "pump_curve_shadow": 1000,
+    "mode3_qualified_peaks": 1000,
     "raw_dna": 750,
     "research_queue": 200,
     "resolved_transactions": 750,
@@ -165,15 +192,49 @@ def size_mb(path: Path) -> float:
     return path.stat().st_size / 1048576 if path.exists() else 0.0
 
 def object_sizes(con: sqlite3.Connection) -> dict[str, float]:
+    """Best-effort object sizing.
+
+    Prefer SQLite's dbstat virtual table. Some Windows/Python SQLite builds are
+    compiled without SQLITE_ENABLE_DBSTAT_VTAB; in that case the old retention
+    report returned an empty object list and the adaptive pass could not explain
+    a large database. Fall back to an approximate table payload scan using
+    length(CAST(column AS BLOB)). The fallback intentionally estimates tables
+    only (not indexes/page slack), but is sufficient to identify large TEXT/BLOB
+    payload owners such as code_vault_snapshots.content.
+    """
     try:
-        return {
-            str(name): float(total or 0) / 1048576
-            for name, total in con.execute(
-                "SELECT name, SUM(pgsize) FROM dbstat GROUP BY name"
-            )
-        }
+        rows = con.execute("SELECT name, SUM(pgsize) FROM dbstat GROUP BY name").fetchall()
+        if rows:
+            return {str(name): float(total or 0) / 1048576 for name, total in rows}
+    except sqlite3.Error:
+        pass
+
+    sizes: dict[str, float] = {}
+    try:
+        tables = [
+            str(r[0]) for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        ]
+        for table in tables:
+            cs = columns(con, table)
+            if not cs:
+                continue
+            # Include a small per-row structural allowance so tiny-column tables
+            # are not reported as exactly zero, while large payload columns still
+            # dominate the ranking.
+            terms = [f"COALESCE(length(CAST({q(c)} AS BLOB)),0)" for c in cs]
+            expr = " + ".join(terms) if terms else "0"
+            try:
+                total = con.execute(
+                    f"SELECT COALESCE(SUM(({expr}) + 24),0) FROM {q(table)}"
+                ).fetchone()[0]
+                sizes[table] = float(total or 0) / 1048576
+            except sqlite3.Error:
+                continue
     except sqlite3.Error:
         return {}
+    return sizes
 
 def top_objects(con: sqlite3.Connection, limit: int = 40) -> list[dict[str, Any]]:
     sizes = object_sizes(con)
@@ -361,6 +422,279 @@ def compact_latest_per_key(
         "policy": f"latest row per {key}",
     }
 
+def offload_hot_payload_column(
+    src: sqlite3.Connection,
+    arc: sqlite3.Connection,
+    table: str,
+    payload_column: str,
+) -> dict[str, Any]:
+    """Archive complete rows, then release a heavy payload column in the hot DB.
+
+    This is for snapshot/cache payloads whose history is already represented by
+    metadata in the hot DB and whose full bytes belong in the archive. Every row
+    with a non-empty payload is copied to the archive *before* the hot value is
+    nulled. Row identity, hashes, timestamps, path metadata and all other columns
+    remain untouched in the hot database.
+    """
+    if not exists(src, table):
+        return {}
+    cs = columns(src, table)
+    if payload_column not in cs:
+        return {"skipped": f"missing column {payload_column}"}
+
+    before_rows = int(src.execute(f"SELECT COUNT(*) FROM {q(table)}").fetchone()[0])
+    payload_rows = int(src.execute(
+        f"SELECT COUNT(*) FROM {q(table)} WHERE {q(payload_column)} IS NOT NULL "
+        f"AND length(CAST({q(payload_column)} AS BLOB)) > 0"
+    ).fetchone()[0])
+    payload_bytes = int(src.execute(
+        f"SELECT COALESCE(SUM(length(CAST({q(payload_column)} AS BLOB))),0) "
+        f"FROM {q(table)} WHERE {q(payload_column)} IS NOT NULL"
+    ).fetchone()[0] or 0)
+    if payload_rows == 0:
+        return {
+            "before_rows": before_rows,
+            "payload_rows_offloaded": 0,
+            "payload_mb_offloaded": 0.0,
+            "policy": f"archive full rows; release hot {payload_column} with schema-valid placeholder",
+        }
+
+    ensure_archive_table(src, arc, table)
+    col_sql = ",".join(q(c) for c in cs)
+    placeholders = ",".join("?" for _ in cs)
+    rows = src.execute(
+        f"SELECT {col_sql} FROM {q(table)} WHERE {q(payload_column)} IS NOT NULL "
+        f"AND length(CAST({q(payload_column)} AS BLOB)) > 0"
+    ).fetchall()
+    if rows:
+        arc.executemany(
+            f"INSERT OR REPLACE INTO {q(table)} ({col_sql}) VALUES ({placeholders})",
+            rows,
+        )
+        arc.commit()
+
+    # Respect the source schema when releasing the hot payload.  Some newer
+    # snapshot tables declare JSON payload columns NOT NULL; blindly assigning
+    # SQL NULL aborts shutdown retention even after the full row was safely
+    # archived.  Choose the smallest schema-valid placeholder instead.
+    info = {str(r[1]): r for r in src.execute(f"PRAGMA table_info({q(table)})").fetchall()}
+    meta = info.get(payload_column)
+    not_null = bool(meta[3]) if meta is not None else False
+    declared_type = str(meta[2] or "").upper() if meta is not None else ""
+    default_sql = meta[4] if meta is not None else None
+
+    replacement: Any = None
+    replacement_label = "NULL"
+    if not_null:
+        name_l = payload_column.lower()
+        if "JSON" in declared_type or "json" in name_l:
+            replacement = "{}"
+            replacement_label = "{}"
+        elif any(t in declared_type for t in ("BLOB", "BINARY")):
+            replacement = sqlite3.Binary(b"")
+            replacement_label = "empty BLOB"
+        else:
+            # Prefer an explicit schema default when it can be decoded safely;
+            # otherwise an empty string is the least destructive TEXT-safe
+            # representation for an archived payload body.
+            if isinstance(default_sql, str):
+                d = default_sql.strip()
+                if len(d) >= 2 and d[0] == d[-1] and d[0] in ("'", '"'):
+                    replacement = d[1:-1]
+                elif d.upper() not in ("NULL", "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"):
+                    try:
+                        replacement = int(d)
+                    except Exception:
+                        try:
+                            replacement = float(d)
+                        except Exception:
+                            replacement = ""
+                else:
+                    replacement = ""
+            else:
+                replacement = ""
+            replacement_label = repr(replacement)
+
+    src.execute(
+        f"UPDATE {q(table)} SET {q(payload_column)}=? "
+        f"WHERE {q(payload_column)} IS NOT NULL AND length(CAST({q(payload_column)} AS BLOB)) > 0",
+        (replacement,),
+    )
+    src.commit()
+    return {
+        "before_rows": before_rows,
+        "payload_rows_offloaded": payload_rows,
+        "payload_mb_offloaded": round(payload_bytes / 1048576, 3),
+        "replacement": replacement_label,
+        "policy": f"archive full rows; hot {payload_column}={replacement_label}",
+    }
+
+
+
+def trim_latest_per_group(
+    src: sqlite3.Connection,
+    arc: sqlite3.Connection,
+    table: str,
+    key_column: str,
+    keep_per_key: int,
+    order_candidates: tuple[str, ...],
+) -> dict[str, Any]:
+    """Archive older group history while keeping a bounded recent working set.
+
+    This is used for provider/asset history where a global tail can accidentally
+    remove every recent row for a low-volume key.  The newest N rows PER KEY stay
+    hot; all older rows are archived first.
+    """
+    if not exists(src, table):
+        return {}
+    cs = set(columns(src, table))
+    if key_column not in cs:
+        return {"skipped": f"missing key column {key_column}"}
+    order_col = next((c for c in order_candidates if c in cs), None)
+    if order_col is None:
+        order_sql = "rowid"
+    else:
+        order_sql = q(order_col)
+
+    total = int(src.execute(f"SELECT COUNT(*) FROM {q(table)}").fetchone()[0])
+    keep_per_key = max(1, int(keep_per_key))
+    keep_ids: set[int] = set()
+    seen: dict[str, int] = {}
+    rows = src.execute(
+        f"SELECT rowid, COALESCE(CAST({q(key_column)} AS TEXT),'') "
+        f"FROM {q(table)} ORDER BY {q(key_column)} ASC, {order_sql} DESC, rowid DESC"
+    ).fetchall()
+    for rowid, key in rows:
+        skey = str(key or "")
+        count = seen.get(skey, 0)
+        if count < keep_per_key:
+            keep_ids.add(int(rowid))
+            seen[skey] = count + 1
+
+    all_ids = {int(r[0]) for r in src.execute(f"SELECT rowid FROM {q(table)}").fetchall()}
+    delete_ids = sorted(all_ids - keep_ids)
+    moved = archive_delete(src, arc, table, delete_ids)
+    return {
+        "before_rows": total,
+        "after_rows": total - moved,
+        "archived_deleted": moved,
+        "groups": len(seen),
+        "keep_per_group": keep_per_key,
+        "policy": f"latest {keep_per_key} per {key_column}; archive older rows",
+    }
+
+
+def trim_mark_tape_preserving_active(
+    src: sqlite3.Connection,
+    arc: sqlite3.Connection,
+    keep_recent_closed: int,
+) -> dict[str, Any]:
+    """Archive historical mark tape while retaining every active-position mark.
+
+    mark_tape is live runner evidence, so active/open position history must never
+    be trimmed by shutdown retention.  For non-active positions, only a bounded
+    recent global tail remains hot; all older rows are still preserved in the
+    archive DB for retrospective analysis.
+    """
+    table = "mark_tape"
+    if not exists(src, table):
+        return {}
+    cs = set(columns(src, table))
+    if "position_id" not in cs:
+        return {"skipped": "mark_tape missing position_id"}
+    total = int(src.execute(f"SELECT COUNT(*) FROM {q(table)}").fetchone()[0])
+    keep_recent_closed = max(100, int(keep_recent_closed))
+
+    active_ids: set[int] = set()
+    if exists(src, "paper_positions"):
+        pcs = set(columns(src, "paper_positions"))
+        if "id" in pcs:
+            status_col = next((c for c in ("status", "state") if c in pcs), None)
+            if status_col:
+                marks = ",".join("?" for _ in ACTIVE_STATES)
+                for r in src.execute(
+                    f"SELECT id FROM paper_positions WHERE UPPER(COALESCE(CAST({q(status_col)} AS TEXT),'')) IN ({marks})",
+                    tuple(sorted(ACTIVE_STATES)),
+                ).fetchall():
+                    try:
+                        active_ids.add(int(r[0]))
+                    except Exception:
+                        pass
+
+    recent_ids = {
+        int(r[0]) for r in src.execute(
+            f"SELECT rowid FROM {q(table)} ORDER BY "
+            + ("ts DESC, " if "ts" in cs else "")
+            + "rowid DESC LIMIT ?",
+            (keep_recent_closed,),
+        ).fetchall()
+    }
+    active_rowids: set[int] = set()
+    if active_ids:
+        marks = ",".join("?" for _ in active_ids)
+        active_rowids = {
+            int(r[0]) for r in src.execute(
+                f"SELECT rowid FROM {q(table)} WHERE position_id IN ({marks})",
+                tuple(sorted(active_ids)),
+            ).fetchall()
+        }
+
+    keep_ids = recent_ids | active_rowids
+    all_ids = {int(r[0]) for r in src.execute(f"SELECT rowid FROM {q(table)}").fetchall()}
+    moved = archive_delete(src, arc, table, sorted(all_ids - keep_ids))
+    return {
+        "before_rows": total,
+        "after_rows": total - moved,
+        "archived_deleted": moved,
+        "active_position_ids_preserved": len(active_ids),
+        "active_rows_preserved": len(active_rowids),
+        "recent_closed_rows_target": keep_recent_closed,
+        "policy": "preserve all active-position tape; archive older non-active history",
+    }
+
+
+def run_special_compactions(
+    con: sqlite3.Connection,
+    arc: sqlite3.Connection,
+    report: dict[str, Any],
+    level: str,
+) -> None:
+    """V11 size-aware compaction for the four objects blocking the 20 MB gate."""
+    operations = report.setdefault("operations" if level == "normal" else "deep_target_operations", {})
+    aggressive = level != "normal"
+
+    if exists(con, "smart_wallet_performance_snapshots"):
+        # Numeric snapshot state remains hot; full raw provider payload is archive material.
+        operations[f"smart_wallet_performance_snapshots_{level}"] = trim_latest_per_group(
+            con, arc, "smart_wallet_performance_snapshots", "wallet_address",
+            3 if aggressive else 8,
+            ("captured_at", "id"),
+        )
+        operations[f"smart_wallet_performance_payload_offload_{level}"] = offload_hot_payload_column(
+            con, arc, "smart_wallet_performance_snapshots", "raw_json"
+        )
+
+    if exists(con, "mark_quarantine_overflow"):
+        operations[f"mark_quarantine_overflow_{level}"] = trim_tail(
+            con, arc, "mark_quarantine_overflow", 50 if aggressive else 150
+        )
+
+    if exists(con, "substrate_price_marks"):
+        operations[f"substrate_price_marks_{level}"] = trim_latest_per_group(
+            con, arc, "substrate_price_marks", "asset",
+            50 if aggressive else 120,
+            ("observed_ts", "created_at", "id"),
+        )
+
+    if exists(con, "mark_tape"):
+        operations[f"mark_tape_{level}"] = trim_mark_tape_preserving_active(
+            con, arc, 300 if aggressive else 1000
+        )
+
+    con.commit()
+    arc.commit()
+
+
 def compact_heartbeats(con: sqlite3.Connection) -> dict[str, Any]:
     output: dict[str, Any] = {}
     for table in ("system_heartbeat", "service_heartbeats"):
@@ -422,7 +756,7 @@ def run_pass(
     threshold_mb = 0.25 if aggressive else 0.5
     auto_keep = 250 if aggressive else 500
     for table in all_tables:
-        if table in policies or table in PROTECTED_TABLES or table in POSITION_POLICIES:
+        if table in policies or table in PROTECTED_TABLES or table in POSITION_POLICIES or table in SPECIAL_COMPACTION_TABLES:
             continue
         lower = table.lower()
         if "position" in lower or "order" in lower:
@@ -435,8 +769,9 @@ def run_pass(
             )
 
     operations = report.setdefault("operations", {})
+    run_special_compactions(con, arc, report, "aggressive" if aggressive else "normal")
     for table, keep in sorted(policies.items()):
-        if table in PROTECTED_TABLES or not exists(con, table):
+        if table in PROTECTED_TABLES or table in SPECIAL_COMPACTION_TABLES or not exists(con, table):
             continue
         actual_keep = min(keep, 250) if aggressive else keep
         try:
@@ -459,6 +794,9 @@ def run_pass(
         operations["code_vault_snapshots"] = compact_latest_per_key(
             con, arc, "code_vault_snapshots", ("file_path", "file_name", "path")
         )
+        operations["code_vault_snapshots_payload_offload"] = offload_hot_payload_column(
+            con, arc, "code_vault_snapshots", "content"
+        )
 
 
 def run_deep_target_pass(
@@ -470,11 +808,21 @@ def run_deep_target_pass(
 
     Every removed row is archived first. Durable registries/state and all active
     positions remain protected. The purpose is to collapse high-churn telemetry
-    tails far enough that VACUUM can return the matrix DB to the 5-10 MB band.
+    tails far enough that VACUUM can return the matrix DB to the 10-20 MB operating band.
     """
     sizes = object_sizes(con)
     operations = report.setdefault("deep_target_operations", {})
     policies = dict(TAIL_POLICIES)
+    run_special_compactions(con, arc, report, "deep")
+    # The code vault is metadata/state plus a very large source-body cache. With
+    # hundreds of tracked files, keeping one complete body per file can exceed
+    # the entire hot-DB budget even when row counts are already minimal.
+    if exists(con, "code_vault_snapshots"):
+        operations["deep_code_vault_payload_offload"] = offload_hot_payload_column(
+            con, arc, "code_vault_snapshots", "content"
+        )
+        con.commit(); arc.commit()
+
 
     all_tables = [
         r[0] for r in con.execute(
@@ -486,7 +834,7 @@ def run_deep_target_pass(
     # Newly introduced churn tables are handled automatically, but only when
     # their names clearly identify them as telemetry/history rather than state.
     for table in all_tables:
-        if table in policies or table in PROTECTED_TABLES or table in POSITION_POLICIES:
+        if table in policies or table in PROTECTED_TABLES or table in POSITION_POLICIES or table in SPECIAL_COMPACTION_TABLES:
             continue
         lower = table.lower()
         if "position" in lower or "order" in lower:
@@ -498,7 +846,7 @@ def run_deep_target_pass(
             )
 
     for table, keep in sorted(policies.items()):
-        if table in PROTECTED_TABLES or not exists(con, table):
+        if table in PROTECTED_TABLES or table in SPECIAL_COMPACTION_TABLES or not exists(con, table):
             continue
         try:
             operations[table] = trim_tail(con, arc, table, min(keep, 50))
@@ -558,7 +906,7 @@ def run_adaptive_target_pass(
         candidates: list[tuple[float, str, int, bool]] = []
 
         for table in table_names:
-            if table in attempted or table in PROTECTED_TABLES:
+            if table in attempted or table in PROTECTED_TABLES or table in SPECIAL_COMPACTION_TABLES:
                 continue
 
             lower = table.lower()
@@ -656,6 +1004,8 @@ def classify_target_blockers(
             classification = "sqlite_autoindex"
         elif name not in table_names:
             classification = "index_or_internal_object"
+        elif name in SPECIAL_COMPACTION_TABLES:
+            classification = "specialized_archive_compaction"
         elif name in PROTECTED_TABLES:
             classification = "protected_durable_state"
         elif name in POSITION_POLICIES or "position" in name.lower():
@@ -724,7 +1074,7 @@ def main() -> int:
         raise SystemExit(f"DB not found: {db}")
 
     report: dict[str, Any] = {
-        "schema_version": "SENTINUITY_RETENTION_V9_SIGNOFF",
+        "schema_version": "SENTINUITY_RETENTION_V11_1_SIGNOFF",
         "database": str(db),
         "archive": str(archive_path),
         "before_mb": round(size_mb(db), 3),
@@ -757,7 +1107,7 @@ def main() -> int:
         return 0
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    backup = db.parent / "db_backups" / f"{db.stem}.FULL_before_retention_v8_{stamp}.db"
+    backup = db.parent / "db_backups" / f"{db.stem}.FULL_before_retention_v11_{stamp}.db"
     consistent_backup(con, backup)
     report["backup"] = str(backup)
     report["rotated_backups"] = rotate_full_backups(db, args.keep_backups)
@@ -867,5 +1217,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as exc:
-        print(f"RETENTION V8 FAILED: {exc}", file=sys.stderr)
+        print(f"RETENTION V11 FAILED: {exc}", file=sys.stderr)
         raise

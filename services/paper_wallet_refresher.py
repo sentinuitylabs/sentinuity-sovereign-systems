@@ -49,9 +49,11 @@ def refresh_once(verbose: bool = True) -> dict:
         if flag and str(flag[0]) == "0":
             return {"skipped": "disabled"}
 
-        w = c.execute("SELECT * FROM paper_wallet LIMIT 1").fetchone()
+        w = c.execute(
+            "SELECT * FROM paper_wallet WHERE wallet_name='main' LIMIT 1"
+        ).fetchone()
         if not w:
-            return {"skipped": "no paper_wallet row"}
+            return {"skipped": "canonical paper_wallet.main row missing"}
         wallet = dict(w)
         starting = float(wallet.get("starting_balance") or 0)
 
@@ -130,14 +132,8 @@ def refresh_once(verbose: bool = True) -> dict:
                 if _col in ss_cols:
                     ss_sets.append(f"{_col}=?")
                     ss_vals.append(float(_val))
-            # In paper mode only, keep wallet_balance non-negative for old gates,
-            # but do not let it masquerade as live wallet truth.
-            if "wallet_balance" in ss_cols:
-                ss_sets.append("wallet_balance=?")
-                ss_vals.append(float(cash))
-            if "initial_capital" in ss_cols:
-                ss_sets.append("initial_capital=?")
-                ss_vals.append(float(starting))
+            # Paper accounting must not overwrite shared funded-wallet state.
+            # paper_wallet.main + paper_* fields remain the paper authority.
             if ss_sets:
                 c.execute("UPDATE system_state SET " + ", ".join(ss_sets) + " WHERE id=1", ss_vals)
         except Exception:

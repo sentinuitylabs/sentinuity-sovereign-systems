@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import sqlite3, time, shutil, re, json, argparse
 from datetime import datetime, timezone
 
@@ -150,26 +151,97 @@ def find_dbs():
         if p.exists() and p not in found:
             found.append(p)
     for p in ROOT.rglob("*.db"):
-        s = str(p).lower()
-        if any(x in s for x in [".venv", "site-packages", "__pycache__", ".git", "backup"]):
+        if _is_excluded_path(p):
             continue
         if p not in found:
             found.append(p)
     return found
 
+# BACKUP_RECURSION_FIX_20260730 -----------------------------------------------
+# Root cause of the 113 GB `backups` tree: discover_dbs() rglob'd every *.db under
+# ROOT while only filtering the substring "backup". Audit trees (`audits`,
+# `audit_outputs`, `_KEEP_IMPORTANT_ARCHIVES`) were therefore swept in, and
+# backup_dbs() created a brand-new timestamped folder on every 10-minute loop
+# with no retention cap at all. Each run re-copied the previous run's captures.
+EXCLUDED_DIR_NAMES = {
+    "backups", "audits", "audit_outputs", "db_backups",
+    "_KEEP_IMPORTANT_ARCHIVES", "_ui_backups", "_prelaunch_patch_backups",
+    "__pycache__", ".git", ".venv", "venv", "site-packages", "node_modules",
+    "logs", "runtime",
+}
+EXCLUDED_SUFFIXES = ("-wal", "-shm", ".db-wal", ".db-shm")
+BACKUP_RETENTION = max(1, int(os.environ.get("CLEANER_BACKUP_RETENTION", "5")))
+BACKUP_PREFIX = "active_pipeline_cleaner_"
+
+
+def _is_excluded_path(path) -> bool:
+    """True when a path sits inside an excluded tree or is a sidecar journal."""
+    try:
+        parts = {seg.lower() for seg in Path(path).parts}
+    except Exception:
+        return True
+    if parts & {name.lower() for name in EXCLUDED_DIR_NAMES}:
+        return True
+    lowered = str(path).lower()
+    if "backup" in lowered or "audit" in lowered:
+        return True
+    return lowered.endswith(EXCLUDED_SUFFIXES)
+
+
+def prune_backups(retention: int = BACKUP_RETENTION):
+    """Keep the newest `retention` cleaner captures. Print kept and removed."""
+    root = ROOT / "backups"
+    if not root.exists():
+        return [], []
+    try:
+        captures = sorted(
+            (d for d in root.iterdir() if d.is_dir() and d.name.startswith(BACKUP_PREFIX)),
+            key=lambda d: d.name, reverse=True,
+        )
+    except Exception as e:
+        log(f"[WARN] backup prune scan failed: {e}")
+        return [], []
+    keep, remove = captures[:retention], captures[retention:]
+    for d in keep:
+        log(f"[KEEP]   {d.name}")
+    for d in remove:
+        try:
+            shutil.rmtree(d, ignore_errors=True)
+            log(f"[REMOVE] {d.name}")
+        except Exception as e:
+            log(f"[WARN] could not remove {d}: {e}")
+    log(f"[OK] backup retention: kept {len(keep)}, removed {len(remove)} "
+        f"(CLEANER_BACKUP_RETENTION={retention})")
+    return keep, remove
+
+
 def backup_dbs(dbs):
-    backup_dir = ROOT / "backups" / ("active_pipeline_cleaner_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+    backup_dir = ROOT / "backups" / (BACKUP_PREFIX + datetime.now().strftime("%Y%m%d_%H%M%S"))
     backup_dir.mkdir(parents=True, exist_ok=True)
-    copied = 0
+    copied = skipped = 0
     for db in dbs:
         try:
+            if _is_excluded_path(db):
+                skipped += 1
+                log(f"[SKIP] excluded from backup: {db}")
+                continue
+            # HYBRID_EDGE_SIGNOFF_20260731: the cleaner is a maintenance lane,
+            # not the owner of live price databases. Copying a hot WAL database
+            # with shutil can collide with price-truth writers and is not a
+            # transactionally complete snapshot. Dedicated shutdown backups retain
+            # these databases; the recurring cleaner skips them while online.
+            if db.name.lower() in HOT_PRICE_DB_NAMES:
+                skipped += 1
+                log(f"[SKIP_HOT_DB_BACKUP] {db.name}")
+                continue
             dest = backup_dir / db.relative_to(ROOT)
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(db, dest)
             copied += 1
         except Exception as e:
             log(f"[WARN] backup failed {db}: {e}")
-    log(f"[OK] backed up {copied} db file(s) to {backup_dir}")
+    log(f"[OK] backed up {copied} db file(s) ({skipped} excluded) to {backup_dir}")
+    prune_backups()
 
 NON_TERMINAL_PROPOSAL_STATES = {
     "open", "researching", "evidence_ready", "debating",

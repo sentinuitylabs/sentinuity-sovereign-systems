@@ -31,7 +31,7 @@ NIM_API_KEY    = os.getenv("NVIDIA_NIM_API_KEY", "").strip()
 # NUGGET routes through NIM/Kimi — no Gemini dependency
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_POLARIS_TOKEN", "").strip()  # POLARIS bot — briefs to Pop+Mum
 TELEGRAM_OWNER_ID  = os.getenv("TELEGRAM_OWNER_ID", "").strip()
-OPENAI_MODEL   = "gpt-5.4-nano"   # default budget tier; router escalates per-call
+OPENAI_MODEL   = "gpt-5.4-mini"   # signed build-lead fallback; router/NIM still handles cheap routine work
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
@@ -285,26 +285,46 @@ class Polaris:
     # -----------------------------
     def analyze_trades(self, conn, counters: List[int]):
 
-        # PATCH B: Hard gate — suppress all strategy proposals while price is stale.
-        # A stale-price organism must not be tuned; it must be repaired first.
+        # PATCH B: Hard gate — suppress all strategy TUNING proposals while price
+        # is stale. A stale-price organism must not be tuned; it must be repaired.
+        #
+        # SIGNOFF_10H_MISSION_LOCK_OBSERVABILITY_20260811:
+        # This gate previously returned {} before any history was read, so every
+        # cycle in which a position was open and the oracle was behind emitted
+        # analysis_complete{"trades":0,...,"last_outcome":"NO_HISTORY"} regardless
+        # of how many real CLOSED outcomes existed. The 10-hour runtime spent long
+        # stretches in exactly that state (NO_COVERAGE_* exits imply a lagging
+        # mark clock), which made the canonical-history fallback added below
+        # unreachable and made Polaris look permanently amnesiac.
+        #
+        # Mission-lock is a WRITE lock on strategy change, not a READ lock on
+        # truth. Observation continues; only the tuning proposals are withheld.
+        # This grants Polaris no new authority: the proposal calls it can reach
+        # while locked are unchanged (SYSTEM_REPAIR only).
+        mission_lock = False
         if self._is_price_stale():
+            mission_lock = True
             # PATCH C: Only queue one SYSTEM_REPAIR, never duplicate it.
             if self._repair_already_queued():
-                logging.info("POLARIS MISSION-LOCK: repair already queued — skipping analyze_trades")
-                return {}
-            self.add_proposal(
-                "SYSTEM_REPAIR",
-                "Price staleness detected with open position(s). "
-                "market_snapshots.observed_price has not been updated within the expected window. "
-                "The oracle or MTM pipeline requires investigation before any strategy changes.",
-                "Investigate ws_price_oracle and market_intelligence MTM pipeline. "
-                "Confirm price feed is live before resuming normal governance.",
-                0.92,
-                {"staleness_detected": True},
-                counters,
-            )
-            logging.warning("POLARIS MISSION-LOCK: SYSTEM_REPAIR queued — analyze_trades suppressed")
-            return {}
+                logging.info(
+                    "POLARIS MISSION-LOCK: repair already queued — tuning suppressed, "
+                    "history observation continues"
+                )
+            else:
+                self.add_proposal(
+                    "SYSTEM_REPAIR",
+                    "Price staleness detected with open position(s). "
+                    "market_snapshots.observed_price has not been updated within the expected window. "
+                    "The oracle or MTM pipeline requires investigation before any strategy changes.",
+                    "Investigate ws_price_oracle and market_intelligence MTM pipeline. "
+                    "Confirm price feed is live before resuming normal governance.",
+                    0.92,
+                    {"staleness_detected": True},
+                    counters,
+                )
+                logging.warning(
+                    "POLARIS MISSION-LOCK: SYSTEM_REPAIR queued — strategy tuning suppressed"
+                )
 
         # GHOST TRADE FILTER: exclude trades where oracle was blind (no coverage)
         # or where guardian force-closed without execution engine decision.
@@ -312,7 +332,7 @@ class Polaris:
         # train Polaris on infrastructure failures, not market behaviour.
         # Falls back to unfiltered if coverage columns don't exist yet (older DB).
         try:
-            _cols = {r[0] for r in conn.execute(
+            _cols = {r[1] for r in conn.execute(
                 "PRAGMA table_info(polaris_trade_reviews)"
             ).fetchall()}
             _has_coverage = "coverage_score" in _cols and "exit_validity" in _cols
@@ -350,27 +370,102 @@ class Polaris:
                 LIMIT 30
             """).fetchall()
 
+        # SIGNOFF_10H_CANONICAL_HISTORY_20260811:
+        # polaris_trade_reviews is an auxiliary review ledger, not the canonical
+        # trade-history authority.  The 10-hour runtime proved that it can be
+        # empty while paper_positions contains many real CLOSED outcomes, causing
+        # analysis_complete to report trades=0 indefinitely.  If the review ledger
+        # has fewer than five usable rows, read a bounded, read-only projection from
+        # canonical paper_positions.  This restores observation only: it does NOT
+        # grant Polaris any new trading/apply authority.
+        history_source = "polaris_trade_reviews"
         if not rows or len(rows) < 5:
+            try:
+                pp_cols = {r[1] for r in conn.execute(
+                    "PRAGMA table_info(paper_positions)"
+                ).fetchall()}
+                required = {"status", "realized_pnl_usd"}
+                if required.issubset(pp_cols):
+                    win_expr = (
+                        "COALESCE(win_loss, CASE WHEN COALESCE(realized_pnl_usd,0)>0 "
+                        "THEN 'WIN' ELSE 'LOSS' END)"
+                        if "win_loss" in pp_cols else
+                        "CASE WHEN COALESCE(realized_pnl_usd,0)>0 THEN 'WIN' ELSE 'LOSS' END"
+                    )
+                    if "exit_category" in pp_cols:
+                        cat_expr = "COALESCE(exit_category,'')"
+                    elif "exit_reason" in pp_cols:
+                        cat_expr = (
+                            "CASE "
+                            "WHEN UPPER(COALESCE(exit_reason,'')) LIKE '%STOP%' THEN 'SL' "
+                            "WHEN UPPER(COALESCE(exit_reason,'')) LIKE '%RUNNER%' THEN 'RUNNER' "
+                            "WHEN UPPER(COALESCE(exit_reason,'')) LIKE '%MAX_HOLD%' THEN 'MAX_HOLD' "
+                            "ELSE COALESCE(exit_reason,'') END"
+                        )
+                    else:
+                        cat_expr = "''"
+                    coverage_expr = "NULL"
+                    if "pnl_integrity_status" in pp_cols or "exit_reason" in pp_cols:
+                        clauses=[]
+                        if "pnl_integrity_status" in pp_cols:
+                            clauses.append("UPPER(COALESCE(pnl_integrity_status,'')) LIKE '%NO_COVERAGE%'")
+                        if "exit_reason" in pp_cols:
+                            clauses.append("UPPER(COALESCE(exit_reason,'')) LIKE 'NO_COVERAGE%'")
+                        coverage_expr = (
+                            "CASE WHEN " + " OR ".join(clauses) +
+                            " THEN 'NO_COVERAGE' ELSE 'VALID_OR_UNKNOWN' END"
+                        )
+                    order_col = "closed_at" if "closed_at" in pp_cols else (
+                        "updated_at" if "updated_at" in pp_cols else "id"
+                    )
+                    rows = conn.execute(f"""
+                        SELECT {win_expr} AS win_loss,
+                               {cat_expr} AS exit_category,
+                               realized_pnl_usd,
+                               {coverage_expr} AS exit_validity
+                        FROM paper_positions
+                        WHERE UPPER(COALESCE(status,''))='CLOSED'
+                          AND realized_pnl_usd IS NOT NULL
+                        ORDER BY {order_col} DESC
+                        LIMIT 50
+                    """).fetchall()
+                    history_source = "paper_positions_canonical"
+                    if rows:
+                        logging.info(
+                            "POLARIS HISTORY FALLBACK: %d canonical CLOSED paper outcomes loaded",
+                            len(rows),
+                        )
+            except Exception as _hist_exc:
+                logging.warning("POLARIS canonical history fallback failed: %s", _hist_exc)
+
+        if not rows or len(rows) < 5:
+            logging.info("POLARIS HISTORY: insufficient usable outcomes (%d)", len(rows or []))
             return {}
 
         total     = len(rows)
-        wins      = sum(1 for r in rows if r["win_loss"] == "WIN")
-        sl_losses = sum(1 for r in rows if r["exit_category"] == "SL")
+        wins      = sum(1 for r in rows if str(r["win_loss"] or "").upper() == "WIN")
+        sl_losses = sum(1 for r in rows if str(r["exit_category"] or "").upper() == "SL")
         avg_pnl   = sum(float(r["realized_pnl_usd"] or 0) for r in rows) / total
         win_rate  = (wins / total) * 100
 
         stats = {
-            "trades":   total,
-            "win_rate": round(win_rate, 2),
-            "avg_pnl":  round(avg_pnl, 4),
-            "sl_rate":  round(sl_losses / total, 2),
+            "trades":         total,
+            "win_rate":       round(win_rate, 2),
+            "avg_pnl":        round(avg_pnl, 4),
+            "sl_rate":        round(sl_losses / total, 2),
+            "history_source": history_source,
         }
 
         # ── READ PROPOSAL OUTCOME HISTORY ────────────────────────────
         # POLARIS reads whether her LAST proposal helped or hurt.
         # This closes the feedback loop — she does not propose blind.
         feedback = self.read_proposal_outcomes(conn)
-        last_outcome          = feedback.get("last_outcome", "NO_HISTORY")
+        last_outcome          = feedback.get("last_outcome", "NO_PROPOSAL_OUTCOMES")
+        # States that mean "no usable proposal-outcome signal", as distinct
+        # from a measured outcome. Trade history may well exist alongside any
+        # of these; they say nothing about it.
+        _no_signal = ("NO_PROPOSAL_OUTCOMES", "HISTORY_QUERY_FAILED",
+                      "HISTORY_ARCHIVED", "HISTORY_PRESENT_MISSION_LOCK")
         last_proposal_helped  = feedback.get("last_proposal_helped")
         rolled_back_count     = feedback.get("rolled_back_count", 0)
 
@@ -382,8 +477,12 @@ class Polaris:
 
         # Only propose again if last proposal has been evaluated
         # Prevents POLARIS spamming proposals without waiting for outcomes
-        if last_outcome == "NO_HISTORY":
-            # First cycle — propose normally
+        if last_outcome in _no_signal:
+            # No applied proposal to learn from yet — propose normally.
+            if last_outcome == "HISTORY_QUERY_FAILED":
+                logging.warning("POLARIS: proposal-outcome query failed (%s); "
+                                "proceeding without feedback signal",
+                                feedback.get("outcome_error", "")[:160])
             pass
         elif last_outcome == "IMPROVED":
             # Last proposal worked — POLARIS can propose follow-on changes
@@ -400,7 +499,7 @@ class Polaris:
 
         # Build feedback context for proposal text
         feedback_context = ""
-        if last_outcome != "NO_HISTORY" and feedback.get("recent_outcomes"):
+        if last_outcome not in _no_signal and feedback.get("recent_outcomes"):
             last = feedback["recent_outcomes"][0]
             delta = last.get("delta") or {}
             feedback_context = (
@@ -409,6 +508,19 @@ class Polaris:
                 f"win_rate_delta={delta.get('win_rate_delta','?')}, "
                 f"pnl_delta={delta.get('pnl_delta','?')}."
             )
+
+        # SIGNOFF_10H_MISSION_LOCK_OBSERVABILITY_20260811:
+        # Under mission-lock the observed statistics are still returned (and
+        # therefore still reported in analysis_complete and the heartbeat), but
+        # no strategy-tuning proposal may be created from a stale-price cohort.
+        if mission_lock:
+            stats["mission_lock"] = True
+            logging.info(
+                "POLARIS MISSION-LOCK: %d outcome(s) observed from %s — "
+                "tuning proposals withheld until price truth is restored",
+                total, history_source,
+            )
+            return stats
 
         if stats["sl_rate"] > 0.6:
             self.add_proposal(
@@ -547,16 +659,32 @@ class Polaris:
             return {
                 "recent_outcomes":      outcomes,
                 "last_proposal_helped": outcomes[0]["outcome"] == "IMPROVED" if outcomes else None,
-                "last_outcome":         outcomes[0]["outcome"] if outcomes else "NO_HISTORY",
+                # COUNCIL_SPINE_20260815 — this field answers "did my last
+                # PROPOSAL help?", not "does trade history exist?". Reporting
+                # NO_HISTORY here while the same heartbeat carries
+                # trades=50 / history_source=paper_positions_canonical told the
+                # operator the opposite of the truth. With code_patches=0 and
+                # patch_apply_journal=0 no proposal has ever been applied, so
+                # there is nothing to measure — which is a different fact, and
+                # now says so.
+                "last_outcome":         outcomes[0]["outcome"] if outcomes else "NO_PROPOSAL_OUTCOMES",
+                "outcome_basis":        "applied_proposal_before_after",
+                "outcomes_available":   len(outcomes),
                 "rolled_back_count":    sum(1 for o in outcomes if o["outcome"] == "ROLLED_BACK"),
                 "improved_count":       sum(1 for o in outcomes if o["outcome"] == "IMPROVED"),
             }
 
         except Exception as e:
             logging.warning("read_proposal_outcomes failed: %s", e)
+            # A failed query and an empty result are different facts. Collapsing
+            # both into one label made a schema/DB fault indistinguishable from
+            # "no proposal has been applied yet".
             return {
                 "recent_outcomes": [],
-                "last_outcome":    "NO_HISTORY",
+                "last_outcome":    "HISTORY_QUERY_FAILED",
+                "outcome_basis":   "query_error",
+                "outcome_error":   f"{type(e).__name__}: {e}"[:300],
+                "outcomes_available": 0,
                 "last_proposal_helped": None,
             }
 
@@ -845,92 +973,24 @@ class Polaris:
         return run_id
 
     def _check_ivaris_status(self) -> dict:
-        """
-        Lightweight diagnostic ping — matches the live provider-aware routing
-        in sovereign_governor.py. Reads IVARIS_PROVIDER and IVARIS_MODEL from
-        system_config so the morning brief reflects the actual live provider.
-        Does NOT affect debate routing. Diagnostic only.
-        """
-        provider = str(get_config_value("IVARIS_PROVIDER", "anthropic")).strip().lower()
-        model    = str(get_config_value("IVARIS_MODEL",    "claude-haiku-4-5-20251001")).strip()
-
-        if provider == "anthropic":
-            if "/" in model:
-                # V3_HONESTY_ROUTING_20260721: an org/model id (NIM/OpenAI style) must never
-                # be sent to the Anthropic endpoint — that is a guaranteed 400.
-                return {
-                    "configured": True, "status": "error",
-                    "detail": (f"routing guard: model '{model[:48]}' is not an "
-                               "Anthropic id; fix IVARIS_MODEL or set "
-                               "IVARIS_PROVIDER=nim"),
-                    "provider": "anthropic", "model": model,
-                }
-            _key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-            if not _key:
-                return {
-                    "configured": False, "status": "missing_key",
-                    "detail": "ANTHROPIC_API_KEY not configured",
-                    "provider": "anthropic", "model": model,
-                }
-            try:
-                import requests as _req
-                resp = _req.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={
-                        "x-api-key":         _key,
-                        "anthropic-version": "2023-06-01",
-                        "content-type":      "application/json",
-                    },
-                    json={
-                        "model":      model,
-                        # V3_HONESTY_ROUTING_20260721: the Anthropic Messages API requires
-                        # max_tokens; max_completion_tokens is an OpenAI field and
-                        # produced the recurring "Anthropic HTTP 400" brief errors.
-                        "max_tokens": 10,
-                        "messages":   [{"role": "user", "content": "Reply with OK."}],
-                    },
-                    timeout=12,
-                )
-                if resp.status_code == 200:
-                    return {"configured": True, "status": "ok",
-                            "detail": "Anthropic API reachable",
-                            "provider": "anthropic", "model": model}
-                _safe = ""
-                try:
-                    _err = (resp.json() or {}).get("error") or {}
-                    _safe = (str(_err.get("type") or "") + ": "
-                             + str(_err.get("message") or ""))[:140].strip(": ")
-                except Exception:
-                    _safe = ""
-                return {"configured": True, "status": "error",
-                        "detail": f"Anthropic HTTP {resp.status_code} {_safe}".strip(),
-                        "provider": "anthropic", "model": model}
-            except Exception as e:
-                return {"configured": True, "status": "error",
-                        "detail": str(e)[:160],
-                        "provider": "anthropic", "model": model}
-
-        else:
-            # NUGGET routes through NIM (Kimi K2) — no gemini_client dependency
-            try:
-                import json as _jn, urllib.request as _ur
-                _nk = os.getenv("NVIDIA_NIM_API_KEY","").strip()
-                if not _nk:
-                    return {"configured": False, "status": "missing_key",
-                            "detail": "NVIDIA_NIM_API_KEY not set", "provider": "nim", "model": "meta/llama-3.3-70b-instruct"}
-                _pl = _jn.dumps({"model": _nim_assignment("NUGGET", "nvidia/nemotron-3-super-120b-a12b"),
-                    "messages":[{"role":"user","content":"Reply OK."}],"max_tokens":5}).encode()
-                _rq = _ur.Request("https://integrate.api.nvidia.com/v1/chat/completions",
-                    data=_pl, method="POST",
-                    headers={"Authorization":f"Bearer {_nk}","Content-Type":"application/json"})
-                with _ur.urlopen(_rq, timeout=10) as _r:
-                    _txt = _jn.loads(_r.read())["choices"][0]["message"]["content"].strip()
-                return {"configured": True, "status": "ok" if _txt else "error",
-                        "detail": f"NUGGET→NIM/Llama3.3: {_txt[:40]}",
-                        "provider": "nim", "model": _nim_assignment("NUGGET", "nvidia/nemotron-3-super-120b-a12b")}
-            except Exception as e:
-                return {"configured": False, "status": "error",
-                        "detail": str(e)[:160], "provider": "nim", "model": _nim_assignment("NUGGET", "nvidia/nemotron-3-super-120b-a12b")}
+        """Truthful IVARIS diagnostic: NVIDIA NIM registry is the only live route."""
+        try:
+            from services.nvidia_model_registry import get_assignment
+            model = str(get_assignment("IVARIS", "qwen/qwen3.5-397b-a17b") or "qwen/qwen3.5-397b-a17b")
+        except Exception:
+            model = "qwen/qwen3.5-397b-a17b"
+        key = os.getenv("NVIDIA_NIM_API_KEY", "").strip()
+        if not key:
+            return {
+                "configured": False, "status": "missing_key",
+                "detail": "NVIDIA_NIM_API_KEY not configured",
+                "provider": "nim", "model": model,
+            }
+        return {
+            "configured": True, "status": "configured",
+            "detail": "IVARIS routes through NVIDIA NIM registry; model rotates on provider failure",
+            "provider": "nim", "model": model,
+        }
 
     def _run_deterministic_task(self, conn, task: dict) -> dict:
         task_name = str(task.get("task_name") or "TASK")
@@ -1435,8 +1495,12 @@ Focus on the highest-leverage change. Be specific and evidence-based."""
             summary = {
                 "trades":           trade_stats.get("trades", 0),
                 "win_rate":         trade_stats.get("win_rate", 0),
+                "history_source":   trade_stats.get("history_source", "none"),
+                # SIGNOFF_10H_MISSION_LOCK_OBSERVABILITY_20260811: distinguish
+                # "no history exists" from "history observed, tuning withheld".
+                "mission_lock":     bool(trade_stats.get("mission_lock", False)),
                 "new_proposals":    counters[0],
-                "last_outcome":     feedback.get("last_outcome", "NO_HISTORY"),
+                "last_outcome":     feedback.get("last_outcome", "NO_PROPOSAL_OUTCOMES"),
                 "improved_count":   feedback.get("improved_count", 0),
                 "rolled_back_count":feedback.get("rolled_back_count", 0),
                 "task_run":         task_result.get("task_name") if task_result else None,

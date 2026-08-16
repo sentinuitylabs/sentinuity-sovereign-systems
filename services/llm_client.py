@@ -191,3 +191,56 @@ def polaris_complete(system_prompt: str, user_message: str, *, task_type: str="r
     _set_last_error("MODEL_PROVIDERS_UNAVAILABLE:"+" | ".join(errors)[:500])
     logger.warning("polaris_complete unavailable: %s", _LAST_ERROR)
     return None
+
+
+def council_role_review(role: str, proposal: dict) -> Optional[dict]:
+    """Conservative adapter used by debate_quorum.
+
+    Uses the already-configured Polaris provider route.  Malformed or unavailable
+    model output returns None so debate_quorum substitutes its deterministic
+    structural critic.  A model response never authorises an apply by itself.
+    """
+    import json
+    files = proposal.get("files") or []
+    system_prompt = (
+        f"You are {role}, one reviewer in a guarded software council. "
+        "Return JSON only with keys approve (boolean), confidence (0..1), notes (string). "
+        "Reject missing tests, backups, bounded target files, or unverifiable claims."
+    )
+    user_message = json.dumps({
+        "proposal_id": proposal.get("proposal_id"),
+        "text": proposal.get("proposal_text") or proposal.get("text") or "",
+        "action": proposal.get("suggested_action") or proposal.get("action") or "",
+        "files": files,
+        "test_cmd": proposal.get("test_cmd"),
+        "compile_ok": proposal.get("compile_ok"),
+        "diff_chars": proposal.get("diff_chars"),
+    }, default=str)[:12000]
+    result = polaris_complete(
+        system_prompt, user_message, task_type="council_build",
+        risk_level="high", code_touch=True,
+        code_touch_file=(str(files[0]) if files else None),
+        max_tokens=450, temperature=0.2)
+    if not result or not result.get("text"):
+        return None
+    text = str(result["text"]).strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S).strip()
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return None
+    approve = payload.get("approve")
+    confidence = payload.get("confidence")
+    if not isinstance(approve, bool):
+        return None
+    try:
+        confidence = max(0.0, min(1.0, float(confidence)))
+    except Exception:
+        return None
+    return {
+        "role": role, "provider": result.get("provider", "model"),
+        "approve": approve, "confidence": confidence,
+        "notes": str(payload.get("notes") or "")[:1000],
+        "model": result.get("model"),
+    }

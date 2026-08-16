@@ -38,8 +38,8 @@ log = logging.getLogger("macro_channel")
 
 SERVICE_NAME = "macro_channel"
 CYCLE_SECONDS = max(60, int(os.getenv("SUBSTRATE_CHANNEL_CYCLE_SEC", "120")))
-LOCK_BACKOFF_MIN = max(60, int(os.getenv("SUBSTRATE_CHANNEL_LOCK_BACKOFF_MIN_SEC", "60")))
-LOCK_BACKOFF_MAX = max(LOCK_BACKOFF_MIN, int(os.getenv("SUBSTRATE_CHANNEL_LOCK_BACKOFF_MAX_SEC", "900")))
+LOCK_BACKOFF_MIN = max(2, int(os.getenv("SUBSTRATE_CHANNEL_LOCK_BACKOFF_MIN_SEC", "2")))
+LOCK_BACKOFF_MAX = max(LOCK_BACKOFF_MIN, int(os.getenv("SUBSTRATE_CHANNEL_LOCK_BACKOFF_MAX_SEC", "30")))
 
 def _is_db_lock(exc: BaseException) -> bool:
     blob = f"{type(exc).__name__}: {exc}".lower()

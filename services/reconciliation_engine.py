@@ -57,7 +57,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH  = BASE_DIR / "sentinuity_matrix.db"
 
 def get_conn():
-    conn = sqlite3.connect(str(DB_PATH), timeout=5.0)
+    from core.schema import get_critical_connection
+    conn = get_critical_connection("matrix")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -104,16 +105,44 @@ def get_all_token_balances(wallet_pubkey: str) -> dict:
         accounts = result.get("value", [])
 
         balances = {}
+        # MODE3_FINAL_SIGNOFF_20260806: raw integer base units, authoritative for
+        # fill reconciliation. `balances` (float) is retained for display only.
+        raw_balances: dict = {}
+        decimals_by_mint: dict = {}
         for account in accounts:
             try:
                 info    = account["account"]["data"]["parsed"]["info"]
                 mint    = info["mint"]
-                ui_amt  = info["tokenAmount"].get("uiAmount") or 0.0
-                balances[mint] = balances.get(mint, 0.0) + float(ui_amt)
+                # MODE3_FINAL_SIGNOFF_20260806 (invariant G)
+                # DEFECT: uiAmount is a JSON float. pump.fun mints commonly hold
+                # 1e9+ base units at 6 decimals; float64 has 53 bits of mantissa
+                # (~9.0e15) and the parsed uiAmount has already been divided by
+                # 10**decimals, so fill reconciliation compared lossy decimals.
+                # tokenAmount.amount is the exact raw integer as a string.
+                _ta = info["tokenAmount"]
+                _raw = _ta.get("amount")
+                _dec = int(_ta.get("decimals") or 0)
+                if _raw is not None:
+                    _raw_int = int(str(_raw))
+                    raw_balances[mint] = raw_balances.get(mint, 0) + _raw_int
+                    decimals_by_mint[mint] = _dec
+                    balances[mint] = balances.get(mint, 0.0) + (_raw_int / (10 ** _dec))
+                else:
+                    ui_amt = _ta.get("uiAmount") or 0.0
+                    balances[mint] = balances.get(mint, 0.0) + float(ui_amt)
             except (KeyError, TypeError):
                 continue
 
-        log.info("[RECON] On-chain balances fetched: %d token accounts", len(balances))
+        log.info("[RECON] On-chain balances fetched: %d token accounts "
+                 "(raw integer base units captured for %d)",
+                 len(balances), len(raw_balances))
+        # MODE3_FINAL_SIGNOFF_20260806: expose exact integers alongside the float
+        # view. Callers reconciling fills MUST read get_raw_token_balances().
+        try:
+            get_all_token_balances.raw = raw_balances          # type: ignore[attr-defined]
+            get_all_token_balances.decimals = decimals_by_mint  # type: ignore[attr-defined]
+        except Exception:
+            pass
         return balances
 
     except requests.exceptions.Timeout:
@@ -122,6 +151,21 @@ def get_all_token_balances(wallet_pubkey: str) -> dict:
     except Exception as e:
         log.error("[RECON] get_all_token_balances error: %s", e)
         return {}
+
+
+def get_raw_token_balances(wallet_pubkey: str) -> dict:
+    """MODE3_FINAL_SIGNOFF_20260806 — exact integer base units per mint.
+
+    Fill reconciliation must use this, never the float uiAmount view.
+    getTokenAccountsByOwner returns tokenAmount.uiAmount already divided by
+    10**decimals as a JSON float; float64 carries 53 mantissa bits, so a
+    high-supply mint's balance is no longer exact by the time it is compared
+    against an expected fill. tokenAmount.amount is the exact base-unit integer.
+
+    Returns {mint_address: int(raw_base_units)}.
+    """
+    get_all_token_balances(wallet_pubkey)
+    return dict(getattr(get_all_token_balances, "raw", {}) or {})
 
 
 def get_token_decimals(mint: str) -> int:

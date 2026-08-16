@@ -75,6 +75,7 @@ WRITE OWNERSHIP
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import logging
 import os
 import sys
@@ -427,6 +428,12 @@ _QUALIFIER_COLUMNS = [
     ("curve_sol_reserves",  "REAL"),
     ("duplicate_key",       "TEXT"),
     ("price_last_attempt_at", "REAL"),
+    # BUNDLE_A_20260810: persist smart-money so downstream ledgers / calibrators
+    # / supervisor can read the same evidence the qualifier already computed.
+    ("smart_money_score",   "REAL"),
+    ("smart_money_tier",    "TEXT"),
+    ("smart_money_holders_delta_180s", "REAL"),
+    ("smart_money_wallet_cluster_score", "REAL"),
 ]
 
 def _ensure_qualifier_columns() -> None:
@@ -442,6 +449,193 @@ def _ensure_qualifier_columns() -> None:
             conn.commit()
     except Exception as e:
         log.warning("Schema substrate check encountered static (non-fatal): %s", e)
+
+
+_QUALIFIER_TLS = threading.local()
+
+# ── SIGNOFF_QUALIFIER_BOUNDED_RETRY_20260812 ─────────────────────────────────
+# HOSTILE REVIEW OF THE PRIOR CONCURRENCY PATCH — DEFECT FOUND AND CORRECTED.
+#
+# The first version of this change routed qualifier workers through
+# `_build_resilient_session()`, which carries Retry(total=3, backoff_factor=0.3,
+# status_forcelist=[429,500,502,503,504]). The session it REPLACED was a bare
+# requests.Session() with no retry adapter at all. Measured consequence:
+#
+#   worst-case per candidate  BEFORE (1 attempt)   :   9.0s
+#   worst-case per candidate  AFTER  (4 attempts)  :  40.2s   (4.5x WORSE)
+#
+#   batch of 8, healthy    : 3.20s serial -> 0.80s concurrent   (4.0x better)
+#   batch of 8, degraded   : 72.0s serial -> 80.4s concurrent   (SLOWER)
+#
+# The degraded case is the one that produces stale entries. The first patch
+# therefore accelerated the case that was never broken and mildly regressed the
+# case that was. Retrying on 429 while simultaneously raising concurrency is
+# also precisely backwards: it increases load exactly when the provider is
+# asking for less.
+#
+# THE KEY INSIGHT: the qualifier ALREADY HAS a retry mechanism at the correct
+# layer. On requests.RequestException the row is released back to
+# quality_status='pending', qualify_claimed_until=NULL and is re-claimed on a
+# later cycle. Request-level retry duplicates that while HOLDING A WORKER SLOT
+# and burning the candidate's remaining freshness budget. Cycle-level retry
+# costs the candidate nothing but a poll interval; request-level retry costs it
+# up to 31 seconds of the very budget it is racing.
+#
+# So: retry ONLY on connection establishment (cheap, no server-side cost, and
+# not a signal of overload). Never retry a read timeout or an HTTP status.
+# Worst case returns to ~9s per candidate, so concurrency is now a strict
+# improvement in BOTH regimes rather than a trade.
+#
+# Per-leg timeouts remain bounded at their existing call sites (bonding-curve
+# RPC timeout=5.0, DexScreener HTTP_TIMEOUT=4). With retries no longer
+# multiplying them, those constants are once again the real ceiling, so one
+# hung request can occupy a worker for at most ~9s and can never exhaust the
+# pool indefinitely.
+
+
+def _build_qualifier_session() -> requests.Session:
+    """Bounded session for qualifier workers: fail fast, let the cycle retry."""
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    s = requests.Session()
+    s.headers.update({"Accept": "application/json"})
+    retry = Retry(
+        total=1,           # one connect-level retry only
+        connect=1,
+        read=0,            # never retry a read timeout - the budget is gone
+        status=0,          # never retry an HTTP status, including 429
+        redirect=2,
+        backoff_factor=0.0,
+        allowed_methods=frozenset(["GET", "POST"]),
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
+def _qualifier_thread_session() -> requests.Session:
+    """One bounded session per qualifier worker thread.
+
+    requests.Session is not guaranteed thread-safe for concurrent use. This
+    mirrors the existing `_pricer_thread_session()` contract already used by
+    the concurrent pricer loop in this module, but deliberately uses the
+    bounded-retry builder above rather than the resilient one - see the
+    SIGNOFF_QUALIFIER_BOUNDED_RETRY note for the measurement that forced this.
+    """
+    sess = getattr(_QUALIFIER_TLS, "session", None)
+    if sess is None:
+        sess = _build_qualifier_session()
+        _QUALIFIER_TLS.session = sess
+    return sess
+
+
+# ── PERSISTENT WORKER POOL ───────────────────────────────────────────────────
+# SECOND DEFECT FOUND IN HOSTILE REVIEW: the first patch created a NEW
+# ThreadPoolExecutor inside every qualifier cycle. Worker threads therefore died
+# at the end of each cycle, taking their thread-local sessions with them.
+# Measured: ~3 brand-new sessions constructed per cycle, growing without bound -
+# at QUALIFIER_POLL_INTERVAL=1.0 that is ~3 new TLS connection pools per second.
+# The thread-local session reuse the patch claimed to provide was doing nothing
+# whatsoever; every request paid a fresh TCP + TLS handshake.
+#
+# A single lazily-created module-level pool keeps worker threads - and therefore
+# their keep-alive connection pools - alive across cycles. Rebuilt only if the
+# configured worker count changes.
+_QUALIFIER_POOL: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_QUALIFIER_POOL_SIZE: int = 0
+_QUALIFIER_POOL_LOCK = threading.Lock()
+
+
+def _qualifier_pool(workers: int) -> concurrent.futures.ThreadPoolExecutor:
+    global _QUALIFIER_POOL, _QUALIFIER_POOL_SIZE
+    with _QUALIFIER_POOL_LOCK:
+        if _QUALIFIER_POOL is None or _QUALIFIER_POOL_SIZE != workers:
+            old = _QUALIFIER_POOL
+            _QUALIFIER_POOL = concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="qualifier")
+            _QUALIFIER_POOL_SIZE = workers
+            if old is not None:
+                # Never block the trading pipeline waiting for a drain.
+                old.shutdown(wait=False)
+        return _QUALIFIER_POOL
+
+
+def _qualify_row_guarded(row: Dict[str, Any]) -> Tuple[int, str, str, str]:
+    """Qualify exactly one claimed row inside a worker thread.
+
+    Returns (row_id, outcome, status, reason) where outcome is one of
+    'processed' | 'network_error' | 'error'.
+
+    IDENTITY: the row id is returned explicitly rather than being recovered by
+    position in the results list. Executor.map does preserve input order, but
+    relying on that would make candidate identity depend on an implementation
+    detail of the pool. Nothing downstream matches a result back to a row by
+    index, and every DB write inside this function is keyed on this row's own
+    primary key, so two workers can never contend for the same row.
+
+    SAFETY: the try/except/finally semantics here are a byte-for-byte
+    behavioural copy of the previous serial loop body. Nothing about claim
+    release, the QUALIFIER_NO_VERDICT safety invariant, or any quality gate is
+    changed — only *where* the work runs. Every DB touch inside this function
+    opens its own connection via the canonical factory.
+    """
+    row_id = int(row["id"])
+    status = reason = ""
+    outcome = "error"
+    try:
+        status, reason = _qualify_one(_qualifier_thread_session(), row)
+        outcome = "processed"
+        log.info("Signal synthesised row=%s mint=%s -> %s (%s)",
+                 row["id"], str(row.get("mint_address", ""))[:16],
+                 status, reason)
+    except requests.RequestException as exc:
+        outcome = "network_error"
+        # CRITICAL FIX (2026-05-21): release qualify_claimed_until on network errors.
+        # Without this, the finally-block safety invariant stamps
+        # QUALIFIER_NO_VERDICT permanently - the actual trading-blocker bug.
+        # Row goes back to clean pending|empty|unclaimed for normal retry.
+        try:
+            with get_connection() as conn:
+                conn.execute(
+                    "UPDATE market_snapshots SET "
+                    "quality_status='pending', quality_reason='', "
+                    "qualify_claimed_until=NULL "
+                    "WHERE id=?",
+                    (row["id"],),
+                )
+                conn.commit()
+        except Exception:
+            pass
+        log.warning(
+            "Sensory fracture in qualifier network pathway for row=%s: %s "
+            "(retryable, claim released)",
+            row["id"], exc,
+        )
+    except Exception as exc:
+        outcome = "error"
+        _mark_qualifier_error(row["id"], f"QUALIFIER_ERROR:{str(exc)[:220]}")
+        log.exception("Severe cognitive dissonance in qualifier for row=%s: %s",
+                      row["id"], exc)
+    finally:
+        # SAFETY INVARIANT: no claimed row may exit with quality_status='pending'
+        # and blank quality_reason. Marks error so row doesn't stay invisibly stuck.
+        try:
+            with get_connection() as _inv_conn:
+                _inv_conn.execute("""
+                    UPDATE market_snapshots
+                    SET quality_status='error',
+                        quality_reason='QUALIFIER_NO_VERDICT',
+                        qualify_claimed_until=NULL
+                    WHERE id=?
+                      AND COALESCE(quality_status,'') = 'pending'
+                      AND COALESCE(quality_reason,'') = ''
+                      AND qualify_claimed_until IS NOT NULL
+                """, (row["id"],))
+                _inv_conn.commit()
+        except Exception:
+            pass
+    return row_id, outcome, status, reason
 
 
 def _claim_qualifier_rows(limit: int) -> List[Dict[str, Any]]:
@@ -463,27 +657,26 @@ def _claim_qualifier_rows(limit: int) -> List[Dict[str, Any]]:
                   AND MAX(COALESCE(first_seen_at,0), COALESCE(qualified_at,0),
                           COALESCE(created_at,0)) >= ?
                 ORDER BY
-                    -- SIGNOFF_FLOW_LATENCY_20260724: priced-first is kept
-                    -- (qualifying an unpriced row burns a claim cycle), but
-                    -- RECENCY now outranks confidence. Confidence-first let
-                    -- older enriched rows repeatedly pre-empt fresh priced
-                    -- candidates during bursts. Scheduling only — every
-                    -- qualification gate and threshold is unchanged.
-                    CASE WHEN COALESCE(observed_price,0)>0
-                               AND COALESCE(price_updated_at,0)>0
-                         THEN 0 ELSE 1 END,
+                    -- EDGE_RESTORE_SIGNOFF_20260810: freshness is the scarce
+                    -- resource on pump-style entries.  Do not let an older,
+                    -- already-indexed row pre-empt a newly discovered mint just
+                    -- because DexScreener has priced the older row first.
                     MAX(
                         COALESCE(first_seen_at,0),
                         COALESCE(qualified_at,0),
                         COALESCE(created_at,0)
                     ) DESC,
+                    CASE WHEN COALESCE(observed_price,0)>0
+                               AND COALESCE(price_updated_at,0)>0
+                         THEN 0 ELSE 1 END,
                     COALESCE(mint_confidence,0) DESC,
                     id DESC
                 LIMIT ?
                 """,
-                # 1200s cutoff - gives signals time to be priced before qualification
-                # Was 600s - too tight when oracle stalls, signals expire before qualifying
-                (now, now - 1200, limit),
+                # EDGE_RESTORE_SIGNOFF_20260810: restore the tighter historical
+                # claim horizon. Rows that cannot become usable within ten minutes
+                # must not crowd out the fresh population.
+                (now, now - 600, limit),
             ).fetchall()
             # NOTE: do NOT overwrite _db_rows here - that was the original bug
             for row in _db_rows:
@@ -587,7 +780,14 @@ def _write_qualifier_result(
                         qualified_at=?,
                         qualify_claimed_until=NULL,
                         vol_acceleration=?, price_change_5m=?, price_change_1h=?,
-                        vol_5m_usd=?, vol_24h_usd=?, regime=?
+                        vol_5m_usd=?, vol_24h_usd=?, regime=?,
+                        -- BUNDLE_A_20260810: persist smart-money evidence already
+                        -- computed into metrics so edge_ledger / supervisor /
+                        -- PAPER influence can see the same values the calibrator saw.
+                        smart_money_score=?,
+                        smart_money_tier=?,
+                        smart_money_holders_delta_180s=?,
+                        smart_money_wallet_cluster_score=?
                     WHERE id=?
                     """,
                     (
@@ -612,6 +812,10 @@ def _write_qualifier_result(
                         metrics.get("vol_5m_usd"),
                         metrics.get("vol_24h"),
                         metrics.get("regime_classification"),
+                        metrics.get("smart_money_score"),
+                        metrics.get("smart_money_tier"),
+                        metrics.get("smart_money_holders_delta_180s"),
+                        metrics.get("smart_money_wallet_cluster_score"),
                         row_id,
                     ),
                 )
@@ -731,7 +935,30 @@ def _fetch_dexscreener_pairs(
         return []
 
 
-def _choose_best_pair(pairs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _choose_best_pair(pairs: List[Dict[str, Any]],
+                     mint: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Select the pair that actually belongs to `mint`.
+
+    EDGE_AUDIT_20260815 — CONTAMINATED PAIR ATTRIBUTION.
+    This previously ranked by (liquidity, volume, fdv) and returned max()
+    with no check that the pair belonged to the candidate at all. The
+    DexScreener token endpoint returns every pair a token appears in, and a
+    fresh bonding-curve token owns the SHALLOWEST pool in that response — so
+    ranking by liquidity reliably selected the deepest and therefore usually
+    the oldest, migrated, or entirely unrelated pool.
+
+    Measured: on-chain age p90 527,574s and max 35,093,154s (406 days) on
+    *pump mints minutes old. Those were other pools' creation dates, and they
+    flowed straight into token_age_seconds, mcap and liquidity.
+
+    Binding to baseToken.address is a strict tightening: it can only reject
+    evidence that was being accepted on a false premise. When nothing matches
+    we return None and the caller falls back to the conservative pipeline-age
+    path, which is the correct behaviour for "we do not know".
+
+    `mint` is optional so existing callers keep working; when it is omitted
+    the legacy ranking is used and the choice is flagged UNVERIFIED.
+    """
     if not pairs:
         return None
 
@@ -741,7 +968,47 @@ def _choose_best_pair(pairs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         mcap  = float(p.get("fdv") or p.get("marketCap") or 0)
         return liq, vol, mcap
 
-    return max(pairs, key=pair_rank)
+    if not mint:
+        chosen = max(pairs, key=pair_rank)
+        if isinstance(chosen, dict):
+            chosen = dict(chosen)
+            chosen["_sentinuity_pair_provenance"] = "UNVERIFIED_NO_MINT_SUPPLIED"
+        return chosen
+
+    target = str(mint).strip().lower()
+    owned, quote_side = [], 0
+    for p in pairs:
+        if not isinstance(p, dict):
+            continue
+        base = str((p.get("baseToken") or {}).get("address") or "").strip().lower()
+        if base and base == target:
+            owned.append(p)
+            continue
+        quote = str((p.get("quoteToken") or {}).get("address") or "").strip().lower()
+        if quote and quote == target:
+            # Our mint is the QUOTE side: this pool prices something else
+            # against us. Its creation date is not our birthday.
+            quote_side += 1
+
+    if not owned:
+        try:
+            log.info("[PAIR_ATTRIBUTION_REJECTED] mint=%s candidates=%d "
+                     "base_matches=0 quote_side_matches=%d "
+                     "action=fall_back_to_pipeline_age",
+                     str(mint)[:16], len(pairs), quote_side)
+        except Exception:
+            pass
+        return None
+
+    chosen = dict(max(owned, key=pair_rank))
+    chosen["_sentinuity_pair_provenance"] = "BASE_TOKEN_VERIFIED"
+    if len(owned) < len(pairs):
+        try:
+            log.debug("[PAIR_ATTRIBUTION] mint=%s kept=%d discarded=%d",
+                      str(mint)[:16], len(owned), len(pairs) - len(owned))
+        except Exception:
+            pass
+    return chosen
 
 
 def _derive_quality_metrics(best_pair: Dict[str, Any]) -> Dict[str, Any]:
@@ -833,7 +1100,7 @@ def _derive_quality_metrics(best_pair: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _evaluate_quality(metrics: Dict[str, Any]) -> Tuple[str, str]:
+def _evaluate_quality_inner(metrics: Dict[str, Any]) -> Tuple[str, str]:
     # ── Toxic timeframe gate (UTC 04-07) ───────────────────────────────────
     import datetime as _dt_tfg
     if False:  # TOXIC_TIMEFRAME_GATE disabled - was blocking AEST golden hour (UTC 04-07)
@@ -849,8 +1116,8 @@ def _evaluate_quality(metrics: Dict[str, Any]) -> Tuple[str, str]:
     # Tier 1 (launch, mcap < tier2_floor):  3 min  - pump tokens move in minutes
     # Tier 2 (mid-cap, tier2-tier3 floor):  15 min - needs time to reach entry band
     # Tier 3 (>tier3_floor / post-grad):    radar only, never a live trade
-    tier1_max      = float(get_config_value("SIGNAL_TIER1_MAX_AGE_SEC",  900))  # relaxed 600→900 - claim window now 1200s
-    tier2_max      = float(get_config_value("SIGNAL_TIER2_MAX_AGE_SEC",  1800))  # relaxed 900→1800
+    tier1_max      = float(get_config_value("SIGNAL_TIER1_MAX_AGE_SEC",  600))  # relaxed 600→900 - claim window now 1200s
+    tier2_max      = float(get_config_value("SIGNAL_TIER2_MAX_AGE_SEC",  900))  # relaxed 900→1800
     tier2_min_mcap = float(get_config_value("SIGNAL_TIER2_MIN_MCAP",   10000))
     tier3_min_mcap = float(get_config_value("SIGNAL_TIER3_MIN_MCAP",   35000))
     radar_enabled  = str(get_config_value("RADAR_QUEUE_ENABLED",         "1")) == "1"
@@ -898,6 +1165,72 @@ def _evaluate_quality(metrics: Dict[str, Any]) -> Tuple[str, str]:
         return "rejected", f"WALLET_CONCENTRATION_{top_holder:.0f}pct"
 
     return "qualified", "OK"
+
+
+# ── OBSERVABILITY_SIGNOFF_20260808 ───────────────────────────────────────────
+# entry_candidate_log held 0 rows for the entire 2026-08-07/08 window because
+# services/entry_telemetry.py had ZERO callers anywhere in the tree. The module
+# was complete, tested and orphaned, so every rejection reason -- including the
+# 29 TOKEN_TOO_YOUNG deferrals that later ran to +100% in shadow -- existed only
+# as free text in market_snapshots.quality_reason.
+#
+# _evaluate_quality has ~10 distinct return points. Rather than instrument each
+# one (and miss the next one added), the real gate is renamed to
+# _evaluate_quality_inner and this wrapper records exactly one terminal row per
+# candidate. It CANNOT change a decision: the inner verdict is returned
+# unmodified on every path, and all telemetry work is exception-swallowed.
+_TELEMETRY_REASON_MAP = (
+    ("TOKEN_TOO_YOUNG",      "SIGNAL_TOO_OLD"),   # age gate, young side
+    ("TOKEN_AGE_UNKNOWN",    "OTHER"),
+    ("BELOW_MIN_MCAP",       "MARKET_CAP_BELOW_MIN"),
+    ("TIER3_RADAR_ONLY",     "MARKET_CAP_ABOVE_MAX"),
+    ("TIER2_TOO_OLD",        "SIGNAL_TOO_OLD"),
+    ("VETO_SIGNAL_TOO_OLD",  "SIGNAL_TOO_OLD"),
+    ("BELOW_MIN_CURVE_SOL",  "LIQUIDITY_BELOW_MIN"),
+    ("BELOW_MIN_HOLDERS",    "OTHER"),
+    ("WALLET_CONCENTRATION", "OTHER"),
+    ("CURVE_COMPLETE",       "OTHER"),
+    ("CURVE_DANGER_ZONE",    "OTHER"),
+)
+
+
+def _canonical_rejection(reason: str) -> str:
+    r = str(reason or "").upper()
+    for prefix, canonical in _TELEMETRY_REASON_MAP:
+        if r.startswith(prefix):
+            return canonical
+    return "OTHER"
+
+
+def _evaluate_quality(metrics: Dict[str, Any]) -> Tuple[str, str]:
+    state, reason = _evaluate_quality_inner(metrics)
+    try:
+        from services.entry_telemetry import GateTrace
+        trace = GateTrace(
+            mint=str(metrics.get("mint_address") or ""),
+            source="market_intelligence._evaluate_quality",
+        )
+        trace.observe(
+            token_name=str(metrics.get("token_name") or "")[:64],
+            confidence=_as_float(metrics.get("confidence_score")),
+            signal_age_sec=_as_float(metrics.get("token_age_seconds")),
+            market_cap_usd=_as_float(metrics.get("market_cap_usd")),
+            liquidity_usd=_as_float(metrics.get("token_liquidity_usd")),
+            momentum_pct=_as_float(metrics.get("momentum_pct")),
+            acceleration_pct=_as_float(metrics.get("acceleration_pct")),
+            price_age_sec=_as_float(metrics.get("price_age_sec")),
+            snapshot_id=metrics.get("snapshot_id"),
+        )
+        if state == "qualified":
+            trace.accept(gate="quality")
+        else:
+            # `deciding_gate` keeps the full raw string (e.g.
+            # TOKEN_TOO_YOUNG_53s) so exact thresholds stay recoverable, while
+            # rejection_reason stays inside CANONICAL_REJECTIONS for grouping.
+            trace.reject(_canonical_rejection(reason), gate=str(reason)[:120])
+    except Exception:
+        pass
+    return state, reason
 
 
 def _log_radar(
@@ -1048,7 +1381,12 @@ def _qualify_one(session: requests.Session, row: Dict[str, Any]) -> Tuple[str, s
     if quality_status == "qualified":
         try:
             pairs     = _fetch_dexscreener_pairs(session, mint)
-            best_pair = _choose_best_pair(pairs)
+            # EDGE_AUDIT_20260815 — bind the pair to THIS mint.
+            # Without the mint argument _choose_best_pair falls back to
+            # legacy max()-by-liquidity and is flagged UNVERIFIED, which
+            # is what left token_age_seconds contaminated (observed max
+            # 38,947,738s = 450 days on a *pump mint minutes old).
+            best_pair = _choose_best_pair(pairs, mint)
             if best_pair:
                 dex_metrics = _derive_quality_metrics(best_pair)
                 if dex_metrics.get("market_cap_usd", 0) > curve_mcap_usd:
@@ -1056,6 +1394,33 @@ def _qualify_one(session: requests.Session, row: Dict[str, Any]) -> Tuple[str, s
                 if dex_metrics.get("token_liquidity_usd"):
                     metrics["token_liquidity_usd"] = dex_metrics["token_liquidity_usd"]
                 if dex_metrics.get("token_age_seconds"):
+                    # EDGE_AUDIT_20260815 — GATE EPOCH MEASUREMENT (no behaviour change).
+                    # This is the only point where both clocks are in hand:
+                    # the on-chain age from pairCreatedAt, and the pipeline age
+                    # from our own insert. MIN_TOKEN_AGE_SEC is enforced
+                    # against the pipeline clock at _evaluate_quality_inner,
+                    # BEFORE this correction, so the difference below is
+                    # discovery latency that is ADDED to the configured wait
+                    # instead of absorbed by it.
+                    #
+                    # Nothing here gates, defers, rejects, or admits. Grep
+                    # DISCOVERY_LAG for the distribution before deciding
+                    # whether to re-base the epoch onto pairCreatedAt.
+                    try:
+                        _dex_age = float(dex_metrics["token_age_seconds"])
+                        _pipe_age = float(metrics.get("token_age_seconds") or 0.0)
+                        if _dex_age > 0 and _pipe_age > 0:
+                            log.info(
+                                "[DISCOVERY_LAG] mint=%s onchain_age=%.1fs "
+                                "pipeline_age=%.1fs lag=%.1fs "
+                                "effective_min_age=%.1fs configured_min_age=%s",
+                                mint[:16], _dex_age, _pipe_age,
+                                _dex_age - _pipe_age,
+                                float(get_config_value("MIN_TOKEN_AGE_SEC", 60))
+                                + (_dex_age - _pipe_age),
+                                get_config_value("MIN_TOKEN_AGE_SEC", 60))
+                    except Exception:
+                        pass
                     # Always prefer DexScreener pairCreatedAt (true on-chain token age)
                     # over snap_created (weaver insert time = pipeline latency, not token age).
                     metrics["token_age_seconds"] = dex_metrics["token_age_seconds"]
@@ -1149,9 +1514,20 @@ def _qualify_one(session: requests.Session, row: Dict[str, Any]) -> Tuple[str, s
     if quality_status == "qualified":
 
         # Wallet convergence scoring - 2+ watched wallets bought same mint in 60s = real signal
+        #
+        # SIGNOFF_QUALIFIER_CONCURRENCY_20260812 (defect 2 of 2):
+        # This block previously opened sqlite3.connect("sentinuity_matrix.db")
+        # with a CWD-RELATIVE path, bypassing core.schema.get_connection(). Two
+        # consequences: (a) it inherited none of the canonical WAL / busy_timeout
+        # / synchronous configuration, and (b) if the qualifier were ever started
+        # from a working directory other than the project root, SQLite would
+        # silently CREATE AN EMPTY DATABASE rather than fail — making
+        # wallet_convergence_score read a permanent 0 with no error anywhere.
+        # A convergence signal that silently reads zero is worse than one that
+        # errors. Now uses the same canonical absolute-path factory as the rest
+        # of the module. No scoring logic below is altered.
         try:
-            import sqlite3 as _sq3
-            _db = _sq3.connect("sentinuity_matrix.db", timeout=30)
+            _db = get_connection()
             # Check wallet_pattern_observations for recent coordinated buys
             _conv = _db.execute("""
                 SELECT COUNT(DISTINCT wallet_address) as convergence_count
@@ -1187,6 +1563,21 @@ def _qualify_one(session: requests.Session, row: Dict[str, Any]) -> Tuple[str, s
             metrics["wallet_convergence_score"] = 0.0
             metrics["watched_wallet_count"] = 0
 
+    # EDGE_RESTORE_SIGNOFF_20260810: smart-money was previously computed
+    # after _write_qualifier_result(), so the calibrator could never consume it.
+    # It remains additive evidence only; it gains no execution authority.
+    if quality_status == "qualified":
+        try:
+            from services.smart_money_metrics import compute_metrics as _sm_compute
+            _sm_result = _sm_compute(mint)
+            if _sm_result:
+                metrics["smart_money_score"] = float(_sm_result.get("score") or 0.0)
+                metrics["smart_money_tier"] = str(_sm_result.get("tier") or "NOISE")
+                metrics["smart_money_holders_delta_180s"] = float(_sm_result.get("holders_delta_180s") or 0.0)
+                metrics["smart_money_wallet_cluster_score"] = float(_sm_result.get("wallet_cluster_score") or 0.0)
+        except Exception:
+            _sm_result = None
+
     _write_qualifier_result(row_id, metrics, quality_status, quality_reason)
 
     if quality_status == "qualified":
@@ -1197,10 +1588,9 @@ def _qualify_one(session: requests.Session, row: Dict[str, Any]) -> Tuple[str, s
                        "age_seconds": metrics.get("token_age_seconds"),
                        "curve_pct": curve_meta.get("curve_progress_pct"),
                    })
-        # Smart money metrics - compute score for qualified tokens (observational)
+        # Smart-money remains observational in cognition; the same result was
+        # already supplied to the calibrator above.
         try:
-            from services.smart_money_metrics import compute_metrics as _sm_compute
-            _sm_result = _sm_compute(mint)
             if _sm_result and _sm_result.get('tier') not in ('NOISE', None):
                 _cognition("QUALIFIER",
                     f"SmartMoney: score={_sm_result['score']} tier={_sm_result['tier']} "
@@ -1222,8 +1612,16 @@ def _qualifier_loop() -> None:
     _ensure_qualifier_columns()
     log.info("QUALIFIER STAGE ONLINE - signal gates initialised: suffix->curve->dex->mcap->age->conf->freshness")
 
-    session = requests.Session()
-    session.headers.update({"Accept": "application/json"})
+    # SIGNOFF_QUALIFIER_CONCURRENCY_20260812: the single shared Session that
+    # used to be created here is retired. Qualification now runs on bounded
+    # worker threads and each worker owns a thread-local resilient session via
+    # `_qualifier_thread_session()`, because requests.Session is not guaranteed
+    # thread-safe for concurrent use. Retaining a shared Session here would have
+    # been the one genuinely unsafe way to make this loop concurrent.
+    #
+    # Worker sessions are built by `_build_qualifier_session()`: one bounded
+    # connect-level retry only, with no read/status retry amplification. The
+    # qualifier's existing cycle/claim lifecycle remains the retry authority.
 
     _last_purge = 0.0  # throttle stale purge to once per 60s
 
@@ -1331,74 +1729,99 @@ def _qualifier_loop() -> None:
 
             rows = _claim_qualifier_rows(batch_size)
 
-            for row in rows:
-                try:
-                    status, reason = _qualify_one(session, row)
+            # ── SIGNOFF_QUALIFIER_CONCURRENCY_20260812 ────────────────────────
+            # CAUSAL DEFECT (measured, not inferred):
+            # _qualify_one() performs two SEQUENTIAL blocking network calls per
+            # candidate — a bonding-curve getAccountInfo RPC (timeout=5.0) and a
+            # DexScreener fetch (HTTP_TIMEOUT=4). Running the claimed batch in a
+            # serial for-loop made every candidate wait for the full network cost
+            # of every candidate ahead of it in the same batch. Head-of-line
+            # blocking: ONE unresponsive mint stalled all others behind it.
+            #
+            #   per-candidate   batch of 8 (serial)   behind 24 pending
+            #   0.40s healthy         4.2s                  12.6s
+            #   3.50s degraded       29.0s                  87.0s
+            #   9.00s timing out     73.0s                 219.0s
+            #
+            # That is the qualify→latch delay that made candidates arrive at the
+            # capital boundary already expired. The final entry revalidation
+            # correctly REFUSES those candidates; this addresses why they went
+            # stale in the first place.
+            #
+            # This is not a new architecture. The pricer loop in this same module
+            # was already converted to bounded worker threads with thread-local
+            # sessions (`_pricer_thread_session`); the qualifier never received
+            # the same treatment. This applies that existing in-house pattern.
+            #
+            # NOT CHANGED BY THIS EDIT: every quality gate, threshold, confidence
+            # rule, claim contract, retry policy and the QUALIFIER_NO_VERDICT
+            # safety invariant. Throughput only.
+            #
+            # ROLLBACK WITHOUT REDEPLOY: set QUALIFIER_CONCURRENCY=1 in
+            # system_config to restore exactly the previous serial behaviour.
+            # PROVIDER_REGRESSION_RECOVERY_SIGNOFF_20260814
+            #
+            # Historical bracket:
+            #   Aug-13 working lineage: qualifier was serial.
+            #   Aug-14 AM lineage: bounded qualifier concurrency defaulted to 4.
+            # The hot provider files (pump_monitor/ws_price_oracle/ingest_pipeline)
+            # were otherwise byte-identical across that bracket, while the latest
+            # runtime showed the new persistent shared-provider pressure signature:
+            # Pump 429 + Oracle WSS 429/reconnect + long downstream cycles.
+            #
+            # Keep the safer worker/session implementation and the canonical DB
+            # connection corrections introduced with the concurrency patch, but
+            # cap effective concurrency to the Aug-13 behaviour by default.
+            # This is a provider-pressure rollback, not a gate/threshold rollback.
+            #
+            # After a sustained healthy soak, the cap can be deliberately raised
+            # without another code deployment by setting:
+            #   QUALIFIER_CONCURRENCY_RECOVERY_CAP > 1
+            _q_requested = int(float(get_config_value("QUALIFIER_CONCURRENCY", 4)))
+            _q_recovery_cap = int(float(
+                get_config_value("QUALIFIER_CONCURRENCY_RECOVERY_CAP", 1)
+            ))
+            _q_workers = max(
+                1,
+                min(_q_requested, max(1, _q_recovery_cap), 8, len(rows) or 1),
+            )
+
+            if rows and _q_workers > 1:
+                # Persistent pool - see _qualifier_pool(). Not a context manager,
+                # because `with ThreadPoolExecutor(...)` tears the threads down
+                # at block exit and destroys their keep-alive sessions.
+                _qpool = _qualifier_pool(_q_workers)
+                _results = list(_qpool.map(_qualify_row_guarded, rows))
+            else:
+                # Serial path retained verbatim for QUALIFIER_CONCURRENCY=1 and
+                # for single-row batches, so the rollback path is a real code
+                # path rather than a differently-shaped approximation of one.
+                _results = [_qualify_row_guarded(row) for row in rows]
+
+            # Tallies are accumulated on the parent thread only. Workers never
+            # mutate shared counters.
+            for _row_id, _outcome, _status, _reason in _results:
+                if _outcome == "processed":
                     processed += 1
-                    if status == "qualified":
+                    if _status == "qualified":
                         qualified += 1
-                    elif status == "deferred":
+                    elif _status == "deferred":
                         pass
                     else:
                         rejected += 1
-                    log.info("Signal synthesised row=%s mint=%s -> %s (%s)",
-                             row["id"], str(row.get("mint_address",""))[:16],
-                             status, reason)
-                except requests.RequestException as exc:
+                else:
                     errors += 1
-                    # CRITICAL FIX (2026-05-21): release qualify_claimed_until on network errors.
-                    # Without this, the finally-block safety invariant stamps
-                    # QUALIFIER_NO_VERDICT permanently - the actual trading-blocker bug.
-                    # Row goes back to clean pending|empty|unclaimed for normal retry.
-                    try:
-                        with get_connection() as conn:
-                            conn.execute(
-                                "UPDATE market_snapshots SET "
-                                "quality_status='pending', quality_reason='', "
-                                "qualify_claimed_until=NULL "
-                                "WHERE id=?",
-                                (row["id"],),
-                            )
-                            conn.commit()
-                    except Exception:
-                        pass
-                    log.warning(
-                        "Sensory fracture in qualifier network pathway for row=%s: %s "
-                        "(retryable, claim released)",
-                        row["id"], exc,
-                    )
-                except Exception as exc:
-                    errors += 1
-                    _mark_qualifier_error(row["id"], f"QUALIFIER_ERROR:{str(exc)[:220]}")
-                    log.exception("Severe cognitive dissonance in qualifier for row=%s: %s",
-                                  row["id"], exc)
-                finally:
-                    # SAFETY INVARIANT: no claimed row may exit with quality_status='pending'
-                    # and blank quality_reason. Marks error so row doesn't stay invisibly stuck.
-                    try:
-                        with get_connection() as _inv_conn:
-                            _inv_conn.execute("""
-                                UPDATE market_snapshots
-                                SET quality_status='error',
-                                    quality_reason='QUALIFIER_NO_VERDICT',
-                                    qualify_claimed_until=NULL
-                                WHERE id=?
-                                  AND COALESCE(quality_status,'') = 'pending'
-                                  AND COALESCE(quality_reason,'') = ''
-                                  AND qualify_claimed_until IS NOT NULL
-                            """, (row["id"],))
-                            _inv_conn.commit()
-                    except Exception:
-                        pass
 
             note = (
                 f"processed={processed} qualified={qualified} "
                 f"rejected={rejected} errors={errors} | "
                 f"fresh_qual_priced={fresh_qualified_priced} "
-                f"tradeable={priced_tradeable} latched={latched_ready}"
+                f"tradeable={priced_tradeable} latched={latched_ready} "
+                f"q_workers={_q_workers}/{_q_requested}"
                 if rows else
                 f"Idle | fresh_qual_priced={fresh_qualified_priced} "
-                f"tradeable={priced_tradeable} latched={latched_ready}"
+                f"tradeable={priced_tradeable} latched={latched_ready} "
+                f"q_workers={_q_workers}/{_q_requested}"
             )
             update_heartbeat(
                 "qualifier", "ALIVE", note,
@@ -1554,59 +1977,188 @@ def _fetch_price_dexscreener(session: requests.Session, mint: str) -> Optional[f
         return None
 
 
+# ── EDGE_AUDIT_20260816: SOL/USD basis state ─────────────────────────────────
+# Module-level and lock-guarded rather than function attributes. Gemini's red
+# team flagged the attribute pattern as fragile; it is also unsafe under the
+# pricer's ThreadPoolExecutor (PRICER_MAX_WORKERS up to 12).
+#
+# A failure is NEVER written into "value". It is recorded as a timestamp and a
+# state string. Nothing in this structure can be mistaken for an observation.
+_SOL_USD_LOCK = threading.Lock()
+_SOL_USD_CACHE: dict = {
+    "state": "UNKNOWN",       # FRESH | DEGRADED | UNAVAILABLE | UNKNOWN
+    "value": None,            # float, ONLY ever a real observation
+    "age_sec": None,
+    "source": None,
+    "observed_at": 0.0,
+    "last_failure_at": 0.0,
+    "last_error": None,
+    "degraded_memo": {},
+}
+
+
+def _set_sol_usd_state(state: str, value, age_sec, source, now: float) -> None:
+    with _SOL_USD_LOCK:
+        _SOL_USD_CACHE["state"] = state
+        _SOL_USD_CACHE["age_sec"] = age_sec
+        _SOL_USD_CACHE["source"] = source
+        if state == "FRESH" and value and float(value) > 0:
+            _SOL_USD_CACHE["value"] = float(value)
+            _SOL_USD_CACHE["observed_at"] = now
+            _SOL_USD_CACHE["last_error"] = None
+        elif state == "DEGRADED":
+            # Report the value actually being SERVED, so the accessor never
+            # disagrees with what callers received. observed_at is deliberately
+            # NOT refreshed: this observation is not ours, its age must keep
+            # advancing toward the bound, and leaving observed_at stale also
+            # guarantees the positive-cache branch above can never re-serve a
+            # degraded value as if it were fresh.
+            if value and float(value) > 0:
+                _SOL_USD_CACHE["value"] = float(value)
+        else:
+            _SOL_USD_CACHE["value"] = None
+
+
+def _note_sol_usd_failure(now: float, error: str) -> None:
+    with _SOL_USD_LOCK:
+        _SOL_USD_CACHE["last_failure_at"] = now
+        _SOL_USD_CACHE["last_error"] = error
+
+
+def sol_usd_basis_state() -> dict:
+    """Machine-readable freshness/provenance for the SOL/USD basis.
+
+    Consumers that need to distinguish "unavailable" from "zero" read this
+    instead of interpreting the float returned by _fetch_sol_usd_price. This
+    is the seam for a future typed basis; it is deliberately additive so that
+    this repair changes no existing call site.
+    """
+    with _SOL_USD_LOCK:
+        out = dict(_SOL_USD_CACHE)
+    out.pop("degraded_memo", None)
+    return out
+
+
 def _fetch_sol_usd_price(session: requests.Session) -> float:
+    """Canonical fresh SOL/USD fetch + persistence.
+
+    The previous helper fetched SOL/USD for internal conversion but never
+    published the basis used by stop-realisability. This version delegates to
+    the shared publisher, which writes both system_config and a dedicated wSOL
+    mtm tick with source and timestamp. It never invents or refreshes a stale
+    default.
+    """
+    # EDGE_AUDIT_20260816 — SOL/USD BASIS TRUTH REPAIR (P3-FINAL).
+    #
+    # REGRESSION (05_AUG_HIGH_OVERNIGHT -> 05_AUG_LATE_PM, the only
+    # edge-relevant change in that diff):
+    #
+    #     price = float(result.get("value") or 0.0)
+    #     _fetch_sol_usd_price._cache = (price if price > 0 else 0.0, now)
+    #
+    # refresh_sol_usd_basis() returns {"value": None} on failure and has never
+    # returned zero. This caller manufactured the zero, then served it as an
+    # observation for a full 30 seconds to every qualifier, pricing and MTM
+    # consumer in the process. Downstream that means:
+    #
+    #   :1348  curve_mcap_usd = 0 -> BELOW_MIN_MCAP rejection
+    #   :2241  _fetch_price_bonding_curve SKIPPED (guarded on sol_usd > 0)
+    #
+    # The bonding curve is the only pricing venue a pre-graduation pump.fun
+    # token has, so a zeroed basis does not degrade pricing — it disables it,
+    # and open positions become unpriceable. 04 Aug best cluster NO_COVERAGE 0;
+    # 17 Aug latest 10h NO_COVERAGE 84/128.
+    #
+    # REPAIR. The intent of the 05 Aug change — never block the hot path on a
+    # dead provider — is preserved in full. What is removed is the
+    # substitution of a number for "unknown". Failure is NEVER stored as a
+    # value. It lives in a separate timestamp and a typed state object.
+    #
+    # Last-known-good is NOT reimplemented here. sol_usd_basis.read_persisted_basis()
+    # already returns value + age_sec + source from the persisted canonical
+    # basis; it is DB-backed, survives restarts and is shared across processes.
+    # This function consults that authority rather than creating a second one.
+    #
+    # The 0.0 return is retained deliberately. Every consumer already treats
+    # <= 0 as unavailable and fails closed; changing the return type to
+    # Optional would raise TypeError at :1348, :2241, :2473 and :2523, which is
+    # a hot-path refactor this repair must not perform. Machine-readable state
+    # is exposed separately via sol_usd_basis_state().
     now = time.time()
-    if hasattr(_fetch_sol_usd_price, "_cache"):
-        cached_price, cached_at = _fetch_sol_usd_price._cache
-        if now - cached_at < 30:
-            return cached_price
+    _ttl = float(get_config_value("SOL_USD_POSITIVE_TTL_SEC", 10.0))
+    _cooldown = float(get_config_value("SOL_USD_FAILURE_COOLDOWN_SEC", 3.0))
+    _max_degraded = float(get_config_value("SOL_USD_MAX_DEGRADED_AGE_SEC", 15.0))
 
-    try:
-        resp = session.get(
-            "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112",
-            timeout=5,
-            headers={"Accept": "application/json"},
-        )
-        if resp.status_code == 200:
-            pairs = (resp.json() or {}).get("pairs") or []
-            sol_pairs = [p for p in pairs if isinstance(p, dict)
-                         and str(p.get("chainId") or "").lower() == "solana"]
-            if sol_pairs:
-                best = max(sol_pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
-                price = float(best.get("priceUsd") or 0)
-                if price > 0:
-                    _fetch_sol_usd_price._cache = (price, now)
-                    return price
-    except Exception:
-        pass
+    with _SOL_USD_LOCK:
+        _cached = _SOL_USD_CACHE.get("value") or 0.0
+        _cached_at = _SOL_USD_CACHE.get("observed_at") or 0.0
+        if _cached > 0 and (now - _cached_at) < _ttl:
+            return float(_cached)
+        _last_fail = _SOL_USD_CACHE.get("last_failure_at") or 0.0
+        _in_cooldown = (now - _last_fail) < _cooldown
+        _degraded_memo = dict(_SOL_USD_CACHE.get("degraded_memo") or {})
 
-    try:
-        resp = session.get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": "solana", "vs_currencies": "usd"},
-            timeout=5,
-            headers={"Accept": "application/json"},
-        )
-        if resp.status_code == 200:
-            price = float((resp.json() or {}).get("solana", {}).get("usd") or 0)
-            if price > 0:
-                _fetch_sol_usd_price._cache = (price, now)
-                return price
-    except Exception:
-        pass
+    if not _in_cooldown:
+        try:
+            from services.sol_usd_basis import refresh_sol_usd_basis
+            # Hot path: keep the per-provider timeout short. The launcher
+            # performs the authoritative preflight refresh with a longer one.
+            result = refresh_sol_usd_basis(session=session, timeout=1.0)
+            _raw = result.get("value")
+            _price = float(_raw) if _raw not in (None, "") else 0.0
+            if _price > 0:
+                _set_sol_usd_state("FRESH", _price, 0.0,
+                                   result.get("source") or "refresh", now)
+                return _price
+            _note_sol_usd_failure(now, str(result.get("error") or "value_none"))
+            log.warning("SOL/USD canonical refresh unavailable: %s",
+                        result.get("error"))
+        except Exception as exc:
+            _note_sol_usd_failure(now, f"{type(exc).__name__}:{exc}")
+            log.warning("SOL/USD canonical refresh failed: %s", exc)
 
+    # DEGRADED: consult the persisted canonical basis. Memoised for the
+    # cooldown window so a sustained outage cannot turn every pricing worker
+    # into a DB reader on the shared trading database.
+    _persisted = None
+    if _degraded_memo and (now - float(_degraded_memo.get("read_at") or 0.0)) < _cooldown:
+        _persisted = _degraded_memo.get("payload")
+    if _persisted is None:
+        try:
+            from services.sol_usd_basis import read_persisted_basis
+            _persisted = read_persisted_basis()
+        except Exception as exc:
+            _persisted = {"value": None, "error": f"read_failed:{exc}"}
+        with _SOL_USD_LOCK:
+            _SOL_USD_CACHE["degraded_memo"] = {"read_at": now, "payload": _persisted}
+
+    _pv = (_persisted or {}).get("value")
+    _page = (_persisted or {}).get("age_sec")
     try:
-        fallback_resp = __import__('urllib.request', fromlist=['urlopen']).urlopen(
-            'https://price.jup.ag/v6/price?ids=SOL', timeout=3
-        )
-        import json as _json
-        fallback_data = _json.loads(fallback_resp.read())
-        fallback_price = float((fallback_data.get('data') or {}).get('SOL', {}).get('price') or 0)
-        if fallback_price > 0:
-            _fetch_sol_usd_price._cache = (fallback_price, now)
-            return fallback_price
-    except Exception:
-        pass
+        _pv = float(_pv) if _pv not in (None, "") else 0.0
+        _page = float(_page) if _page not in (None, "") else None
+    except (TypeError, ValueError):
+        _pv, _page = 0.0, None
+
+    if _pv > 0 and _page is not None and _page <= _max_degraded:
+        _src = (_persisted or {}).get("source") or "persisted_basis"
+        _set_sol_usd_state("DEGRADED", _pv, _page, _src, now)
+        # Drift telemetry: lets the operator DERIVE the correct degraded bound
+        # from observation instead of arguing about the default.
+        _prev = float(_degraded_memo.get("last_value") or 0.0)
+        _drift = (abs(_pv - _prev) / _prev * 100.0) if _prev > 0 else 0.0
+        log.warning("[SOL_USD_DEGRADED] value=%.4f age=%.1fs bound=%.0fs "
+                    "source=%s drift_since_last=%.3f%% reason=refresh_unavailable",
+                    _pv, _page, _max_degraded, _src, _drift)
+        with _SOL_USD_LOCK:
+            _SOL_USD_CACHE.setdefault("degraded_memo", {})["last_value"] = _pv
+        return _pv
+
+    _set_sol_usd_state("UNAVAILABLE", None, _page, None, now)
+    log.error("[SOL_USD_UNAVAILABLE] persisted_age=%s bound=%.0fs — returning "
+              "0.0; every consumer must fail closed. Do NOT widen the bound to "
+              "silence this.",
+              ("%.1fs" % _page) if _page is not None else "none", _max_degraded)
     return 0.0
 
 
@@ -1783,9 +2335,9 @@ def _append_mtm_rows(rows: List[Tuple[str, float]], now: float) -> int:
                             last_price=?,
                             last_marked_at=?,
                             market_value_usd=?,
-                            highest_price_seen=CASE
-                                WHEN COALESCE(highest_price_seen, 0) > ?
-                                THEN highest_price_seen
+                            display_high_price=CASE
+                                WHEN COALESCE(display_high_price, 0) > ?
+                                THEN display_high_price
                                 ELSE ? END
                         WHERE id=?
                           AND status='OPEN'

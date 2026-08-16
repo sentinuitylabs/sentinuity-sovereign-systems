@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import json
 import random
 from pathlib import Path
 from typing import Optional, Any
@@ -108,6 +109,174 @@ def get_intel_connection(timeout: float = 8.0):
         isolation_level=None, factory=ResilientConnection,
     )
     return _configure_connection(conn, busy_ms=30000)
+
+# ── MODE3_FINAL_SIGNOFF_20260806: EXECUTION-CRITICAL WRITE PATH ──────────────
+# DEFECT: LOCK_RETRY_MAX_SEC = 30.0 means an execution-critical write (oracle
+# mark, qualified peak, runner-floor update, close claim, transaction signature,
+# settlement state) can block inside _retry_locked for up to 30 seconds. Mode 3
+# invariant D forbids an execution-critical write sleeping or backing off for
+# tens of seconds. Analytics/telemetry/Council/UI writes may still wait.
+CRITICAL_LOCK_RETRY_MAX_SEC = 2.0
+
+_CRITICAL_BLOCKER: dict = {"active": False, "reason": "", "at": 0.0, "count": 0}
+
+
+class CriticalWriteBlocked(RuntimeError):
+    """Raised when an execution-critical SQLite write cannot complete in time."""
+
+
+class CriticalCursor(sqlite3.Cursor):
+    def execute(self, sql, parameters=()):
+        parent = super().execute
+        return _retry_locked(lambda: parent(sql, parameters),
+                             max_wait_sec=CRITICAL_LOCK_RETRY_MAX_SEC)
+
+    def executemany(self, sql, seq_of_parameters):
+        parent = super().executemany
+        return _retry_locked(lambda: parent(sql, seq_of_parameters),
+                             max_wait_sec=CRITICAL_LOCK_RETRY_MAX_SEC)
+
+
+class CriticalConnection(sqlite3.Connection):
+    def cursor(self, factory=CriticalCursor):
+        return super().cursor(factory)
+
+    def execute(self, sql, parameters=()):
+        return self.cursor().execute(sql, parameters)
+
+    def executemany(self, sql, seq_of_parameters):
+        return self.cursor().executemany(sql, seq_of_parameters)
+
+    def commit(self):
+        parent = super().commit
+        return _retry_locked(parent, max_wait_sec=CRITICAL_LOCK_RETRY_MAX_SEC)
+
+
+def get_critical_connection(db: str = "matrix") -> sqlite3.Connection:
+    """Short-transaction connection for execution-critical writes.
+
+    Bounded at CRITICAL_LOCK_RETRY_MAX_SEC (default 2s) rather than 30s.
+    On exhaustion the caller receives sqlite3.OperationalError and MUST call
+    record_critical_write_failure() rather than swallowing it.
+    """
+    path = DB_PATH if db == "matrix" else (BASE_DIR / "sentinuity_intelligence.db")
+    conn = sqlite3.connect(
+        str(path), timeout=CRITICAL_LOCK_RETRY_MAX_SEC, isolation_level=None,
+        check_same_thread=False, factory=CriticalConnection,
+    )
+    return _configure_connection(conn, busy_ms=int(CRITICAL_LOCK_RETRY_MAX_SEC * 1000))
+
+
+def record_critical_write_failure(what: str, exc: BaseException) -> None:
+    """Surface a failed execution-critical write as a visible blocker.
+
+    Mode 3 invariant D: do not hide failed critical writes. While the blocker is
+    active, is_live_entry_blocked() returns True and new live entries must not
+    be opened. Persisted to system_config so other processes observe it.
+    """
+    _CRITICAL_BLOCKER.update({
+        "active": True,
+        "reason": f"{what}: {type(exc).__name__}: {exc}"[:400],
+        "at": time.time(),
+        "count": int(_CRITICAL_BLOCKER.get("count", 0)) + 1,
+    })
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=1.0, isolation_level=None)
+        conn.execute("PRAGMA busy_timeout=1000")
+        conn.execute(
+            "INSERT OR REPLACE INTO system_config(key,value) VALUES(?,?)",
+            ("MODE3_CRITICAL_WRITE_BLOCKER",
+             json.dumps({"reason": _CRITICAL_BLOCKER["reason"],
+                         "at": _CRITICAL_BLOCKER["at"],
+                         "count": _CRITICAL_BLOCKER["count"]})),
+        )
+        conn.close()
+    except Exception:
+        pass
+
+
+def critical_write_blocker() -> dict:
+    """Current blocker state, merged across processes via system_config."""
+    state = dict(_CRITICAL_BLOCKER)
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=1.0)
+        row = conn.execute(
+            "SELECT value FROM system_config WHERE key='MODE3_CRITICAL_WRITE_BLOCKER'"
+        ).fetchone()
+        conn.close()
+        if row and row[0]:
+            shared = json.loads(row[0])
+            ttl = 300.0
+            if time.time() - float(shared.get("at", 0)) < ttl:
+                state["active"] = True
+                state["reason"] = shared.get("reason", state.get("reason", ""))
+                state["at"] = shared.get("at", state.get("at", 0.0))
+                state["count"] = max(int(state.get("count", 0)),
+                                     int(shared.get("count", 0)))
+    except Exception:
+        pass
+    return state
+
+
+def is_live_entry_blocked() -> tuple:
+    st = critical_write_blocker()
+    if st.get("active"):
+        return True, f"critical_write_failure:{str(st.get('reason'))[:160]}"
+    return False, ""
+
+
+def clear_critical_write_blocker() -> None:
+    """Operator-invoked reset. Never called automatically."""
+    _CRITICAL_BLOCKER.update({"active": False, "reason": "", "at": 0.0})
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=2.0, isolation_level=None)
+        conn.execute("DELETE FROM system_config WHERE key='MODE3_CRITICAL_WRITE_BLOCKER'")
+        conn.close()
+    except Exception:
+        pass
+
+
+
+def effective_max_hold_seconds(position=None) -> float:
+    """Canonical Mode 3 max-hold authority.
+
+    EXECUTOR_MAX_HOLD_SECONDS is authoritative. A position may carry an explicit
+    max_hold_override_sec; legacy MAX_HOLD_SECONDS is synchronised as a display
+    alias and never independently governs execution.
+    """
+    override = None
+    if position is not None:
+        try:
+            if isinstance(position, dict):
+                override = position.get("max_hold_override_sec")
+            else:
+                override = position["max_hold_override_sec"] if "max_hold_override_sec" in position.keys() else None
+        except Exception:
+            override = None
+    if override not in (None, ""):
+        try:
+            return max(1.0, float(override))
+        except Exception:
+            pass
+    try:
+        return max(1.0, float(get_config_value("EXECUTOR_MAX_HOLD_SECONDS", 900.0)))
+    except Exception:
+        return 900.0
+
+
+def sync_max_hold_alias() -> float:
+    """Synchronise the legacy display alias to the canonical executor value."""
+    value = effective_max_hold_seconds()
+    conn = get_critical_connection("matrix")
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO system_config(key,value) VALUES(?,?)",
+            ("MAX_HOLD_SECONDS", str(int(value) if value.is_integer() else value)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return value
 
 def get_connection() -> sqlite3.Connection:
     """
@@ -452,6 +621,24 @@ def ensure_hub_compat_schema() -> None:
                     updated_at    REAL
                 )
             """)
+
+
+            # Council research authorities.  These rows are idempotent doctrine
+            # seeds, not fetched content and not executable authority.
+            _forge_now = time.time()
+            for _key, _title, _desc, _priority in (
+                ("quant_grid_dca_research", "Quant / grid / DCA research",
+                 "Inspect public architecture patterns for bounded research evidence.", 10),
+                ("agentic_trading_frameworks", "Agentic trading frameworks",
+                 "Inspect public agent orchestration and safety patterns.", 9),
+                ("wallet_convergence", "Wallet convergence research",
+                 "Inspect public wallet intelligence and convergence designs.", 8),
+            ):
+                conn.execute(
+                    "INSERT OR IGNORE INTO forge_projects("
+                    "project_key,title,description,status,priority,current_stage,created_at,updated_at"
+                    ") VALUES(?,?,?,'active',?,'RESEARCH',?,?)",
+                    (_key, _title, _desc, _priority, _forge_now, _forge_now))
 
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS forge_research_cache (

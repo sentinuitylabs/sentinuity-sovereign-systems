@@ -2,8 +2,9 @@
 
 Every cycle it derives the public address from ``SOLANA_PRIVATE_KEY``, reads the
 confirmed on-chain SOL balance, obtains a fresh SOL/USD price and publishes one
-canonical wallet snapshot.  It runs in LIVE *and* DUAL mode and never mutates
-paper equity or a paper starting balance.
+canonical wallet snapshot. Wallet visibility is read-only and therefore refreshes
+whenever signing credentials are configured, independent of whether LIVE/DUAL is
+currently armed. It never mutates paper equity or a paper starting balance.
 """
 from __future__ import annotations
 
@@ -99,6 +100,8 @@ def _rpc_urls() -> list[tuple[str, str]]:
         ("QUICKNODE_RPC", os.getenv("QUICKNODE_RPC", "")),
         ("SOLANA_RPC_URL", os.getenv("SOLANA_RPC_URL", "")),
         ("HELIUS_RPC", os.getenv("HELIUS_RPC", "")),
+        ("HELIUS_RPC_URL", os.getenv("HELIUS_RPC_URL", "")),
+        ("SOLANA_PUBLIC", "https://api.mainnet-beta.solana.com"),
     ]
     seen: set[str] = set()
     result: list[tuple[str, str]] = []
@@ -215,7 +218,14 @@ def fetch_real_wallet_usd() -> Optional[float]:
 
 
 def sync_once(*, force: bool = False) -> bool:
-    if not force and not live_lane_enabled():
+    # Wallet balance visibility is telemetry, not trading authority. Historically
+    # this was gated by live_lane_enabled(), so the same funded wallet could show
+    # SYNCED on a live launch and UNSYNCED on a paper/disarmed launch. Refresh it
+    # whenever credentials exist; entry/exit arming remains governed elsewhere.
+    _load_env()
+    if not os.getenv("SOLANA_PRIVATE_KEY", "").strip():
+        if force:
+            record_live_wallet_error("SOLANA_PRIVATE_KEY_NOT_SET")
         return False
     try:
         snap = fetch_real_wallet_snapshot()

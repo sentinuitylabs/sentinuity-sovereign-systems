@@ -38,10 +38,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.append(str(BASE_DIR))
 
 from core.schema import get_connection, update_heartbeat
-from services.provider_firewall import (
-    check_provider, log_api_call,
-    GITHUB_AUTH_INVALID_ANONYMOUS, GITHUB_AUTH_REVALIDATE,
-)
+from services.provider_firewall import check_provider, log_api_call
 
 try:
     from dotenv import load_dotenv
@@ -70,7 +67,16 @@ MAX_SOURCE_BYTES = 140_000
 # This is represented as a 20-cycle deterministic trail so the Council cannot
 # starve the Intel/Substrate buildout simply because trading repositories are
 # more numerous or more exciting.
-_MODE_TRAIL = ["BUILDOUT"] * 10 + ["EDGE_HUNT"] * 7 + ["FRONTIER"] * 3
+# Interleaved 20-cycle trail preserves the exact 50/35/15 allocation while
+# ensuring a short operator session sees both organism buildout and edge hunting.
+# The prior grouped 10/7/3 sequence could spend many hours entirely in BUILDOUT.
+_MODE_TRAIL = [
+    "BUILDOUT", "EDGE_HUNT", "BUILDOUT", "FRONTIER",
+    "BUILDOUT", "EDGE_HUNT", "BUILDOUT", "EDGE_HUNT",
+    "BUILDOUT", "FRONTIER", "EDGE_HUNT", "BUILDOUT",
+    "EDGE_HUNT", "BUILDOUT", "FRONTIER", "EDGE_HUNT",
+    "BUILDOUT", "EDGE_HUNT", "BUILDOUT", "BUILDOUT",
+]
 
 MODE_LABELS = {
     "BUILDOUT": "BUILDING THE ORGANISM",
@@ -122,34 +128,106 @@ EXPEDITIONS = {
         },
     ],
     "EDGE_HUNT": [
+        # ENTRY EDGE ---------------------------------------------------------
         {
             "project_key": "solana_entry_pipeline_research",
             "topic": "pumpfun_entry_selection",
             "queries": [
                 "pump fun trading bot solana bonding curve market cap liquidity filter",
-                "solana meme coin trading bot momentum liquidity marketcap python",
+                "solana memecoin early entry fresh pair momentum liquidity bot",
                 "pumpfun smart money market cap entry regime wallet convergence solana",
+                "solana token launch filter bonding curve graduation entry strategy",
             ],
-            "keywords": ("pump", "bonding", "curve", "liquidity", "market", "momentum", "solana"),
+            "keywords": ("pump", "bonding", "curve", "liquidity", "market", "momentum", "solana", "entry"),
         },
+
+        # SMART CAPITAL / COPYTRADE -----------------------------------------
         {
             "project_key": "wallet_convergence",
             "topic": "smart_money_copytrade",
             "queries": [
                 "solana smart money wallet tracking copy trading python",
                 "solana whale wallet copytrade scoring wallet performance",
-                "solana wallet cohort copytrade realised pnl ranking conviction",
+                "solana wallet funding ancestry cluster copytrade profitable wallets",
+                "solana holder concentration wallet convergence smart capital bot",
             ],
-            "keywords": ("wallet", "copy", "whale", "smart", "performance", "solana", "trade"),
+            "keywords": ("wallet", "copy", "whale", "smart", "performance", "funding", "holder", "solana"),
         },
+
+        # MANIPULATION / SAFETY ---------------------------------------------
+        {
+            "project_key": "solana_manipulation_research",
+            "topic": "bundle_insider_rug_detection",
+            "queries": [
+                "solana bundled wallet detection pumpfun insider dev wallet bot",
+                "pumpfun bundle detection coordinated wallets funding ancestry",
+                "solana liquidity withdrawal rug detector deployer wallet cluster",
+            ],
+            "keywords": ("bundle", "bundled", "insider", "deployer", "rug", "wallet", "liquidity", "funding"),
+        },
+
+        # EXECUTION ----------------------------------------------------------
         {
             "project_key": "sniper_lane_research",
             "topic": "solana_launch_execution",
             "queries": [
                 "pumpfun sniper bot jito solana python",
                 "solana token launch sniper bonding curve transaction simulation",
+                "solana trading bot rpc failover jupiter route priority fee latency",
+                "jito priority fee solana trading execution route optimization",
             ],
-            "keywords": ("sniper", "jito", "launch", "simulation", "bonding", "transaction", "solana"),
+            "keywords": ("sniper", "jito", "launch", "simulation", "transaction", "rpc", "jupiter", "latency"),
+        },
+
+        # HARVESTING ---------------------------------------------------------
+        {
+            "project_key": "runner_harvest_research",
+            "topic": "dynamic_profit_capture",
+            "queries": [
+                "solana memecoin trailing take profit runner exit trading bot",
+                "crypto dynamic profit lock peak capture algorithm bot",
+                "solana momentum trailing stop runner harvesting strategy",
+            ],
+            "keywords": ("trailing", "profit", "runner", "exit", "peak", "take", "harvest", "momentum"),
+        },
+
+        # MARKET MAKING / ARBITRAGE / MEV ----------------------------------
+        {
+            "project_key": "market_structure_edge_research",
+            "topic": "market_making_arbitrage_mev",
+            "queries": [
+                "solana market making bot inventory spread risk python",
+                "solana arbitrage bot jupiter dex routing latency",
+                "solana mev trading strategy bundle arbitrage open source",
+            ],
+            "keywords": ("market", "making", "arbitrage", "mev", "spread", "inventory", "jupiter", "dex"),
+        },
+
+        # PASSIVE / AUTOMATED CLAIMS ----------------------------------------
+        # Claims are discovery leads only. Existing safety/provenance scoring
+        # still decides whether any underlying mechanism is worth abstraction.
+        {
+            "project_key": "automated_income_claim_research",
+            "topic": "passive_automated_trading_claims",
+            "queries": [
+                "solana passive income trading bot automated open source",
+                "profitable solana trading bot automated income github",
+                "hands free crypto trading bot solana market making",
+                "solana yield automated trading strategy bot",
+            ],
+            "keywords": ("passive", "automated", "profit", "profitable", "income", "yield", "strategy", "solana"),
+        },
+
+        # SUBSTRATE-NATIVE / LOWER-VOLATILITY AUTOMATION -------------------
+        {
+            "project_key": "substrate_passive_strategy_research",
+            "topic": "substrate_native_automation",
+            "queries": [
+                "crypto paper trading framework passive strategy mean reversion python",
+                "automated market neutral crypto strategy risk controlled python",
+                "crypto systematic trading bot low volatility portfolio rebalance",
+            ],
+            "keywords": ("paper", "systematic", "mean", "reversion", "market", "neutral", "portfolio", "risk"),
         },
     ],
     "FRONTIER": [
@@ -263,39 +341,15 @@ def _effective_github_token(configured_token: str) -> tuple[str, str]:
     allowed, reason = check_provider("github", SERVICE_NAME)
     if not allowed:
         raise GitHubAccessUnavailable(f"provider firewall: {reason}")
-    if reason == GITHUB_AUTH_INVALID_ANONYMOUS:
+    if reason == "GITHUB_AUTH_INVALID_ANONYMOUS":
         return "", reason
     return configured_token, reason
-
-
-_SEARCH_REQUEST_TIMES: list[float] = []
-
-
-def _reserve_github_search_request(authenticated: bool) -> None:
-    """Local process budget below GitHub's documented search ceilings.
-
-    Anonymous search is deliberately capped at 8/minute (provider ceiling 10),
-    authenticated search at 25/minute (provider ceiling 30).  The reserve is
-    charged per *actual HTTP search request*, including a 401 anonymous retry.
-    """
-    now = time.time()
-    cutoff = now - 60.0
-    _SEARCH_REQUEST_TIMES[:] = [t for t in _SEARCH_REQUEST_TIMES if t >= cutoff]
-    limit = 25 if authenticated else 8
-    if len(_SEARCH_REQUEST_TIMES) >= limit:
-        raise GitHubAccessUnavailable(
-            f"GitHub local search budget exhausted ({len(_SEARCH_REQUEST_TIMES)}/{limit} in 60s)"
-        )
-    _SEARCH_REQUEST_TIMES.append(now)
 
 
 def _github_get(url: str, configured_token: str, *, params=None, timeout: int = 12, accept: str = "application/vnd.github+json"):
     """GET GitHub with one safe authenticated->anonymous fallback on HTTP 401."""
     import requests
     token, reason = _effective_github_token(configured_token)
-    is_search = "/search/repositories" in url
-    if is_search:
-        _reserve_github_search_request(bool(token))
     headers = _provider_headers(token)
     headers["Accept"] = accept
     r = requests.get(url, params=params, headers=headers, timeout=timeout)
@@ -304,12 +358,11 @@ def _github_get(url: str, configured_token: str, *, params=None, timeout: int = 
                  error_type=None if r.status_code == 200 else r.text[:120])
 
     if r.status_code == 401 and token:
-        # log_api_call marks auth invalid. Ask the firewall again; anonymous
-        # fallback is allowed only when the firewall explicitly grants it.
+        # The credential was rejected. log_api_call has now marked GitHub auth
+        # invalid; ask the firewall again and continue only if it explicitly
+        # grants anonymous public-read authority.
         anon_token, anon_reason = _effective_github_token(configured_token)
-        if anon_token == "" and anon_reason == GITHUB_AUTH_INVALID_ANONYMOUS:
-            if is_search:
-                _reserve_github_search_request(False)
+        if anon_token == "" and anon_reason == "GITHUB_AUTH_INVALID_ANONYMOUS":
             headers = _provider_headers("")
             headers["Accept"] = accept
             r = requests.get(url, params=params, headers=headers, timeout=timeout)
@@ -319,6 +372,7 @@ def _github_get(url: str, configured_token: str, *, params=None, timeout: int = 
                 log.warning("GitHub token rejected; expedition continuing in anonymous public-read mode")
     return r
 
+
 def _request_json(url: str, token: str, timeout: int = 12):
     r = _github_get(url, token, timeout=timeout)
     if r.status_code != 200:
@@ -326,132 +380,30 @@ def _request_json(url: str, token: str, timeout: int = 12):
     return r.json()
 
 
-_LAST_SEARCH_TRACE: list[dict] = []
-
-
-def _relaxed_search_queries(query: str) -> list[str]:
-    """Specific -> broad search ladder while preserving GitHub qualifiers.
-
-    Council prompts are prose; repository search treats free terms
-    conjunctively.  Qualifiers such as ``language:python`` and ``stars:>100``
-    are extracted before tokenisation and re-attached to every relaxed rung.
-    Existing ``in:`` qualifiers are replaced only on the relaxed rungs.
-    """
-    raw = " ".join(str(query or "").split())
-    qualifier_re = re.compile(r'(?<!\S)([A-Za-z][A-Za-z0-9_.-]*:(?:"[^"]+"|\S+))')
-    qualifiers = qualifier_re.findall(raw)
-    non_in = [q for q in qualifiers if not q.lower().startswith("in:")]
-    free = qualifier_re.sub(" ", raw)
-    words = [w for w in re.findall(r"[A-Za-z0-9_.+-]+", free.lower()) if len(w) > 1]
-    stop = {"architecture","framework","system","code","software","research","dashboard"}
-    useful = [w for w in words if w not in stop]
-
-    def compose(ws, in_scope):
-        parts = list(ws) + list(non_in)
-        if in_scope:
-            parts.append(in_scope)
-        q = " ".join(parts)
-        # Stay below GitHub's 256-character limit, truncating on a token
-        # boundary so a qualifier is never severed mid-word.
-        if len(q) <= 240:
-            return q
-        kept = []
-        for tok in q.split():
-            if len(" ".join(kept + [tok])) > 240:
-                break
-            kept.append(tok)
-        return " ".join(kept)
-
-    variants=[]
-    bool_ops=len(re.findall(r"\b(?:AND|OR|NOT)\b", raw, re.I))
-    if raw and len(raw) <= 240 and bool_ops <= 5:
-        variants.append(raw)
-    if useful:
-        variants.append(compose(useful[:5], "in:name,description,readme"))
-        variants.append(compose(useful[:3], "in:name,description,readme"))
-    if len(useful)>=2:
-        variants.append(compose(useful[:2], "in:name,description"))
-    out=[];seen=set()
-    for q in variants:
-        q=" ".join(q.split())
-        if q and q not in seen:
-            seen.add(q);out.append(q)
-    if not out:
-        # A NO_RESULTS produced without a single HTTP call is exactly the
-        # untruth this patch exists to remove.  Fail loudly instead.
-        raise GitHubAccessUnavailable(
-            f"GitHub QUERY_UNUSABLE: no searchable terms after normalisation: {raw[:120]!r}")
-    return out[:4]
-
 def _github_search(query: str, token: str, max_results: int = MAX_REPOS_PER_QUERY) -> list[dict]:
-    """Search GitHub with truthful zero-result diagnostics and bounded relaxation.
-
-    A provider/auth/transport problem still raises GitHubAccessUnavailable.  Only
-    actual HTTP-200 search responses may become NO_RESULTS.  If the descriptive
-    Council query returns zero, up to three progressively broader variants are
-    attempted before NO_RESULTS is accepted.
-    """
-    global _LAST_SEARCH_TRACE
-    _LAST_SEARCH_TRACE = []
     try:
-        for idx, effective_query in enumerate(_relaxed_search_queries(query)):
-            r = _github_get(
-                "https://api.github.com/search/repositories", token,
-                params={"q": effective_query, "sort": "stars", "order": "desc", "per_page": max_results},
-                timeout=12,
-            )
-            remaining = r.headers.get("x-ratelimit-remaining") or "?"
-            if r.status_code == 422:
-                _LAST_SEARCH_TRACE.append({"variant": idx, "query": effective_query, "status": 422,
-                                           "returned": 0, "rate_remaining": str(remaining),
-                                           "error": "QUERY_INVALID"})
-                raise GitHubAccessUnavailable(f"GitHub QUERY_INVALID_422: {r.text[:160]}")
-            if r.status_code in (403, 429):
-                reset_raw = r.headers.get("x-ratelimit-reset") or "0"
-                try: reset_at = float(reset_raw)
-                except Exception: reset_at = 0.0
-                wait = max(1.0, reset_at - time.time()) if reset_at else 5.0
-                # Honour provider backoff without pinning the scout for minutes.
-                time.sleep(min(wait, 30.0))
-                r = _github_get(
-                    "https://api.github.com/search/repositories", token,
-                    params={"q": effective_query, "sort": "stars", "order": "desc", "per_page": max_results},
-                    timeout=12,
-                )
-                remaining = r.headers.get("x-ratelimit-remaining") or "?"
-                if r.status_code in (403, 429):
-                    raise GitHubAccessUnavailable(
-                        f"GitHub RATE_LIMITED_{r.status_code}; remaining={remaining}; reset={reset_raw}"
-                    )
-            if r.status_code == 401:
-                raise GitHubAccessUnavailable(f"GitHub AUTH_401 after fallback; remaining={remaining}")
-            if r.status_code != 200:
-                raise GitHubAccessUnavailable(f"GitHub HTTP {r.status_code}: {r.text[:120]}")
-            payload = r.json()
-            items = list(payload.get("items", []) or [])
-            total_count = int(payload.get("total_count", len(items)) or 0)
-            _LAST_SEARCH_TRACE.append({
-                "variant": idx, "query": effective_query, "status": 200,
-                "total_count": total_count, "returned": len(items),
-                "rate_remaining": str(remaining),
+        r = _github_get(
+            "https://api.github.com/search/repositories", token,
+            params={"q": query, "sort": "stars", "order": "desc", "per_page": max_results},
+            timeout=12,
+        )
+        if r.status_code in (401, 403, 429):
+            detail = (r.headers.get("x-ratelimit-remaining") or "?")
+            raise GitHubAccessUnavailable(f"GitHub HTTP {r.status_code}; remaining={detail}")
+        if r.status_code != 200:
+            raise GitHubAccessUnavailable(f"GitHub HTTP {r.status_code}: {r.text[:120]}")
+        out = []
+        for item in r.json().get("items", []):
+            out.append({
+                "name": item.get("full_name", ""), "description": item.get("description", "") or "",
+                "stars": int(item.get("stargazers_count", 0) or 0), "language": item.get("language", "") or "",
+                "url": item.get("html_url", ""), "updated": item.get("updated_at", ""),
+                "topics": item.get("topics", []) or [], "owner": (item.get("owner") or {}).get("login", "") or "NOT_RESOLVED",
+                "licence": ((item.get("license") or {}).get("spdx_id") or "NOT_RESOLVED"),
+                "default_branch": item.get("default_branch", "main") or "main", "archived": bool(item.get("archived")),
+                "fork": bool(item.get("fork")),
             })
-            if not items:
-                log.info("[GITHUB_SEARCH_ZERO] variant=%d total_count=%d query=%r", idx, total_count, effective_query[:180])
-                continue
-            log.info("[GITHUB_SEARCH_HIT] variant=%d total_count=%d returned=%d query=%r", idx, total_count, len(items), effective_query[:180])
-            out = []
-            for item in items:
-                out.append({
-                    "name": item.get("full_name", ""), "description": item.get("description", "") or "",
-                    "stars": int(item.get("stargazers_count", 0) or 0), "language": item.get("language", "") or "",
-                    "url": item.get("html_url", ""), "updated": item.get("updated_at", ""),
-                    "topics": item.get("topics", []) or [], "owner": (item.get("owner") or {}).get("login", "") or "NOT_RESOLVED",
-                    "licence": ((item.get("license") or {}).get("spdx_id") or "NOT_RESOLVED"),
-                    "default_branch": item.get("default_branch", "main") or "main", "archived": bool(item.get("archived")),
-                    "fork": bool(item.get("fork")),
-                })
-            return out
-        return []
+        return out
     except GitHubAccessUnavailable:
         raise
     except Exception as exc:
@@ -584,7 +536,66 @@ def _choose_mode(total_cycles: int) -> str:
     return _MODE_TRAIL[int(total_cycles) % len(_MODE_TRAIL)]
 
 
+def _gap_driven_targets() -> list[dict]:
+    """COUNCIL_INTERNAL_FIRST_20260816.
+
+    Expeditions that answer a measured internal question take priority over the
+    static domain rotation. A brief only reaches EXTERNAL_REQUESTED after the
+    organism has been examined and the internal capability search returned a
+    genuine gap, so anything here is already gap-anchored by construction.
+
+    Failure is total and silent by design: if the Council layer is unavailable
+    the Scout falls back to its existing rotation. Council infrastructure must
+    never be able to stop reconnaissance, and it must never be a dependency of
+    anything on the trading hot path.
+    """
+    try:
+        from services.organism_causal_brief import load_brief, is_known
+        from services.causal_investigation import ensure_schema
+        from services.organism_causal_brief import connect_brief_db
+        ensure_schema()
+        conn = connect_brief_db()
+        try:
+            rows = conn.execute(
+                "SELECT brief_id FROM organism_causal_briefs "
+                "WHERE state='EXTERNAL_REQUESTED' ORDER BY updated_at DESC LIMIT 2"
+            ).fetchall()
+        finally:
+            conn.close()
+        out = []
+        for row in rows:
+            brief = load_brief(row["brief_id"])
+            if brief is None:
+                continue
+            question = brief.external_question
+            if not is_known(question):
+                continue
+            # Mechanism-level primitives derived from the measured gap, not
+            # repo-popularity browsing. A repo is not a finding.
+            primitives = [p for p in (brief.owning_code
+                                      if is_known(brief.owning_code) else []) if p]
+            queries = [str(question)[:250]]
+            for prim in primitives[:2]:
+                stem = str(prim).split("/")[-1].split(":")[0].replace(".py", "")
+                if stem:
+                    queries.append(f"{brief.capability} {stem} implementation")
+            out.append({
+                "project_key": f"gap_{brief.brief_id}",
+                "queries": queries,
+                "keywords": tuple(str(brief.capability).lower().split()[:6]),
+                "_brief_id": brief.brief_id,
+                "_gap_driven": True,
+            })
+        return out
+    except Exception:
+        return []
+
+
 def _targets_for_cycle(mode: str, cycle_no: int) -> list[dict]:
+    # COUNCIL_INTERNAL_FIRST_20260816: measured gaps outrank the rotation.
+    gap_targets = _gap_driven_targets()
+    if gap_targets:
+        return gap_targets[:2]
     targets = EXPEDITIONS[mode]
     if not targets:
         return []
@@ -731,6 +742,31 @@ def _inspect_repository(repo: dict, target: dict, token: str, mode: str, cycle_n
     }
 
 
+def _broad_fallback_query(target: dict) -> str:
+    """Return a deliberately broad second search when a precise trail is empty.
+
+    GitHub search rewards concise repository vocabulary; the original long
+    research-language queries repeatedly returned zero repositories. The broad
+    query changes discovery only, never scoring, safety, provenance or authority.
+    """
+    key = str(target.get("project_key") or "")
+    return {
+        "intelligence_tab_evolution": "agent observability dashboard python",
+        "substrate_node_evolution": "crypto paper trading framework python",
+        "autonomous_organism_buildout": "autonomous coding agent python",
+        "solana_entry_pipeline_research": "pumpfun trading bot solana",
+        "wallet_convergence": "solana wallet tracker copy trading",
+        "solana_manipulation_research": "solana bundle detector wallet rug",
+        "sniper_lane_research": "pumpfun sniper solana",
+        "runner_harvest_research": "solana trailing profit trading bot",
+        "market_structure_edge_research": "solana arbitrage market making bot",
+        "automated_income_claim_research": "solana automated trading bot",
+        "substrate_passive_strategy_research": "systematic crypto trading python",
+        "organism_frontier_architecture": "agent orchestration memory python",
+        "data_truth_frontier": "event sourcing trading python",
+    }.get(key, " ".join(str(target.get("topic") or key).replace("_", " ").split()[:4]))
+
+
 def _cycle() -> dict:
     import sqlite3 as _sq
     with get_connection() as conn:
@@ -747,21 +783,16 @@ def _cycle() -> dict:
                    discoveries_recorded=0, last_note=MODE_DESCRIPTIONS[mode])
         conn.commit()
 
-        configured_token = os.getenv("GITHUB_TOKEN", "").strip()
-        token, auth_reason = _effective_github_token(configured_token)
+        token = os.getenv("GITHUB_TOKEN", "").strip()
         anonymous = not bool(token)
-        # IMPORTANT: effective auth mode comes from the provider firewall, not
-        # merely from whether a stale token string exists in .env.  Otherwise a
-        # rejected token makes the cycle behave like authenticated search while
-        # every request is actually using anonymous fallback.
+        # Public GitHub repositories can be researched without a token.  Anonymous
+        # mode deliberately reduces scope so it stays inside GitHub's lower public
+        # API allowance; a token only increases depth, it is not authority.
         if anonymous:
             targets = targets[:1]
             _set_state(conn, status="FOLLOWING A PUBLIC TRAIL",
-                       last_note=("GitHub credential unavailable/rejected; using reduced public read-only reconnaissance"
-                                  if configured_token else
-                                  "No GITHUB_TOKEN configured; using reduced public read-only reconnaissance"))
+                       last_note="No GITHUB_TOKEN configured; using reduced public read-only reconnaissance")
             conn.commit()
-        log.info("[GITHUB_AUTH_MODE] mode=%s reason=%s", "anonymous" if anonymous else "authenticated", auth_reason)
 
         repos_seen, discoveries = 0, 0
         searches_completed = 0
@@ -777,12 +808,31 @@ def _cycle() -> dict:
                 conn.commit()
                 repos = _github_search(query, token, max_results=(2 if anonymous else MAX_REPOS_PER_QUERY))
                 searches_completed += 1
+                # Precise research-language searches repeatedly returned zero in
+                # runtime. Broaden once, visibly and with its own ledger event.
+                if not repos:
+                    _bq = _broad_fallback_query(target)
+                    if _bq and _bq.lower() != query.lower():
+                        _research_event(
+                            conn, "SEARCH_BROADENED", task_id=target["project_key"],
+                            query=_bq, parent_event_id=planned,
+                            summary=f"No repositories for precise query; broadening trail from: {query[:180]}",
+                            disposition="PLANNED", metadata={"mode": mode, "cycle_no": cycle_no},
+                        )
+                        conn.commit()
+                        repos = _github_search(_bq, token, max_results=(2 if anonymous else MAX_REPOS_PER_QUERY))
+                        searches_completed += 1
+                        _research_event(
+                            conn, "SEARCH_EXECUTED", task_id=target["project_key"],
+                            query=_bq, parent_event_id=planned,
+                            summary=f"repositories_returned={len(repos)} (broadened)",
+                            disposition="RESULTS" if repos else "NO_RESULTS",
+                            metadata={"mode": mode, "cycle_no": cycle_no, "broadened_from": query},
+                        )
                 repos_seen += len(repos)
                 _research_event(conn, "SEARCH_EXECUTED", task_id=target["project_key"], query=query, parent_event_id=planned,
-                                summary=f"repositories_returned={len(repos)}; variants={len(_LAST_SEARCH_TRACE)}",
-                                disposition="RESULTS" if repos else "NO_RESULTS",
-                                metadata={"mode": mode, "cycle_no": cycle_no, "auth_mode": "anonymous" if anonymous else "authenticated",
-                                          "search_trace": list(_LAST_SEARCH_TRACE)})
+                                summary=f"repositories_returned={len(repos)}", disposition="RESULTS" if repos else "NO_RESULTS",
+                                metadata={"mode": mode, "cycle_no": cycle_no})
                 _set_state(conn, status="LOOKING CLOSER", repositories_seen=repos_seen)
                 conn.commit()
 

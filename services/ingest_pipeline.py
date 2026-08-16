@@ -20,6 +20,7 @@ if str(BASE_DIR) not in sys.path:
 load_dotenv(BASE_DIR / ".env", override=True)
 
 from core.schema import get_connection, update_heartbeat, init_db, get_config_value
+from services.token_identity import resolve_token_identity
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,20 +37,55 @@ HB_RESOLVER = "resolver"
 HB_WEAVER   = "signal_engine"
 
 import os
-RPC_URL = os.getenv("HELIUS_RPC", "").strip().strip('"').strip("'")
-if not RPC_URL:
-    RPC_URL = os.getenv("QUICKNODE_RPC", "").strip().strip('"').strip("'")
-if not RPC_URL:
-    RPC_URL = os.getenv("SOLANA_RPC_URL", "").strip().strip('"').strip("'")
+import threading as _rpc_threading
+
+def _clean_rpc(value: str) -> str:
+    return str(value or "").strip().strip('"').strip("'")
+
+# SIGNOFF_OVERNIGHT_RPC_ROTATION_20260813
+# Pump Monitor stayed productive during provider pressure because it rotates
+# endpoints and has a public Solana last resort. Resolver adopts that proven
+# topology while preserving its historical retry boundary: ONE endpoint per
+# request; raw_dna RETRY owns later attempts.
+_RPC_CANDIDATES = [
+    _clean_rpc(os.getenv("HELIUS_RPC", "")),
+    _clean_rpc(os.getenv("HELIUS_RPC_URL", "")),
+    _clean_rpc(os.getenv("QUICKNODE_RPC", "")),
+    _clean_rpc(os.getenv("SOLANA_RPC_URL", "")),
+    "https://api.mainnet-beta.solana.com",
+]
+RPC_URLS = []
+for _u in _RPC_CANDIDATES:
+    if _u.startswith("http") and _u not in RPC_URLS:
+        RPC_URLS.append(_u)
+
+RPC_URL = RPC_URLS[0] if RPC_URLS else ""
+_rpc_lock = _rpc_threading.Lock()
+_rpc_counter = 0
+
+def _next_rpc_url() -> tuple[int, str]:
+    global _rpc_counter
+    if not RPC_URLS:
+        raise RuntimeError("No RPC URL configured")
+    with _rpc_lock:
+        idx = _rpc_counter % len(RPC_URLS)
+        _rpc_counter += 1
+    return idx, RPC_URLS[idx]
 
 HTTP_TIMEOUT = 8
 VALIDATION_BATCH_SIZE = 200
 RESOLVER_BATCH_SIZE = 6  # reduced from 100 — prevents RPC overload
 VALIDATION_SLEEP = 1.0
 RESOLVER_SLEEP = 0.6
-PIPELINE_SLEEP = max(2.0, float(os.getenv("INGEST_PIPELINE_SLEEP_SEC", "2.0")))
-LOCK_BACKOFF_MIN = max(15.0, float(os.getenv("INGEST_LOCK_BACKOFF_MIN_SEC", "15")))
-LOCK_BACKOFF_MAX = max(LOCK_BACKOFF_MIN, float(os.getenv("INGEST_LOCK_BACKOFF_MAX_SEC", "300")))
+PIPELINE_SLEEP = max(0.25, float(os.getenv("INGEST_PIPELINE_SLEEP_SEC", "1.0")))
+WEAVE_BATCH_LIMIT = max(1, int(os.getenv("INGEST_WEAVE_BATCH_LIMIT", "100")))
+# SIGNOFF_BOUNDED_LOCK_YIELD_20260731
+# Previous behaviour: 2s -> 4s -> 8s -> 16s -> 20s exponential sleep applied to the
+# WHOLE pipeline whenever ANY lane (or the heartbeat write) saw SQLITE_BUSY. A locked
+# telemetry writer could therefore stall the weaver for up to 20s per cycle, ageing
+# every queued candidate. Replaced with a bounded, non-escalating ~1s yield.
+LOCK_BACKOFF_MIN = max(0.25, float(os.getenv("INGEST_LOCK_BACKOFF_MIN_SEC", "1.0")))
+LOCK_BACKOFF_MAX = max(LOCK_BACKOFF_MIN, float(os.getenv("INGEST_LOCK_BACKOFF_MAX_SEC", "1.0")))
 
 def _is_db_lock(exc: BaseException) -> bool:
     blob = f"{type(exc).__name__}: {exc}".lower()
@@ -439,15 +475,19 @@ def _claim_resolver_rows(limit: int = RESOLVER_BATCH_SIZE) -> list[dict]:
 
 
 def _rpc_post(session: requests.Session, method: str, params: list[Any]) -> Any:
-    if not RPC_URL:
-        raise RuntimeError("No RPC URL configured")
+    """One bounded RPC attempt. raw_dna owns retry across later cycles."""
+    provider_index, rpc_url = _next_rpc_url()
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": method,
         "params": params,
     }
-    resp = session.post(RPC_URL, json=payload, timeout=HTTP_TIMEOUT)
+    resp = session.post(rpc_url, json=payload, timeout=HTTP_TIMEOUT)
+    if resp.status_code == 429:
+        raise requests.HTTPError(
+            f"RPC provider {provider_index + 1}/{len(RPC_URLS)} returned HTTP 429"
+        )
     resp.raise_for_status()
     data = resp.json()
     if data.get("error"):
@@ -543,7 +583,15 @@ def _resolve_one(session: requests.Session, tx_hash: str) -> tuple[str, str, Opt
         return "failed", "NO_MINT", None
 
     block_time = _safe_float(tx_result.get("blockTime"), 0.0)
-    token_name = str(mint).strip()  # preserve old signal_engine contract
+    # Identity is enrichment only: bounded timeout, persistent cache, and mint
+    # fallback. It never blocks or authorises trading.
+    identity = resolve_token_identity(mint, session=session, timeout_sec=0.40)
+    # Human identity is display/research metadata; the full mint remains in
+    # mint_address and is never replaced or used as a label.  A prior regression
+    # overwrote this resolved name with the mint, causing the UI to display the
+    # address even though token_identity_cache contained the correct metadata.
+    token_name = str(identity.get("name") or identity.get("symbol") or "").strip()
+    token_symbol = str(identity.get("symbol") or "").strip()
 
     # PATCH 1: Persist full forensic bundle — signature, slot, block_time, logMessages.
     # Previously logMessages was discarded. Now persisted so POLARIS/IVARIS can
@@ -568,6 +616,8 @@ def _resolve_one(session: requests.Session, tx_hash: str) -> tuple[str, str, Opt
         "owner_address":     owner,
         "block_time":        block_time,
         "token_name":        token_name,
+        "token_symbol":      token_symbol,
+        "identity_source":   str(identity.get("source") or "UNRESOLVED"),
         "forensic_bundle":   forensic_bundle,
     }
     return "resolved", "OK", payload
@@ -881,9 +931,11 @@ def _insert_market_snapshot_from_resolution(conn: sqlite3.Connection, row: dict)
 
 
 def _weave_signals() -> int:
+    """Weave each resolution in its own short SQLite transaction."""
     woven = 0
-    with get_connection() as conn:
-        rt_cols = _table_columns(conn, "resolved_transactions")
+
+    with get_connection() as read_conn:
+        rt_cols = _table_columns(read_conn, "resolved_transactions")
         order_col = "id" if "id" in rt_cols else "rowid"
         select_parts = [
             "rt.tx_hash",
@@ -894,31 +946,57 @@ def _weave_signals() -> int:
             "rt.block_time",
             "rt.raw_dna_id" if "raw_dna_id" in rt_cols else "NULL AS raw_dna_id",
         ]
-
-        rows = conn.execute(f"""
+        rows = read_conn.execute(f"""
             SELECT {", ".join(select_parts)}
             FROM resolved_transactions rt
-            LEFT JOIN market_snapshots ms
-              ON ms.tx_hash = rt.tx_hash
+            LEFT JOIN market_snapshots ms ON ms.tx_hash = rt.tx_hash
+            LEFT JOIN raw_dna rd ON rd.id = rt.raw_dna_id
             WHERE ms.tx_hash IS NULL
+              AND COALESCE(rt.weave_state, 0) = 0
             ORDER BY rt.{order_col} DESC
-            LIMIT 25
+            LIMIT {int(WEAVE_BATCH_LIMIT)}
         """).fetchall()
+        rows = [dict(r) for r in rows]
 
-        for row in rows:
-            if _insert_market_snapshot_from_resolution(conn, dict(row)):
-                raw_dna_id = row["raw_dna_id"]
-                if raw_dna_id:
+    for row in rows:
+        def _write_one():
+            with get_connection() as conn:
+                if not _insert_market_snapshot_from_resolution(conn, row):
+                    conn.execute(
+                        "UPDATE resolved_transactions SET weave_state=-1 WHERE tx_hash=?",
+                        (row["tx_hash"],),
+                    )
+                    conn.commit()
+                    return False
+
+                conn.execute(
+                    "UPDATE resolved_transactions SET weave_state=1 WHERE tx_hash=?",
+                    (row["tx_hash"],),
+                )
+
+                raw_id = row.get("raw_dna_id")
+                if raw_id:
                     conn.execute("""
                         UPDATE raw_dna
-                        SET processed_state = 3,
-                            resolution_status = 'WOVEN',
-                            resolution_note = 'market_snapshot_created'
-                        WHERE id = ?
-                    """, (raw_dna_id,))
-                woven += 1
+                           SET processed_state=3,
+                               resolution_status='WOVEN',
+                               resolution_note='market_snapshot_created'
+                         WHERE id=?
+                    """, (raw_id,))
+                conn.commit()
+                return True
 
-        conn.commit()
+        try:
+            if _db_write_retry(_write_one, attempts=4, base_sleep=0.10):
+                woven += 1
+        except sqlite3.OperationalError as exc:
+            if _is_db_lock(exc):
+                log.warning(
+                    "Weaver yielded tx=%s after bounded SQLITE_BUSY retries",
+                    str(row.get("tx_hash") or "")[:16],
+                )
+                continue
+            raise
 
     update_heartbeat(
         HB_WEAVER,
@@ -1009,8 +1087,10 @@ def run_pipeline() -> None:
                 last_success_at=time.time() if total_work > 0 else None,
             )
         except Exception as exc:
+            # SIGNOFF_BOUNDED_LOCK_YIELD_20260731: a busy heartbeat is telemetry only.
+            # It must never gate validate/resolve/weave, so it no longer sets lock_seen.
             if _is_db_lock(exc):
-                lock_seen = True
+                log.warning("[HEARTBEAT_DB_LOCK] telemetry write skipped: %s", exc)
             else:
                 log.warning("pipeline heartbeat failed: %s", exc)
 
@@ -1024,12 +1104,13 @@ def run_pipeline() -> None:
             })
             last_anomaly_flush = time.time()
 
+        # SIGNOFF_BOUNDED_LOCK_YIELD_20260731: bounded, non-escalating yield. Lane
+        # isolation is unchanged (each lane keeps its own try/except above); this only
+        # removes the compounding whole-pipeline sleep that aged queued candidates.
         if lock_seen:
-            log.warning("[INGEST_DB_LOCK_BACKOFF] sleep=%.1fs", lock_backoff)
+            log.warning("[INGEST_DB_LOCK_YIELD] sleep=%.2fs (bounded)", lock_backoff)
             time.sleep(lock_backoff)
-            lock_backoff = min(LOCK_BACKOFF_MAX, lock_backoff * 2.0)
         else:
-            lock_backoff = LOCK_BACKOFF_MIN
             time.sleep(PIPELINE_SLEEP)
 
 

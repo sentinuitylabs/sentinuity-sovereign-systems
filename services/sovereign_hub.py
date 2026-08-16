@@ -969,6 +969,8 @@ def _sanitize_exception_text(text: str) -> str:
         return "awaiting valid payload"
     text = _fix_display_mojibake(text)
     text_lower = text.lower()
+    if "24h_limit_reached_500" in text_lower:
+        return "GitHub trail closed for today — analysing harvested specimens until access replenishes"
     if any(x in text_lower for x in ["exception:", "traceback", "nonetype", "not subscriptable", 
                                        "keyerror", "valueerror", "attributeerror"]):
         return "skipped malformed payload"
@@ -4373,8 +4375,28 @@ def render_living_trade_meter(payload: dict) -> None:
         import math as _math
         from services.position_truth_payload import (
             AXIS_DATUM_PCT, SOCK_OCCUPIED, SOCK_REJECTED,
-            SOCK_VERIFYING, reason_text,
+            SOCK_VERIFYING, PAYLOAD_CONTRACT_VERSION, reason_text,
         )
+
+        # UI_CANONICAL_TRUTH_BOUNDARY_20260814:
+        # This renderer is intentionally incapable of accepting a compatibility
+        # row or legacy hand-computed PnL.  The runtime audit proved canonical
+        # hero truth was -1.64% while an earlier visible card showed -100%.
+        # Treat a non-canonical payload as UNKNOWN rather than rendering any
+        # percentage carried by an old/stale dictionary.
+        if str(payload.get("contract_version") or "") != str(PAYLOAD_CONTRACT_VERSION):
+            payload = {
+                "contract_version": PAYLOAD_CONTRACT_VERSION,
+                "token_name": payload.get("token_name") or payload.get("token") or "?",
+                "position_id": payload.get("position_id") or payload.get("id"),
+                "hero_pnl_pct": None, "hero_pnl_usd": None,
+                "hero_qualified": False, "hero_stage": "NONE",
+                "authority_stage": "NONE", "reason_code": "NON_CANONICAL_UI_PAYLOAD",
+                "stage_observed": {}, "stage_executable": {},
+                "stage_trusted": {}, "stage_protected": {},
+                "A_pool": {}, "B_tape": {}, "evidence_coverage_have": 0,
+                "evidence_coverage_total": 4,
+            }
 
         def _f(v):
             try:
@@ -4896,16 +4918,44 @@ def _fetch_feed_rows_inline(db_path) -> list:
             ).fetchall()
             selected = set(_sel)
 
+            # SIGNOFF_MARK_TRUTH_20260812:
+            # The Motor Feed used persisted unrealized_pnl_usd/position_size for
+            # OPEN rows. During a transient no-mark sentinel this can briefly equal
+            # -100% even though the canonical position-truth contract correctly says
+            # the executable stage is UNAVAILABLE. Hydrate one read-only truth batch
+            # and let that contract own OPEN-row PnL. Genuine near-zero executable
+            # quotes remain visible because position_truth_payload distinguishes a
+            # positive executable quote from an absent/sentinel zero.
+            _truth_by_id = {}
+            try:
+                from services.position_truth_payload import build_open_position_truth_payloads
+                for _tp in build_open_position_truth_payloads(matrix_db=str(db_path), limit=80, now=now):
+                    _truth_by_id[int(_tp.get("position_id"))] = _tp
+            except Exception:
+                _truth_by_id = {}
+
             for r in open_rows:
                 mint = _s(_cell(r, selected, "mint_address"))
                 seen_open_mints.add(mint)
 
                 size = _f(_cell(r, selected, "position_size_usd", 0.0))
-                pnl_usd = _f(
-                    _cell(r, selected, "unrealized_pnl_usd",
-                          _cell(r, selected, "realized_pnl_usd", 0.0))
-                )
-                pnl_pct = (pnl_usd / size * 100.0) if size > 0 else 0.0
+                _pid = int(_cell(r, selected, "id", 0) or 0)
+                _tp = _truth_by_id.get(_pid)
+                if _tp is not None:
+                    # None is intentional and means "no authoritative mark".
+                    pnl_pct = _tp.get("hero_pnl_pct")
+                    pnl_usd = _tp.get("hero_pnl_usd")
+                    _hero_px = (
+                        _tp.get("executable_price")
+                        if _tp.get("hero_stage") == "EXECUTABLE" else
+                        _tp.get("observed_price")
+                    )
+                else:
+                    # Fail presentation closed: do not manufacture PnL from a
+                    # potentially stale compatibility field when truth hydration fails.
+                    pnl_pct = None
+                    pnl_usd = None
+                    _hero_px = None
 
                 funding_mode = _cell(r, selected, "funding_mode", "")
                 execution_source = _cell(r, selected, "execution_source", "")
@@ -4938,10 +4988,10 @@ def _fetch_feed_rows_inline(db_path) -> list:
                     "exit_value_usd": 0.0,
                     "qty": _f(_cell(r, selected, "quantity", 0.0)),
                     "entry_price": _f(_cell(r, selected, "entry_price", 0.0)),
-                    "current_price": _f(_cell(r, selected, "current_price",
-                                           _cell(r, selected, "last_price", 0.0))),
+                    "current_price": (_f(_hero_px) if _hero_px is not None else None),
                     "pnl_usd": pnl_usd,
                     "pnl_pct": pnl_pct,
+                    "mark_available": bool(_tp is not None and pnl_pct is not None),
                     "ts": _f(_cell(r, selected, "opened_at", now), now),
                     "conf": _f(_cell(r, selected, "confidence", 0.0)),
                     "slip": _f(_cell(r, selected, "slippage_pct", 0.0)),
@@ -5292,15 +5342,20 @@ def _render_feed_row(r: dict, now: float, hour_config: dict = None) -> str:
     """
     side    = str(r.get("side") or "BUY").upper()
     mode    = str(r.get("mode") or "PAPER").upper()
-    pnl_usd = float(r.get("pnl_usd") or 0.0)
-    pnl_pct = float(r.get("pnl_pct") or 0.0)
+    _raw_pnl_usd = r.get("pnl_usd")
+    _raw_pnl_pct = r.get("pnl_pct")
+    pnl_usd = float(_raw_pnl_usd or 0.0)
+    pnl_pct = float(_raw_pnl_pct or 0.0)
+    _mark_available = bool(r.get("mark_available", True)) and _raw_pnl_pct is not None
     cash_flow = float(r.get("cash_flow_usd") or 0.0)
     stake = float(r.get("stake_usd") or 0.0)
     exit_value = float(r.get("exit_value_usd") or 0.0)
 
-    has_pnl = abs(pnl_usd) > 0.001 or abs(pnl_pct) > 0.01
+    has_pnl = _mark_available and (abs(pnl_usd) > 0.001 or abs(pnl_pct) > 0.01)
 
-    if not has_pnl:
+    if not _mark_available:
+        pct_display, pct_cls = "NO MARK", "sntPctNeu"
+    elif not has_pnl:
         pct_display, pct_cls = "  n/a", "sntPctNeu"
     elif pnl_pct >= 75:
         pct_display, pct_cls = f"+{pnl_pct:.1f}%", "sntPctGold"
@@ -5600,16 +5655,8 @@ def render_unified_execution_lanes() -> None:
     )
 
     for _t_row in _trades:
-        _pct_raw = _t_row.get("pnl_pct", None)
-        _pct    = float(_pct_raw) if _pct_raw is not None else 0.0
-        _pnl    = float(_t_row.get("pnl", 0.0) or 0.0)
-        _badge  = _t_row.get("src_badge", "STALE")
-        _age    = _t_row.get("age_str", "?")
-        _token  = _t_row.get("token", "?")
-        _fresh  = _t_row.get("is_fresh", False)
-        _pcol   = "#14F195" if _pct >= 0 else "#FF073A"
-        _bcol   = "#14F195" if _badge == "LIVE" else (
-                  "#FF073A" if _badge in ("STALE","STALE_EXEC","NO_DATA","NO_EXEC_DATA") else "#FFD700")
+        # No compatibility-field PnL calculation is permitted in this lane.
+        # render_living_trade_meter consumes the canonical v2 contract only.
         # SIGNOFF_UI_SINGLE_LIVE_CARD_20260808:
         # render_living_trade_meter already contains token, PnL, freshness/source
         # badge and the SL→TP path. The former compact row repeated the same
@@ -7107,63 +7154,25 @@ def render_living_cortex():
         #   • No legacy inline world (_render_sovereign_world_html is fenced).
         # If the canonical file is absent we surface the EXACT path checked and
         # mount nothing - the hub must never silently load an old world.
-        _world_path = ROOT / "ui" / "sovereign_world.html"
-        if not _world_path.exists():
+        # ── LIVING_WORLD_V2_SIGNOFF_20260816 ───────────────────────────────
+        # One read-only canonical projection drives HUD → WORLD → EXPEDITION →
+        # CHAMBER → FORGE/POLARIS → TRADE TRUTH → EVIDENCE/CHRONICLE.
+        # No trading, Council, Forge or Polaris semantics are changed here.
+        try:
+            from ui.sentinuity_canon import load_canonical_state as _canon_load
+            from ui.sentinuity_home import render_home as _canon_home
+            _canon_state = _canon_load(DB_PATH)
+            st.session_state["_canon_state"] = _canon_state
+            _canon_home(st, _canon_state, world_height=620)
+        except Exception as _canon_exc:
+            _canon_msg = html.escape(str(_canon_exc)[:160])
             st.markdown(
-                '<div style="padding:18px 22px;border:1px solid rgba(255,7,58,0.35);'
-                'border-radius:12px;background:rgba(20,4,12,0.64);margin:8px 0;">'
-                '<div style="font-family:Share Tech Mono,monospace;font-size:0.68rem;'
-                'letter-spacing:3px;color:#FF073A;margin-bottom:6px;">CANONICAL WORLD MISSING</div>'
-                '<div style="font-family:Share Tech Mono,monospace;font-size:0.66rem;color:#ddd;margin-bottom:4px;">'
-                'Canonical world missing: ui/sovereign_world.html</div>'
-                f'<div style="font-family:Share Tech Mono,monospace;font-size:0.66rem;color:#888;">'
-                f'Checked: {html.escape(str(_world_path))}</div></div>',
+                '<div style="padding:16px 20px;border:1px solid rgba(255,209,102,0.35);border-radius:12px;background:rgba(20,16,4,0.55);margin:8px 0;">'
+                '<div style="font-family:Share Tech Mono,monospace;font-size:0.68rem;letter-spacing:3px;color:#FFD166;margin-bottom:6px;">LIVING WORLD UNAVAILABLE</div>'
+                f'<div style="font-family:Share Tech Mono,monospace;font-size:0.66rem;color:#ddd;">{html.escape(type(_canon_exc).__name__)}: {_canon_msg}</div>'
+                '<div style="font-family:Share Tech Mono,monospace;font-size:0.62rem;color:#888;margin-top:4px;">World state is unknown; no healthy state is fabricated.</div></div>',
                 unsafe_allow_html=True,
             )
-        else:
-            _world_html = None
-            try:
-                _world_html = _world_path.read_text(encoding="utf-8", errors="replace")
-            except Exception as _world_read_err:
-                st.markdown(
-                    '<div style="padding:18px 22px;border:1px solid rgba(255,7,58,0.35);'
-                    'border-radius:12px;background:rgba(20,4,12,0.64);margin:8px 0;">'
-                    '<div style="font-family:Share Tech Mono,monospace;font-size:0.68rem;'
-                    'letter-spacing:3px;color:#FF073A;margin-bottom:6px;">WORLD READ ERROR</div>'
-                    f'<div style="font-family:Share Tech Mono,monospace;font-size:0.66rem;color:#aaa;">'
-                    f'{html.escape(type(_world_read_err).__name__)}: '
-                    f'{html.escape(str(_world_read_err)[:160])}</div></div>',
-                    unsafe_allow_html=True,
-                )
-            if _world_html:
-                # Best-effort live state from the documented single source.
-                # A failure here must NOT block the world - it boots with {} and
-                # the canonical world's applySwState tolerates missing fields.
-                try:
-                    from ui.state_contract import load_world_state as _load_world_state
-                    _world_state = _load_world_state(str(DB_PATH)) or {}
-                except Exception:
-                    _world_state = {}
-                try:
-                    import json as _world_json
-                    _world_state_json = _world_json.dumps(_world_state, default=str)
-                except Exception:
-                    _world_state_json = "{}"
-                # Boot the canonical world with current state via its own
-                # contract: window.applySwState(state) (type:'sw_state_update').
-                _world_boot = (
-                    "<script>(function(){var __SW_STATE__=" + _world_state_json + ";"
-                    "function __sw_go(){if(window.applySwState){try{window.applySwState(__SW_STATE__);}catch(_e){}}"
-                    "else{setTimeout(__sw_go,60);}}"
-                    "if(document.readyState!=='loading'){__sw_go();}"
-                    "else{document.addEventListener('DOMContentLoaded',__sw_go);}})();</script>"
-                )
-                if "</body>" in _world_html:
-                    _world_html = _world_html.replace("</body>", _world_boot + "</body>", 1)
-                else:
-                    _world_html = _world_html + _world_boot
-                import streamlit.components.v1 as _world_cmp
-                _world_cmp.html(_world_html, height=680, scrolling=False)
     else:
         # Lightweight placeholder - no iframe, no canvas, no JS
         st.markdown(
@@ -7257,7 +7266,7 @@ def render_living_cortex():
 
         # Throttled NPC lifecycle: only runs in World Mode - tick-copter/organism
         # narrative lines are world commentary, not system telemetry.
-        if st.session_state.get("world_mode_enabled", False):
+        if False:  # SIGNOFF: random NPC lifecycle retired; world movement is event-derived only.
          if _sx_now - float(st.session_state.get("sx_last_npc_tick", 0.0)) > 8:
             st.session_state["sx_last_npc_tick"] = _sx_now
             try:
@@ -7465,8 +7474,9 @@ def render_living_cortex():
                 "</div>"
             )
 
-        # Gate entire commentary/cortex section - only show in WORLD mode
-        if st.session_state.get("world_mode_enabled", False):
+        # SIGNOFF: canonical World Mode already owns narrative + system status.
+        # Keep this legacy commentary/cortex only in fast mode to prevent duplicate talk.
+        if not st.session_state.get("world_mode_enabled", False):
             st.markdown("### ⚔ MYCELIAL FLUX CHANNELS")
             
             _feed_title = "🌐 SOVEREIGN COMMENTARY — AGENTS + NPCS + WORLD EVENTS"
@@ -7811,8 +7821,8 @@ def render_living_cortex():
             except Exception:
                 pass
 
-                        # ── SECTION 2: LIVE DEBATE CHAMBER ──────────────────────────────────
-            st.markdown(f"<div style='font-family:Orbitron,sans-serif;font-size:0.7rem;letter-spacing:4px;color:#9945FF;margin-bottom:8px;'>⚔ LIVE DEBATE CHAMBER</div>", unsafe_allow_html=True)
+            # ── SECTION 2: COUNCIL CAMP · LIVE EXPEDITION ──────────────────────────────────
+            st.markdown(f"<div style='font-family:Orbitron,sans-serif;font-size:0.7rem;letter-spacing:4px;color:#9945FF;margin-bottom:8px;'>✦ COUNCIL CAMP · LIVE EXPEDITION</div>", unsafe_allow_html=True)
             # SIGNOFF_20260713: prepare the persistent workstream quietly.
             # The former full-width task-card wall competed with the Debate Chamber.
             # Keep every task and state, but render a slim rail beneath the transcript.
@@ -7868,8 +7878,22 @@ def render_living_cortex():
 
             _debate_html = "<div class='snty-debate-stage' style='max-height:560px;overflow-y:auto;padding:12px 10px;font-family:\"Share Tech Mono\",monospace;background:linear-gradient(180deg,rgba(7,3,20,.42),rgba(3,2,10,.18));border-top:1px solid rgba(153,69,255,.22);border-bottom:1px solid rgba(142,249,255,.12);margin-bottom:10px;'>"
             if not debate_df.empty:
+                _debate_seen = set()
+                _debate_rendered = 0
                 for idx, row in debate_df.iterrows():
                     spk = str(row.get('speaker', '')).upper()
+                    _pid_key = str(row.get('proposal_id', '') or '')
+                    _cj_key = str(row.get('content_json', '') or '')
+                    # Repeated provider-failure retries are operational history,
+                    # not new reasoning.  One latest copy per proposal/speaker/
+                    # payload keeps the Camp readable while raw rows remain in DB.
+                    _dup_key = (_pid_key, spk, _cj_key)
+                    if _dup_key in _debate_seen:
+                        continue
+                    _debate_seen.add(_dup_key)
+                    if _debate_rendered >= 8:
+                        break
+                    _debate_rendered += 1
                     _raw_verdict = _sanitize_exception_text(str(row.get('verdict_text', '') or ''))
                     _action_codes = ('RESEARCH_FIRST INITIATION', 'AUDIT_FIRST INITIATION',
                                      'DESIGN_FIRST INITIATION', 'current_state', 'oracle_evidence',
@@ -7904,6 +7928,28 @@ def render_living_cortex():
                             if code in _raw_verdict:
                                 _raw_verdict = readable
                                 break
+                    # DEBATE_PAYLOAD_TRUTH_20260814:
+                    # Final-verdict rows often carry no `message` and IVARIS
+                    # rows carry the useful explanation in `objections`.
+                    # Render that structured payload instead of the action code.
+                    try:
+                        import json as _jmod2
+                        _cj2 = row.get('content_json', '')
+                        _d2 = _jmod2.loads(str(_cj2)) if _cj2 and isinstance(_cj2, str) else (_cj2 if isinstance(_cj2, dict) else {})
+                    except Exception:
+                        _d2 = {}
+                    if isinstance(_d2, dict):
+                        _obs2 = _d2.get('objections') or _d2.get('final_objections') or []
+                        if isinstance(_obs2, str):
+                            _obs2 = [_obs2]
+                        _obs2 = [str(x).strip() for x in _obs2 if str(x).strip()]
+                        _failed2 = bool(_d2.get('_ivaris_failed'))
+                        if _failed2 and _obs2:
+                            _raw_verdict = "Critic unavailable — " + _obs2[0]
+                        elif spk == "VERDICT" and _obs2 and not bool(_d2.get('consensus')):
+                            _raw_verdict = "Held — " + _obs2[0]
+                        elif (_raw_verdict.lower() in ('debate','final_verdict','initial_critique','') and _obs2):
+                            _raw_verdict = _obs2[0]
                     msg = purify_links(_raw_verdict)
                     ts = _fmt_clock(row.get('logged_at', 0))
                     think = str(row.get('thinking_state', ''))
@@ -7930,7 +7976,8 @@ def render_living_cortex():
                     _align = "left" if spk == "POLARIS" else "right"
                     _bg = "rgba(142,249,255,0.05)" if spk == "POLARIS" else "rgba(255,179,71,0.05)"
                     _border = f"border-left:3px solid {col};" if spk == "POLARIS" else f"border-right:3px solid {col};"
-                    _grok_narr = html.escape(_sanitize_exception_text(str(row.get('grok_narrative', '') or '')))
+                    _grok_raw = str(row.get('grok_narrative', '') or '').strip()
+                    _grok_narr = html.escape(_sanitize_exception_text(_grok_raw)) if _grok_raw else ""
                     name_class = "next-up" if idx == 0 else ""
                     text_class = "typewriter" if idx == 0 else ""
                     is_mastery = think == 'golden_mastery'
@@ -8074,7 +8121,19 @@ def render_living_cortex():
             _debate_html += "</div>"
             st.markdown(_debate_html, unsafe_allow_html=True)
 
-            # ── GITHUB DISCOVERY EXPEDITION ─────────────────────────────────
+            # ── LUMEN FIELD · LIVING COUNCIL OVERLAY ────────────────────────
+            # LUMEN_FIELD_MOUNT_20260813
+            # Tier-3 cognition only. The renderer projects existing evidence and
+            # persisted Lumen state; it never fabricates idle motion and can never
+            # block trading surfaces if unavailable. Existing GitHub cards remain
+            # directly below as the detailed expedition ledger.
+            try:
+                from ui.lumen_field import render_living_field as _render_lumen_field
+                _render_lumen_field(show_provenance=False, max_specimens=6)
+            except Exception as _lf_exc:
+                st.caption(f"Living Field unavailable: {type(_lf_exc).__name__} · trading surfaces unaffected")
+
+            # ── THE TRAIL BEYOND · GITHUB FORAGE ─────────────────────────────────
             # SENTINUITY_GITHUB_EXPEDITION_20260810
             # This is a read-only view over github_scout provenance. It sits
             # directly beneath the Debate Chamber so the operator can follow
@@ -8274,7 +8333,7 @@ def render_living_cortex():
                     st.markdown(
                         "<div style='margin:0 0 12px;padding:10px 12px;border:1px solid rgba(142,249,255,.12);"
                         "border-radius:8px;background:rgba(5,12,14,.52);color:#777;font-family:Share Tech Mono,monospace;"
-                        "font-size:.68rem;letter-spacing:1px;'>THE TRAIL BEYOND · GITHUB DISCOVERY EXPEDITION · "
+                        "font-size:.68rem;letter-spacing:1px;'>THE TRAIL BEYOND · GITHUB FORAGE · "
                         "AWAITING FIRST SCOUT CYCLE</div>", unsafe_allow_html=True)
             except Exception as _gx_exc:
                 st.caption(f"GitHub discovery expedition unavailable: {type(_gx_exc).__name__}")

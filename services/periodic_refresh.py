@@ -37,6 +37,23 @@ log = logging.getLogger("periodic_refresh")
 
 SERVICE_NAME    = "periodic_refresh"
 DEFAULT_CYCLE   = 600    # 10 minutes
+HEARTBEAT_TICK_SEC = 20  # remain visibly alive while waiting for the next refresh
+
+
+def _heartbeat_sleep(seconds: int, last_note: str) -> None:
+    """Sleep without allowing the 10-minute service to appear dead.
+
+    The previous implementation emitted a heartbeat only after each 600-second
+    work cycle. Guardian considers a service restartable after 420 seconds, so
+    periodic_refresh could be restarted before reaching its next intended run.
+    """
+    deadline = time.monotonic() + max(0, seconds)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(HEARTBEAT_TICK_SEC, remaining))
+        update_heartbeat(SERVICE_NAME, "alive", f"waiting_next_cycle | {last_note}")
 
 
 def _run_refresh_cycle() -> dict:
@@ -220,7 +237,7 @@ def run() -> None:
             log.warning("[REFRESH_ERROR] %s", exc)
             update_heartbeat(SERVICE_NAME, "warn", f"error: {exc}")
 
-        time.sleep(cycle)
+        _heartbeat_sleep(cycle, note if 'note' in locals() else 'startup')
 
 
 if __name__ == "__main__":

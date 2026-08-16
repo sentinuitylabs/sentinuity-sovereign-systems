@@ -249,8 +249,22 @@ def _pos_int(v: Any) -> int:
 
 
 def _pct_from(entry: Any, price: Any) -> Optional[float]:
+    # SIGNOFF_MARK_TRUTH_20260812 (surviving -100% formula, site 3 of 3):
+    # Same defect shape as ui/execution_glassbox._pct — the denominator was
+    # guarded, the numerator was not, so a sentinel/missing zero mark produced
+    # exactly -100.0% rather than None.
+    #
+    # This site matters more than the other two because position_truth_payload
+    # is the CANONICAL truth payload other surfaces consume. A -100% invented
+    # here propagates to every renderer downstream, including any that correctly
+    # trusts this module rather than recomputing. Returning None makes the
+    # absence of an executable mark explicit and lets each surface render
+    # NO MARK / ACQUIRING MARK / UNAVAILABLE.
+    #
+    # p > 0 quotes are untouched; a real near-zero mark still reports its real
+    # result. Negative PnL is never clamped.
     e, p = _f(entry), _f(price)
-    if e is None or p is None or e <= 0:
+    if e is None or p is None or e <= 0 or p <= 0:
         return None
     return (p / e - 1.0) * 100.0
 

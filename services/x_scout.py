@@ -414,7 +414,9 @@ def run() -> None:
         log.warning("x_scout: TWITTER_BEARER_TOKEN not set — scout idle")
         update_heartbeat(SERVICE_NAME, "IDLE", "TWITTER_BEARER_TOKEN missing in .env")
         while True:
-            time.sleep(3600)
+            # Stay visibly alive even when optional X credentials are absent.
+            # The previous 3600s sleep exceeded Guardian's 420s dead threshold.
+            time.sleep(300)
             update_heartbeat(SERVICE_NAME, "IDLE", "TWITTER_BEARER_TOKEN missing — still waiting")
         return
 

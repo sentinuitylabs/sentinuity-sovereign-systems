@@ -1,103 +1,79 @@
 @echo off
-title SENTINUITY — STOPPING ALL
-setlocal enabledelayedexpansion
+setlocal EnableExtensions
 
-:: ── AUTO-ELEVATE TO ADMIN ────────────────────────────────────────────────────
-net session >nul 2>&1
-if errorlevel 1 (
-    %SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -Command "Start-Process '%~f0' -Verb RunAs"
-    exit /b
-)
+rem ============================================================================
+rem SENTINUITY STOP_ALL — SIGN-OFF REPLACEMENT 2026-07-30
+rem Clean shutdown only. No startup purge, no position reset, no relaunch logic.
+rem ============================================================================
+
+for %%I in ("%~dp0..") do set "ROOT_PATH=%%~fI"
+if not exist "%ROOT_PATH%\services" set "ROOT_PATH=C:\Users\Polar\.openclaw\workspace\trading-bot"
+set "PS_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+
+cd /d "%ROOT_PATH%"
+title SENTINUITY - STOPPING ALL
 
 echo ============================================================
-echo  STOPPING ALL SENTINUITY SERVICES
+echo  SENTINUITY CLEAN SHUTDOWN
+echo  Root: %ROOT_PATH%
 echo ============================================================
 echo.
 
-:: ── CLOUDFLARE SERVICE (needs admin — now works) ─────────────────────────────
-echo [1] Stopping Cloudflare tunnel service...
+rem Stop the optional Cloudflare/OpenClaw outer services first. Best effort only.
+echo [1/4] Stopping external launch authorities...
+where openclaw >nul 2>&1
+if not errorlevel 1 openclaw gateway stop >nul 2>&1
+schtasks /End /TN "OpenClaw Gateway" >nul 2>&1
 sc stop cloudflared >nul 2>&1
-if errorlevel 1 (
-    taskkill /F /IM cloudflared.exe /T >nul 2>&1
-    echo   Fallback taskkill used.
-) else (
-    echo   Service stopped cleanly.
-)
-echo.
-
-:: ── KILL ALL IN PARALLEL ─────────────────────────────────────────────────────
-echo [2] Killing all processes (parallel)...
-start "" /B taskkill /F /IM python.exe    /T >nul 2>&1
-start "" /B taskkill /F /IM pythonw.exe   /T >nul 2>&1
-REM === SENTINUITY BOOT CLEAN HOTFIX START ===
-echo [BOOT-CLEAN] Running startup freshness purge...
-set "SENT_HOTFIX_DIR="
-if exist "%~dp0launch\startup_freshness_purge.py" set "SENT_HOTFIX_DIR=%~dp0launch"
-if exist "%~dp0startup_freshness_purge.py" set "SENT_HOTFIX_DIR=%~dp0"
-if exist "%~dp0..\launch\startup_freshness_purge.py" set "SENT_HOTFIX_DIR=%~dp0..\launch"
-
-if not defined SENT_HOTFIX_DIR (
-    echo [FATAL] startup_freshness_purge.py not found from launcher path
-    pause
-    exit /b 1
-)
-
-python "%SENT_HOTFIX_DIR%\startup_freshness_purge.py"
-if errorlevel 1 (
-    echo [FATAL] startup_freshness_purge failed. Launch aborted.
-    pause
-    exit /b 1
-)
-
-echo [BOOT-CLEAN] Running restart stale position reset...
-python "%SENT_HOTFIX_DIR%\startup_restart_position_reset.py"
-if errorlevel 1 (
-    echo [FATAL] startup_restart_position_reset failed. Launch aborted.
-    pause
-    exit /b 1
-)
-
-echo [BOOT-CLEAN] Startup purge/reset complete.
-REM === SENTINUITY BOOT CLEAN HOTFIX END ===
-start "" /B taskkill /F /IM streamlit.exe /T >nul 2>&1
-start "" /B taskkill /F /IM node.exe      /T >nul 2>&1
-
-for %%T in (
-  "SENTINUITY GUARDIAN" "SENTINUITY WATCHDOG" "CouncilBuild" "ShadowTracker"
-  "SENTINUITY SOVEREIGN CONSOLE" "Gateway"
-  "Scout" "IngestPipeline" "MarketIntel" "Supervisor"
-  "ExecEngine" "SovGovernor" "SPE" "Replay" "PolarisAux" "Recon"
-  "Researcher" "Reflect" "Reviewer" "Calibrator"
-  "Messenger" "CH Analyst" "WalletScout" "TG Scout"
-  "Vault" "Ivy Forge" "Tunnel" "SovHub"
-  "Ingest" "Resolver" "Weaver" "Oracle" "Qualifier"
-  "Executor" "ZombieRes" "Polaris" "HITL Bot"
-  "Debate" "Health" "DB Prune" "Healer" "Dashboard" "Substrate"
-  "SENTINUITY-ingest_pipeline" "SENTINUITY-market_intelligence"
-  "SENTINUITY-execution_engine" "SENTINUITY-sovereign_governor"
-  "SENTINUITY-pump_monitor" "SENTINUITY-wallet_scout"
-  "SENTINUITY-telegram_scout" "SENTINUITY-neural_supervisor"
-  "SENTINUITY-sovereign_parameter_engine" "SENTINUITY-replay_engine"
-  "SENTINUITY-polaris" "SENTINUITY-polaris_auxiliary"
-  "SENTINUITY-reconnaissance_engine" "SENTINUITY-code_vault"
-  "SENTINUITY-sovereign_hub" "SENTINUITY-system_guardian"
-  "WD-scout" "WD-ingest" "WD-resolver" "WD-signal_engine"
-  "WD-oracle" "WD-token_qualifier" "WD-supervisor"
-  "WD-paper_executor" "WD-zombie_resolver" "WD-polaris"
-  "WD-health_monitor" "WD-db_prune_guard" "WD-auto_healer"
-  "WD-debate_engine" "WD-polaris_researcher" "WD-wallet_scout"
-) do start "" /B taskkill /F /FI "WINDOWTITLE eq %%~T" /T >nul 2>&1
-
-timeout /t 3 /nobreak >nul
+taskkill /F /IM cloudflared.exe /T >nul 2>&1
 echo   Done.
 echo.
 
-echo ============================================================
-echo  ALL SERVICES STOPPED
-echo  Safe to run diagnostics or restart.
-echo ============================================================
-echo.
-pause
+rem Pass 1: kill restart/watchdog authorities before ordinary workers.
+echo [2/4] Stopping watchdogs, guardians and launch consoles...
+"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
+ "$root=[regex]::Escape('%ROOT_PATH%');" ^
+ "$rx='Watchdog_Sentinuity|Sentinuity_Watch|Launch_Sentinuity|Restart_Sentinuity|services[\\/.](sentinuity_watch|system_guardian|sovereign_governor|polaris|polaris_auxiliary|reconnaissance_engine|master_console)';" ^
+ "$procs=Get-CimInstance Win32_Process ^| Where-Object { $_.ProcessId -ne $PID -and ([string]$_.CommandLine -match $root) -and ([string]$_.CommandLine -match $rx) };" ^
+ "foreach($p in $procs){ try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch {} };" ^
+ "Write-Host ('  Stopped authority processes: '+@($procs).Count)"
 
-:: Stop OpenClaw gateway last, after confirmed codebase shutdown
-taskkill /F /IM openclaw.exe /T >nul 2>&1
+timeout /t 2 /nobreak >nul
+
+rem Pass 2: kill every remaining process whose command line belongs to this repo.
+echo [3/4] Stopping remaining Sentinuity process trees...
+"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
+ "$root=[regex]::Escape('%ROOT_PATH%');" ^
+ "$rx='python|pythonw|py.exe|streamlit|cmd.exe|powershell.exe|node.exe';" ^
+ "$procs=Get-CimInstance Win32_Process ^| Where-Object { $_.ProcessId -ne $PID -and ([string]$_.CommandLine -match $root) -and ([string]$_.Name -match $rx) };" ^
+ "$ordered=$procs ^| Sort-Object @{Expression={if($_.Name -match 'cmd|powershell'){0}else{1}}};" ^
+ "foreach($p in $ordered){ try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch {} };" ^
+ "Write-Host ('  Stopped repo processes: '+@($procs).Count)"
+
+timeout /t 3 /nobreak >nul
+
+rem Final verification and one retry for anything that raced during shutdown.
+echo [4/4] Verifying shutdown...
+"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -Command ^
+ "$root=[regex]::Escape('%ROOT_PATH%');" ^
+ "$self=$PID;" ^
+ "$left=Get-CimInstance Win32_Process ^| Where-Object { $_.ProcessId -ne $self -and ([string]$_.CommandLine -match $root) -and ([string]$_.CommandLine -match 'services[\\/.]|Launch_Sentinuity|Restart_Sentinuity|Watchdog_Sentinuity|Sentinuity_Watch|streamlit' };" ^
+ "foreach($p in $left){ try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch {} };" ^
+ "Start-Sleep -Seconds 2;" ^
+ "$remain=Get-CimInstance Win32_Process ^| Where-Object { $_.ProcessId -ne $self -and ([string]$_.CommandLine -match $root) -and ([string]$_.CommandLine -match 'services[\\/.]|Launch_Sentinuity|Restart_Sentinuity|Watchdog_Sentinuity|Sentinuity_Watch|streamlit' };" ^
+ "if(@($remain).Count -eq 0){ Write-Host '  PASS: no Sentinuity services remain.'; exit 0 } else { Write-Host '  FAIL: processes still remain:'; $remain ^| Select-Object ProcessId,Name,CommandLine ^| Format-Table -AutoSize; exit 1 }"
+
+if errorlevel 1 (
+  echo.
+  echo ============================================================
+  echo  SHUTDOWN INCOMPLETE - remaining processes printed above
+  echo ============================================================
+  exit /b 1
+)
+
+echo.
+echo ============================================================
+echo  ALL SENTINUITY SERVICES STOPPED
+ echo  Safe to replace files, verify, or relaunch.
+echo ============================================================
+exit /b 0

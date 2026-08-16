@@ -10,60 +10,86 @@ from wallets.substrate_wallet_schema import connect, ensure_schema, heartbeat
 
 
 def ingest_copytrade_once() -> int:
-    """Substrate copytrade bridge — SIGN-OFF SAFE (PHASE_SIGNOFF_20260621).
+    """Bridge REAL observed smart-wallet trades into Substrate corroboration.
 
-    By default this does NOT inject any trade-influencing signals. Real substrate
-    copytrade requires real wallet/API sources (GMGN/Birdeye) which are not yet
-    wired. Until then:
-      - SUBSTRATE_COPYTRADE_PAPER_INFLUENCE defaults to 0 (OFF). No rows written.
-      - Fake/sample signals ONLY appear if SUBSTRATE_COPYTRADE_DEMO_MODE=1 is
-        explicitly set, and even then they are tagged SIMULATED and state='DEMO'
-        so downstream allocation must never treat them as real wallet signals.
-    This prevents random.choice() sample data from influencing paper allocation.
+    Only assets with a canonical, unambiguous mapping are eligible. At present
+    that is native SOL/WSOL. Arbitrary Solana token mints are never relabelled as
+    WETH/cbBTC, and demo rows remain explicit opt-in only.
     """
     ensure_schema()
-
-    _influence = os.getenv("SUBSTRATE_COPYTRADE_PAPER_INFLUENCE", "0") == "1"
-    _demo = os.getenv("SUBSTRATE_COPYTRADE_DEMO_MODE", "0") == "1"
-
-    # No real source wired yet. Without explicit demo opt-in, write nothing and
-    # report honestly — do NOT manufacture trade-like signals.
-    if not _demo:
-        msg = ("awaiting real wallet source (GMGN/Birdeye not configured); "
-               "influence=" + ("ON" if _influence else "OFF"))
-        heartbeat("substrate_copytrade_bridge", "OK", msg, 0)
-        return 0
-
-    # DEMO MODE (opt-in only): emit a clearly-tagged simulated row for UI smoke
-    # testing. These rows are SIMULATED and state='DEMO' — they must never be
-    # promoted into real substrate allocation.
-    now = int(time.time())
-    samples = [
-        ("solana", "SOL", "SMART_WALLET_CLUSTER_CORE"),
-        ("base", "WETH", "ALT_MARKET_SPREAD_WALLET"),
-        ("base", "cbBTC", "BTC_PROXY_WALLET_SMALL"),
-    ]
-    chain, symbol, wallet = random.choice(samples)
+    influence = os.getenv("SUBSTRATE_COPYTRADE_PAPER_INFLUENCE", "0") == "1"
+    demo = os.getenv("SUBSTRATE_COPYTRADE_DEMO_MODE", "0") == "1"
+    now = time.time()
+    max_age = max(60, int(os.getenv("SUBSTRATE_COPYTRADE_MAX_AGE_SEC", "1800")))
+    wsol = "So11111111111111111111111111111111111111112"
 
     con = connect()
+    inserted = 0
     try:
-        con.execute(
-            """
-            INSERT INTO substrate_copytrade_signals
-            (wallet_address, chain, asset_symbol, asset_address, action, confidence, observed_size_usd, pnl_hint, state, raw_json, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                wallet, chain, symbol, "native" if symbol == "SOL" else "wrapped", "BUY",
-                0.63 + random.random() * 0.08, 50 + random.random() * 100,
-                "SIMULATED — demo mode only, not a real wallet signal",
-                "DEMO", json.dumps({"phase": "copytrade_ingest", "simulated": True, "demo_mode": True, "influence_real": False}, sort_keys=True),
-                now, now,
-            ),
-        )
-        con.commit()
-        heartbeat("substrate_copytrade_bridge", "OK", f"DEMO_SIMULATED_signal={chain}:{symbol} (not real)", 1)
-        return 1
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if "smart_wallet_trades" in tables:
+            cols = {r[1] for r in con.execute("PRAGMA table_info(smart_wallet_trades)")}
+            wallet_col = next((c for c in ("wallet_address","wallet","address") if c in cols), None)
+            mint_col = next((c for c in ("mint_address","mint","token_mint") if c in cols), None)
+            side_col = next((c for c in ("side","action","trade_side") if c in cols), None)
+            conf_col = next((c for c in ("confidence","wallet_score","quality_score") if c in cols), None)
+            size_col = next((c for c in ("size_usd","amount_usd","observed_size_usd") if c in cols), None)
+            time_col = next((c for c in ("block_time","observed_at","created_at","timestamp") if c in cols), None)
+            if wallet_col and mint_col and side_col and time_col:
+                q=lambda x:'"'+x.replace('"','""')+'"'
+                rows=con.execute(
+                    f"SELECT * FROM smart_wallet_trades WHERE {q(time_col)}>=? "
+                    f"AND {q(mint_col)}=? ORDER BY {q(time_col)} DESC LIMIT 50",
+                    (now-max_age, wsol),
+                ).fetchall()
+                for row in rows:
+                    d=dict(row); side=str(d.get(side_col) or '').upper()
+                    if side not in ('BUY','SELL'): continue
+                    wallet=str(d.get(wallet_col) or '')
+                    observed=float(d.get(time_col) or now)
+                    raw=json.dumps({"source":"smart_wallet_trades","source_row":d.get("id"),
+                                    "observed_at":observed,"real":True,
+                                    "paper_influence_enabled":influence},sort_keys=True)
+                    exists=con.execute(
+                        "SELECT 1 FROM substrate_copytrade_signals WHERE wallet_address=? "
+                        "AND asset_symbol='SOL' AND action=? AND created_at BETWEEN ? AND ? LIMIT 1",
+                        (wallet,side,observed-2,observed+2)).fetchone()
+                    if exists: continue
+                    conf=float(d.get(conf_col) or 0.65) if conf_col else 0.65
+                    size=float(d.get(size_col) or 0.0) if size_col else 0.0
+                    con.execute("""INSERT INTO substrate_copytrade_signals
+                        (wallet_address,chain,asset_symbol,asset_address,action,confidence,
+                         observed_size_usd,pnl_hint,state,raw_json,created_at,updated_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (wallet,"solana","SOL",wsol,side,max(0.0,min(0.95,conf)),size,
+                         "REAL observed smart-wallet SOL/WSOL trade",
+                         "NEW" if influence else "OBSERVE",raw,observed,now))
+                    inserted += 1
+        if inserted:
+            con.commit()
+            heartbeat("substrate_copytrade_bridge","OK",
+                      f"real_smart_wallet_signals={inserted} influence={'ON' if influence else 'OBSERVE'}",inserted)
+            return inserted
+    finally:
+        con.close()
+
+    if not demo:
+        heartbeat("substrate_copytrade_bridge","DEGRADED",
+                  "no recent canonical SOL/WSOL smart-wallet trades; no synthetic signals",0)
+        return 0
+
+    # Explicit UI smoke-test only; downstream state DEMO is never actionable.
+    con=connect()
+    try:
+        con.execute("""INSERT INTO substrate_copytrade_signals
+            (wallet_address,chain,asset_symbol,asset_address,action,confidence,
+             observed_size_usd,pnl_hint,state,raw_json,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ("SMART_WALLET_CLUSTER_CORE","solana","SOL","native","BUY",0.65,50.0,
+             "SIMULATED — demo mode only","DEMO",
+             json.dumps({"simulated":True,"influence_real":False},sort_keys=True),now,now))
+        con.commit(); heartbeat("substrate_copytrade_bridge","OK","DEMO_SIMULATED SOL",1); return 1
     finally:
         con.close()
 

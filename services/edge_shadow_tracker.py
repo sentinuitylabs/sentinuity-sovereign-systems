@@ -46,6 +46,7 @@ if str(_ROOT) not in sys.path:
 from services.edge_ledger import (  # noqa: E402
     LEDGER_TABLE, ensure_schema, _connect as _ledger_connect,
 )
+from core.schema import update_heartbeat  # noqa: E402
 
 SERVICE = "edge_shadow_tracker"
 
@@ -332,17 +333,30 @@ def main() -> None:
     _log(f"online db={os.environ.get('SENTINUITY_DB','sentinuity_matrix.db')} "
          f"observe={OBSERVE_SEC:.0f}s fetch={'on' if FETCH_ENABLED else 'off'}")
     ensure_schema()
+    try:
+        update_heartbeat(SERVICE, "starting", "edge shadow tracker online")
+    except Exception:
+        pass
     while True:
         try:
             s = run_pass()
+            note = (f"tracked={s['tracked']} updated={s['updated']} "
+                    f"final={s['finalised']} oracle={s['oracle']} fetch={s['fetched']}")
             if s["tracked"] or s["finalised"]:
-                _log(f"tracked={s['tracked']} updated={s['updated']} "
-                     f"final={s['finalised']} oracle={s['oracle']} fetch={s['fetched']}")
+                _log(note)
+            try:
+                update_heartbeat(SERVICE, "alive", note, work_processed=int(s["updated"] + s["finalised"]))
+            except Exception:
+                pass
         except KeyboardInterrupt:
             _log("shutdown")
             return
         except Exception as e:
             _log(f"pass error: {type(e).__name__}: {e}")
+            try:
+                update_heartbeat(SERVICE, "error", str(e)[:120])
+            except Exception:
+                pass
         time.sleep(POLL_SEC)
 
 

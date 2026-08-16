@@ -26,3 +26,12 @@ OPENAI_API_KEY=
 ANTHROPIC_API_KEY=
 XAI_API_KEY=
 BRAVE_SEARCH_API_KEY=
+
+# --- GITHUB COUNCIL RESEARCH ---
+# Optional. If omitted or rejected, GitHub Expedition falls back to reduced
+# anonymous public-repository reconnaissance. A valid token increases API depth.
+GITHUB_TOKEN=
+GITHUB_ENABLED=1
+GITHUB_SCOUT_CYCLE_SECONDS=2700
+GITHUB_SCOUT_BOOTSTRAP_SECONDS=900
+GITHUB_SCOUT_BOOTSTRAP_CYCLES=4

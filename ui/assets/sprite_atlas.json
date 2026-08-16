@@ -1,0 +1,88 @@
+{
+  "cell": {
+    "w": 24,
+    "h": 28
+  },
+  "baseline": 26,
+  "scale_out": 4,
+  "poses": [
+    "s",
+    "n",
+    "e"
+  ],
+  "frames": 2,
+  "rows": {
+    "NUGGET": 0,
+    "POLARIS": 1,
+    "IVARIS": 2,
+    "ORACLE": 3,
+    "RHIZA": 4,
+    "AXON": 5,
+    "COURIER": 6,
+    "GUARDIAN": 7,
+    "KEEPER": 8,
+    "WARDEN": 9
+  },
+  "characters": {
+    "NUGGET": {
+      "label": "Nugget",
+      "role": "Field scout \u00b7 auditor",
+      "npc": false,
+      "accent": "#ffd166"
+    },
+    "POLARIS": {
+      "label": "Polaris",
+      "role": "Coordinator \u00b7 safety gate",
+      "npc": false,
+      "accent": "#52f4ff"
+    },
+    "IVARIS": {
+      "label": "Ivaris",
+      "role": "Adversarial critic",
+      "npc": false,
+      "accent": "#ffb24a"
+    },
+    "ORACLE": {
+      "label": "Oracle",
+      "role": "Senses \u00b7 price & market truth",
+      "npc": false,
+      "accent": "#ad63ff"
+    },
+    "RHIZA": {
+      "label": "Rhiza",
+      "role": "Synthesis \u00b7 memory",
+      "npc": false,
+      "accent": "#42f5a7"
+    },
+    "AXON": {
+      "label": "Axon",
+      "role": "Implementation \u00b7 execution validator",
+      "npc": false,
+      "accent": "#ff8a3d"
+    },
+    "COURIER": {
+      "label": "Courier",
+      "role": "Carries evidence",
+      "npc": true,
+      "accent": "#ad63ff"
+    },
+    "GUARDIAN": {
+      "label": "Guardian",
+      "role": "Service steward",
+      "npc": true,
+      "accent": "#ffd166"
+    },
+    "KEEPER": {
+      "label": "Keeper",
+      "role": "Nursery",
+      "npc": true,
+      "accent": "#42f5a7"
+    },
+    "WARDEN": {
+      "label": "Warden",
+      "role": "Stores \u00b7 tallies",
+      "npc": true,
+      "accent": "#ffd166"
+    }
+  }
+}

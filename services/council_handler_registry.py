@@ -206,8 +206,6 @@ def capability_gap_handler(task: dict, ctx: dict) -> Dict[str, Any]:
                               f"#{cid} becomes executable. Does not implement it."),
             "suggested_action": f"write {rel}",
             "files": [rel],
-            "diff_chars": max(1, len(content)),
-            "compile_ok": True,
             "test_cmd": "spec file exists and names the missing handler_key",
             "backup_planned": True,
             "risk_tier": "TIER_0",
@@ -358,7 +356,6 @@ def council_build_health_handler(task: dict, ctx: dict) -> Dict[str, Any]:
         return {"proposal_type": "build_health_report",
                 "proposal_text": "Refresh the local Council build-plane health report.",
                 "suggested_action": f"write {rel}", "files": [rel],
-                "diff_chars": max(1, len(content)), "compile_ok": True,
                 "test_cmd": "report renders and contains the metrics table",
                 "backup_planned": True, "risk_tier": "TIER_0",
                 "new_content": content, "target_file": target}
@@ -445,7 +442,6 @@ def solana_edge_audit_handler(task: dict, ctx: dict) -> Dict[str, Any]:
         return {"proposal_type": "edge_audit_report",
                 "proposal_text": "Refresh the local Solana edge audit.",
                 "suggested_action": f"write {rel}", "files": [rel],
-                "diff_chars": max(1, len(content)), "compile_ok": True,
                 "test_cmd": "report contains the local leg summary",
                 "backup_planned": True, "risk_tier": "TIER_0",
                 "new_content": content, "target_file": target}

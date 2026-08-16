@@ -308,8 +308,8 @@ def append_mtm_rows(rows: List[Tuple[str, float]], now: float) -> int:
                         WHEN entry_price > 0 THEN position_size_usd * ((? - entry_price) / entry_price)
                         ELSE COALESCE(unrealized_pnl_usd, 0.0)
                     END,
-                    highest_price_seen = CASE
-                        WHEN COALESCE(highest_price_seen, 0) > ? THEN highest_price_seen
+                    display_high_price = CASE
+                        WHEN COALESCE(display_high_price, 0) > ? THEN display_high_price
                         ELSE ?
                     END
                 WHERE mint_address = ?

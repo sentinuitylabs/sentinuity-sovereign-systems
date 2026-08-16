@@ -35,7 +35,11 @@ def _root() -> Path:
 
 ROOT = _root()
 DB_PATH = ROOT / "sentinuity_matrix.db"
+PRICE_TRUTH_DB_PATH = ROOT / "sentinuity_price_truth.db"
+INTELLIGENCE_DB_PATH = ROOT / "sentinuity_intelligence.db"
 EXEC_LOG = ROOT / "logs" / "execution_engine.log"
+LIVE_LOG = ROOT / "logs" / "live_trading.log"
+ORACLE_LOG = ROOT / "logs" / "ws_price_oracle.log"
 GUARDIAN_LOG = ROOT / "logs" / "system_guardian.log"
 
 _TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
@@ -69,6 +73,38 @@ def _ro_conn() -> sqlite3.Connection | None:
         return con
     except Exception:
         return None
+
+
+def _ro_conn_path(path: Path) -> sqlite3.Connection | None:
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+        con.row_factory = sqlite3.Row
+        return con
+    except Exception:
+        return None
+
+def _table_cols(con: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        return {str(r[1]) for r in con.execute(f'PRAGMA table_info("{table}")')}
+    except Exception:
+        return set()
+
+def _table_exists(con: sqlite3.Connection, table: str) -> bool:
+    try:
+        return con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",(table,)
+        ).fetchone() is not None
+    except Exception:
+        return False
+
+def _safe_log_line(line: str) -> str:
+    s=str(line or "").strip()
+    s=re.sub(r'https?://\S+','[URL_REDACTED]',s)
+    s=re.sub(r'(?i)(x-api-key|authorization|api[_-]?key|private[_-]?key)\s*[:=]\s*\S+',
+             r'\1=[REDACTED]',s)
+    s=re.sub(r'\b([1-9A-HJ-NP-Za-km-z]{64,})\b',
+             lambda m:m.group(1)[:10]+'…'+m.group(1)[-6:],s)
+    return s[:460]
 
 
 def _tail_lines(path: Path, max_lines: int = 16000) -> list[str]:
@@ -425,13 +461,136 @@ def council_lines(pulse: dict, gates: dict, lane: dict, latch: dict) -> list[dic
                             f"{lane.get('paper_max','?')} slots"
                             + (f", equity ${pe:.2f}." if pe is not None else ".")})
     if pulse.get("wired"):
-        stale = [r for r in pulse.get("rows", [])
-                 if r["age_s"] > 120 and "exec" in str(r["service_name"]).lower()]
-        if stale:
+        # SIGNOFF_UI_TRUTH_20260810: Council narration must use the same
+        # service-specific freshness classification already computed for the
+        # Sovereign Pulse panel.  Do not infer global health from the executor
+        # heartbeat alone.
+        pulse_rows = list(pulse.get("rows", []) or [])
+        stale_rows = [r for r in pulse_rows
+                      if str(r.get("freshness_class") or "").endswith("stale")]
+        aging_rows = [r for r in pulse_rows
+                      if str(r.get("freshness_class") or "").endswith("aging")]
+        fresh_rows = [r for r in pulse_rows
+                      if str(r.get("freshness_class") or "").endswith("fresh")]
+        if stale_rows or aging_rows:
+            oldest = max(stale_rows or aging_rows,
+                         key=lambda r: float(r.get("age_s") or 0.0))
             out.append({"agent": "AXON", "mode": "health",
-                        "text": f"Executor heartbeat aged {stale[0]['age_s']:.0f}s — "
-                                f"watch Guardian; it must not kill an active scan."})
+                        "text": (f"Pulse telemetry: {len(fresh_rows)} fresh, "
+                                 f"{len(aging_rows)} aging, {len(stale_rows)} stale. "
+                                 f"Oldest degraded service {oldest.get('service_name','unknown')} "
+                                 f"is {float(oldest.get('age_s') or 0.0):.0f}s old.")})
+        elif pulse_rows:
+            out.append({"agent": "AXON", "mode": "health",
+                        "text": f"Pulse telemetry: {len(fresh_rows)}/{len(pulse_rows)} services fresh."})
         else:
             out.append({"agent": "AXON", "mode": "health",
-                        "text": "All core pulses fresh. The organism breathes."})
+                        "text": "Pulse telemetry returned no service rows — health not measured."})
     return out
+
+
+@_cached(ttl=2)
+def active_execution_glassbox(limit: int = 4) -> dict:
+    mc=_ro_conn()
+    if not mc:
+        return {"wired":False,"rows":[],"src":"matrix DB unavailable"}
+    try:
+        if not _table_exists(mc,"paper_positions"):
+            return {"wired":False,"rows":[],"src":"paper_positions missing"}
+        pcols=_table_cols(mc,"paper_positions")
+        wanted=["id","token_name","mint_address","status","entry_price","current_price","last_price",
+                "unrealized_pnl_pct","live_exec_price","live_exec_pct","live_exec_source",
+                "live_exec_updated_at","live_exec_age_sec","live_exec_can_exit","runner_protected",
+                "runner_peak_pct","runner_lock_floor_pct","runner_lock_price","runner_peak_trust_source",
+                "runner_floor_state","trusted_peak_price","trusted_peak_pct","trusted_peak_source",
+                "runner_state","active_trail_pct","exit_reason","buy_tx_sig","sell_tx_sig",
+                "funding_mode","mode","opened_at","updated_at"]
+        sel=[c for c in wanted if c in pcols]
+        order="updated_at" if "updated_at" in pcols else "id"
+        status_filter="WHERE status='OPEN'" if "status" in pcols else ""
+        q=f'SELECT {",".join(sel)} FROM paper_positions {status_filter} ORDER BY {order} DESC LIMIT ?'
+        positions=[dict(r) for r in mc.execute(q,(int(limit),)).fetchall()]
+    except Exception as e:
+        return {"wired":False,"rows":[],"src":f"paper_positions ({e})"}
+    finally:
+        mc.close()
+
+    ptc=_ro_conn_path(PRICE_TRUTH_DB_PATH)
+    inc=_ro_conn_path(INTELLIGENCE_DB_PATH)
+    out=[]
+
+    for p in positions:
+        pid=p.get("id"); mint=str(p.get("mint_address") or "")
+        item={"position":p,"token":str(p.get("token_name") or mint[:8] or "?"),"mint":mint,
+              "layer_a":None,"layer_b":None,"layer_c":None,"truth_candidate":None,
+              "mode_b":None,"parity":None,"live_fire":None,"raw_trace":[]}
+        if ptc:
+            try:
+                for table,key in (("peak_onchain_state","layer_a"),("peak_trade_tape","layer_b"),
+                                  ("peak_executable_quotes","layer_c"),("peak_truth_candidates","truth_candidate")):
+                    if not _table_exists(ptc,table): continue
+                    c=_table_cols(ptc,table); wh=[];args=[]
+                    if "position_id" in c and pid is not None:
+                        wh=["position_id=?"];args=[pid]
+                    elif "mint_address" in c:
+                        wh=["mint_address=?"];args=[mint]
+                    if not wh: continue
+                    if table=="peak_onchain_state": ordercol="observed_at" if "observed_at" in c else "id"
+                    elif table=="peak_executable_quotes": ordercol="quote_ts" if "quote_ts" in c else "id"
+                    else: ordercol="created_at" if "created_at" in c else ("observed_at" if "observed_at" in c else "id")
+                    r=ptc.execute(f'SELECT * FROM {table} WHERE {" AND ".join(wh)} ORDER BY {ordercol} DESC, id DESC LIMIT 1',args).fetchone()
+                    item[key]=dict(r) if r else None
+            except Exception:
+                pass
+
+        mc2=_ro_conn()
+        if mc2:
+            try:
+                for table,key in (("mode_b_decision_ledger","mode_b"),("paper_live_parity","parity")):
+                    if not _table_exists(mc2,table): continue
+                    c=_table_cols(mc2,table); wh=[];args=[]
+                    if table=="paper_live_parity" and "paper_position_id" in c and pid is not None:
+                        wh=["paper_position_id=?"];args=[pid]
+                    elif "position_id" in c and pid is not None:
+                        wh=["position_id=?"];args=[pid]
+                    elif "mint_address" in c:
+                        wh=["mint_address=?"];args=[mint]
+                    if not wh: continue
+                    ordercol="state_updated_at" if "state_updated_at" in c else ("evaluated_at" if "evaluated_at" in c else "id")
+                    r=mc2.execute(f'SELECT * FROM {table} WHERE {" AND ".join(wh)} ORDER BY {ordercol} DESC, id DESC LIMIT 1',args).fetchone()
+                    item[key]=dict(r) if r else None
+            except Exception:
+                pass
+            finally:
+                mc2.close()
+
+        if inc:
+            try:
+                if _table_exists(inc,"live_fire_ledger"):
+                    c=_table_cols(inc,"live_fire_ledger"); wh=[];args=[]
+                    if "position_id" in c and pid is not None:
+                        wh=["position_id=?"];args=[pid]
+                    elif "mint" in c:
+                        wh=["mint=?"];args=[mint]
+                    if wh:
+                        r=inc.execute(f'SELECT * FROM live_fire_ledger WHERE {" AND ".join(wh)} ORDER BY event_ts DESC, id DESC LIMIT 1',args).fetchone()
+                        item["live_fire"]=dict(r) if r else None
+            except Exception:
+                pass
+
+        keys=[mint[:12]]
+        if pid is not None: keys += [f"pos={pid}",f"position_id={pid}"]
+        event_re=re.compile(r"runner|floor|trail|peak|quote|jupiter|exit|sell|route|canary|FIRE_PATH_OPEN|EXECUTE_LIVE|reconcil|impact|stale|divergen",re.I)
+        raw=[]
+        for lp in (EXEC_LOG,LIVE_LOG,ORACLE_LOG):
+            if not lp.exists(): continue
+            for line in _tail_lines(lp,5000):
+                if event_re.search(line) and any(k and k in line for k in keys):
+                    raw.append((lp.name,_safe_log_line(line)))
+        item["raw_trace"]=[{"source":a,"line":b} for a,b in raw[-28:]]
+        out.append(item)
+
+    if ptc: ptc.close()
+    if inc: inc.close()
+    return {"wired":True,"rows":out,
+            "src":"read-only paper_positions + peak_* + Mode-B/parity/live-fire ledgers + redacted engine log tails; ttl=2s"}

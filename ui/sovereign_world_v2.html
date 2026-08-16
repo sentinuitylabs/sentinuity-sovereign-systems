@@ -1,0 +1,420 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Sentinuity — Living World</title>
+<style>
+/* SENTINUITY_LIVING_WORLD_V2_20260817
+   Backdrop is ENVIRONMENT ONLY. Every character is an independent sprite.
+   No movement occurs without a runtime state change. No timer creates work. */
+:root{
+  --ink:#05070f; --panel:rgba(8,11,26,.86); --line:rgba(96,132,196,.28);
+  --cyan:#52f4ff; --violet:#ad63ff; --gold:#ffd166; --mint:#42f5a7;
+  --ember:#ff8a3d; --red:#ff5577; --dim:#8fa3c4; --text:#e8f4ff;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:transparent;color:var(--text);font-family:var(--mono)}
+#stage{position:relative;width:100%;max-width:1120px;margin:0 auto;
+  border:1px solid var(--line);border-radius:14px;overflow:hidden;background:#070a16}
+#viewport{position:relative;width:100%;aspect-ratio:8/5;overflow:hidden}
+#backdrop{position:absolute;inset:0;width:100%;height:100%;
+  image-rendering:pixelated;image-rendering:crisp-edges;display:block}
+#layer{position:absolute;inset:0}
+
+/* ── faculty markers ─────────────────────────────────────────────────── */
+.site{position:absolute;transform:translate(-50%,-50%);pointer-events:auto;
+  z-index:3;text-align:center}
+.site .ring{width:var(--r,42px);height:calc(var(--r,42px)*.6);border-radius:50%;
+  border:1px solid rgba(120,190,240,.30);margin:0 auto;
+  box-shadow:0 0 14px rgba(82,244,255,.10) inset}
+.site .name{font-size:8px;letter-spacing:.14em;color:#bcd8f2;margin-top:3px;
+  text-shadow:0 1px 3px #000,0 0 8px #000;white-space:nowrap}
+.site .cap{font-size:8px;letter-spacing:.1em;margin-top:1px;color:var(--mint);
+  text-shadow:0 1px 3px #000}
+.site.h-DEGRADED .ring{border-color:rgba(255,209,102,.55);
+  box-shadow:0 0 16px rgba(255,209,102,.22) inset}
+.site.h-STRESSED .ring{border-color:rgba(255,85,119,.65);
+  box-shadow:0 0 18px rgba(255,85,119,.28) inset;animation:stress 2.4s infinite}
+.site.h-STRESSED .name{color:#ffb3c1}
+.site.h-PARTIAL .ring{border-color:rgba(255,209,102,.4)}
+.site.h-UNKNOWN .ring{border-style:dashed;border-color:rgba(140,150,175,.4)}
+.site.h-UNKNOWN .name{color:#93a2bb}
+@keyframes stress{0%,100%{opacity:.55}50%{opacity:1}}
+
+/* ── sprites ─────────────────────────────────────────────────────────── */
+.actor{position:absolute;z-index:5;will-change:transform;
+  transform:translate(-50%,-100%)}
+.actor .sh{position:absolute;left:50%;bottom:-2px;transform:translateX(-50%);
+  width:60%;height:16%;border-radius:50%;
+  background:radial-gradient(ellipse,rgba(0,0,0,.55),transparent 70%)}
+.actor .art{width:100%;height:100%;
+  background-repeat:no-repeat;image-rendering:pixelated}
+.actor .badge{position:absolute;left:50%;top:100%;transform:translateX(-50%);
+  margin-top:4px;font-size:7px;letter-spacing:.1em;padding:1px 5px;border-radius:3px;
+  background:rgba(4,8,20,.9);border:1px solid rgba(102,200,255,.35);color:#9fe8ff;
+  white-space:nowrap;opacity:0;transition:opacity .2s}
+.actor.busy .badge,.actor:hover .badge,.actor.flag .badge{opacity:1}
+.actor.flag .badge{border-color:var(--red);color:#ffb3c1}
+.actor.offline .art{filter:grayscale(.85) brightness(.55)}
+.actor.offline .badge{opacity:1;border-color:rgba(140,150,175,.4);color:#9aa8bd}
+.actor.npc{z-index:4}
+
+/* ── relic lifecycle ─────────────────────────────────────────────────── */
+#relic{position:absolute;z-index:6;transform:translate(-50%,-100%);
+  transition:left .9s ease,top .9s ease}
+#relic .art{width:100%;height:100%;background-repeat:no-repeat;
+  image-rendering:pixelated}
+#relic .lbl{position:absolute;left:50%;bottom:100%;transform:translateX(-50%);
+  margin-bottom:5px;font-size:7px;letter-spacing:.1em;padding:2px 6px;border-radius:4px;
+  background:rgba(4,8,20,.92);border:1px solid var(--line);color:#cfe6ff;
+  white-space:nowrap;max-width:180px;overflow:hidden;text-overflow:ellipsis}
+#relic .halo{position:absolute;inset:-40%;border-radius:50%;pointer-events:none}
+#relic.s-inspecting .halo{background:radial-gradient(circle,rgba(150,190,230,.22),transparent 68%);animation:pulse 2.6s infinite}
+#relic.s-promising .halo{background:radial-gradient(circle,rgba(126,240,200,.30),transparent 68%);animation:pulse 2s infinite}
+#relic.s-contested .halo{background:radial-gradient(circle,rgba(255,178,74,.28),transparent 68%);animation:flicker .5s steps(2) infinite}
+#relic.s-accepted .halo{background:radial-gradient(circle,rgba(255,209,102,.42),transparent 70%);animation:pulse 1.8s infinite}
+#relic.s-testing .halo{background:radial-gradient(circle,rgba(255,138,61,.34),transparent 68%);animation:pulse 1.1s infinite}
+#relic.s-failed .halo{background:radial-gradient(circle,rgba(255,85,119,.36),transparent 68%)}
+#relic.s-dud{animation:rattle .5s steps(3) 3}
+#relic.s-dud .art{filter:grayscale(1) brightness(.7)}
+#relic.s-rejected .halo{background:radial-gradient(circle,rgba(230,244,255,.35),transparent 60%)}
+#relic.s-absorbed .halo{background:radial-gradient(circle,rgba(126,240,176,.45),transparent 70%);animation:pulse 1.4s infinite}
+@keyframes pulse{0%,100%{opacity:.45;transform:scale(.94)}50%{opacity:1;transform:scale(1.06)}}
+@keyframes flicker{0%,100%{opacity:.3}50%{opacity:.95}}
+@keyframes rattle{0%,100%{transform:translate(-50%,-100%)}
+  33%{transform:translate(calc(-50% - 2px),-100%)}
+  66%{transform:translate(calc(-50% + 2px),-100%)}}
+
+/* ── overlays ────────────────────────────────────────────────────────── */
+#hud{position:absolute;left:0;right:0;top:0;z-index:8;display:flex;gap:8px;
+  align-items:center;padding:8px 10px;
+  background:linear-gradient(180deg,rgba(4,7,18,.82),transparent)}
+#hud .chip{font-size:9px;letter-spacing:.12em;padding:3px 7px;border-radius:5px;
+  border:1px solid var(--line);background:rgba(6,10,24,.7);color:#b9d2ee}
+#hud .chip b{color:#fff;font-weight:600}
+#hud .grow{flex:1}
+.chip.warn{border-color:rgba(255,209,102,.5);color:var(--gold)}
+.chip.bad{border-color:rgba(255,85,119,.55);color:#ffb3c1}
+.chip.good{border-color:rgba(66,245,167,.45);color:var(--mint)}
+
+#banner{position:absolute;left:0;right:0;bottom:0;z-index:8;padding:9px 11px;
+  background:linear-gradient(0deg,rgba(4,7,18,.92),transparent);
+  display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+#banner .stage{font-size:9px;letter-spacing:.2em;color:var(--cyan)}
+#banner .what{font-size:11px;color:#fff;flex:1;min-width:150px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#banner .act{font-size:9px;color:var(--dim)}
+#banner .act.blocked{color:#ffb3c1}
+
+#legend{position:absolute;right:8px;top:36px;z-index:8;font-size:8px;
+  background:rgba(4,7,18,.9);border:1px solid var(--line);border-radius:6px;
+  padding:6px 8px;color:#a9c2e0;display:none;max-width:190px;line-height:1.5}
+#legend.on{display:block}
+#legend b{color:#fff;display:block;margin-bottom:3px;letter-spacing:.1em}
+#legend i{font-style:normal;color:var(--gold)}
+#lgBtn{position:absolute;right:8px;top:9px;z-index:9;font:inherit;font-size:8px;
+  letter-spacing:.1em;padding:3px 7px;border-radius:5px;cursor:pointer;
+  border:1px solid var(--line);background:rgba(6,10,24,.8);color:#b9d2ee}
+#lgBtn:focus-visible,#stage:focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
+
+#quiet{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:7;
+  font-size:9px;letter-spacing:.16em;color:#93a8c6;background:rgba(4,7,18,.78);
+  border:1px solid var(--line);border-radius:8px;padding:8px 12px;display:none;
+  text-align:center}
+#quiet.on{display:block}
+
+@media(max-width:640px){
+  #viewport{aspect-ratio:1/1}
+  .site .name{font-size:7px}
+  #hud{padding:6px 7px;gap:5px}
+  #hud .chip{font-size:8px;padding:2px 5px}
+  #banner .what{font-size:10px}
+  .site .cap{display:none}
+}
+@media(prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+}
+</style></head>
+<body>
+<div id="stage" tabindex="0">
+  <div id="viewport">
+    <img id="backdrop" alt="Sentinuity island — the organism's settlement, its faculties and the wild forest beyond." src="__BACKDROP__">
+    <div id="layer">
+      <div id="sites"></div>
+      <div id="actors"></div>
+      <div id="relic" style="display:none"><div class="halo"></div><div class="art"></div><div class="lbl"></div></div>
+    </div>
+    <div id="hud">
+      <span class="chip" id="cMode">—</span>
+      <span class="chip" id="cEquity">—</span>
+      <span class="chip" id="cWin">—</span>
+      <span class="chip" id="cRisk">—</span>
+      <span class="grow"></span>
+    </div>
+    <button id="lgBtn" type="button" aria-expanded="false">KEY</button>
+    <div id="legend" role="note">
+      <b>WHAT YOU ARE SEEING</b>
+      The island is the organism. Scouts leave through the gate to search the
+      wild forest for useful knowledge and carry finds back to the stone circle.
+      <i>Gold means the Council accepted a candidate — not that it works.</i>
+      A capability only joins a faculty after it is built, tested and passed.
+    </div>
+    <div id="quiet">NO EXPEDITION UNDERWAY<br><span style="color:#6f829d">the settlement is resting</span></div>
+    <div id="banner">
+      <span class="stage" id="bStage">—</span>
+      <span class="what" id="bWhat">Awaiting runtime state</span>
+      <span class="act" id="bAct"></span>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ── assets injected by the Python bridge ─────────────────────────────── */
+const SPRITES = "__SPRITES__";
+const RELICS  = "__RELICS__";
+const SITES   = __SITES__;
+const ATLAS   = __ATLAS_META__;
+const RMETA   = __RELIC_META__;
+
+const MAP_W = SITES.width, MAP_H = SITES.height;
+const CELL_W = ATLAS.cell.w, CELL_H = ATLAS.cell.h, ZOOM = ATLAS.scale_out;
+const POSES = ATLAS.poses, NFRAMES = ATLAS.frames;
+const RCELL = RMETA.cell;
+
+const SITE_LABEL = {
+  heart:"ORGANISM CORE", council:"COUNCIL", price_truth:"PRICE TRUTH",
+  smart_money:"SMART MONEY", substrate:"SUBSTRATE", execution:"EXECUTION",
+  intelligence:"INTELLIGENCE", inspection:"INSPECTION CIRCLE", trailhead:"THE GATE"
+};
+/* faculty key -> site key, mirrors sentinuity_canon.FACULTIES */
+const FACULTY_SITE = {
+  PRICE_TRUTH:"price_truth", EXECUTION:"execution", INTELLIGENCE:"intelligence",
+  SMART_MONEY:"smart_money", SUBSTRATE:"substrate", COUNCIL:"council"
+};
+/* actions that mean the character is doing visible work */
+const BUSY = new Set(["DEPARTING","RETURNING","PRESENTING","EXTRACTING","DEBATING",
+  "CHALLENGING","FORGING","TESTING","VERIFYING","ABSORBING","DISCARDING","OBSERVING"]);
+const FLAG = new Set(["BLOCKED","OFFLINE","RECOVERING"]);
+function stablePhase(id){
+  let h=0; for(let i=0;i<id.length;i++) h=((h*31)+id.charCodeAt(i))>>>0;
+  return (h%600)/100;
+}
+function esc(v){return String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+
+let state = null, actors = {}, sitesEl = {}, spriteScale = 1;
+const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+function el(tag, cls, parent){
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (parent) parent.appendChild(n);
+  return n;
+}
+function pct(site){
+  const s = SITES.sites[site] || SITES.sites.heart || {x:50,y:50};
+  return s;
+}
+/* deterministic fan-out so co-located agents never stack on one pixel */
+function offsetFor(id, i, n){
+  const a = (Math.PI*2*i)/Math.max(1,n) + 0.6;
+  const r = n>1 ? 3.6 : 1.6;
+  return {dx: Math.cos(a)*r, dy: Math.sin(a)*r*0.55};
+}
+
+function measure(){
+  const vp = document.getElementById("viewport");
+  spriteScale = vp.clientWidth / MAP_W;
+  const w = CELL_W*spriteScale, h = CELL_H*spriteScale;
+  Object.values(actors).forEach(a=>{
+    a.el.style.width = w+"px"; a.el.style.height = h+"px";
+    a.art.style.backgroundSize =
+      (CELL_W*POSES.length*NFRAMES*spriteScale)+"px "+
+      (CELL_H*Object.keys(ATLAS.rows).length*spriteScale)+"px";
+  });
+  const r = document.getElementById("relic");
+  r.style.width = (RCELL*spriteScale)+"px";
+  r.style.height = (RCELL*spriteScale)+"px";
+  r.querySelector(".art").style.backgroundSize =
+    (RCELL*2*spriteScale)+"px "+(RCELL*Object.keys(RMETA.rows).length*spriteScale)+"px";
+  drawSites();
+}
+
+/* ── faculty markers ──────────────────────────────────────────────────── */
+function drawSites(){
+  const box = document.getElementById("sites");
+  const f = (state && state.faculties) || {};
+  if (!Object.keys(sitesEl).length){
+    Object.keys(SITES.sites).forEach(k=>{
+      const n = el("div","site",box);
+      n.style.left = pct(k).x+"%"; n.style.top = pct(k).y+"%";
+      el("div","ring",n);
+      el("div","name",n).textContent = SITE_LABEL[k] || k.toUpperCase();
+      el("div","cap",n);
+      sitesEl[k] = n;
+    });
+  }
+  Object.entries(FACULTY_SITE).forEach(([fk,sk])=>{
+    const n = sitesEl[sk]; if(!n) return;
+    const d = f[fk];
+    n.className = "site h-" + ((d && d.health) || "UNKNOWN");
+    const cap = n.querySelector(".cap");
+    /* capability markers appear ONLY for absorbed capabilities */
+    cap.textContent = (d && d.capabilities>0) ? "◆".repeat(Math.min(5,d.capabilities)) : "";
+    n.title = d ? (d.label+" — "+d.health+" · "+d.services_alive+"/"+d.services_known+
+                   " services · "+d.capabilities+" absorbed capabilities")
+                : (SITE_LABEL[sk]||sk);
+  });
+}
+
+/* ── sprite frame selection ───────────────────────────────────────────── */
+function setFrame(a, pose, frame){
+  const row = ATLAS.rows[a.id];
+  if (row === undefined) return;
+  const col = POSES.indexOf(pose)*NFRAMES + frame;
+  a.art.style.backgroundPosition =
+    (-col*CELL_W*spriteScale)+"px "+(-row*CELL_H*spriteScale)+"px";
+  a.art.style.transform = (pose==="e" && a.flip) ? "scaleX(-1)" : "";
+}
+
+function ensureActor(id, info){
+  if (actors[id]) return actors[id];
+  const box = document.getElementById("actors");
+  const n = el("div","actor"+(ATLAS.characters[id] && ATLAS.characters[id].npc?" npc":""),box);
+  const art = el("div","art",n);
+  art.style.backgroundImage = "url("+SPRITES+")";
+  el("div","sh",n);
+  const badge = el("div","badge",n);
+  const p = pct(info.site);
+  const a = {id, el:n, art, badge, x:p.x, y:p.y, tx:p.x, ty:p.y,
+             pose:"s", frame:0, flip:false, moving:false, phase:stablePhase(id)};
+  n.title = (ATLAS.characters[id]||{}).label + " — " + ((ATLAS.characters[id]||{}).role||"");
+  actors[id] = a;
+  return a;
+}
+
+/* ── apply canonical state ────────────────────────────────────────────── */
+function apply(s){
+  if (!s) return;
+  state = s;
+  const w = s.world || {};
+  const hud = s.hud || {};
+  const exp = s.expedition || {};
+
+  /* HUD — runtime truth, never flattered */
+  const money = v => (v===null||v===undefined) ? "—"
+      : (v<0?"-$":"$")+Math.abs(Number(v)).toFixed(2);
+  set("cMode","MODE <b>"+esc(hud.mode||"—")+"</b>");
+  set("cEquity","EQUITY <b>"+money(hud.equity)+"</b>");
+  const wr = hud.win_rate;
+  const cw = document.getElementById("cWin");
+  cw.innerHTML = "WIN RATE <b>"+(wr===null||wr===undefined?"—":wr+"%")+"</b>";
+  cw.className = "chip " + (wr===null||wr===undefined ? "" : wr<20 ? "bad" : wr<45 ? "warn" : "good");
+  const cr = document.getElementById("cRisk");
+  cr.textContent = hud.risk || "—";
+  cr.className = "chip " + (hud.risk && hud.risk!=="NOMINAL" ? "warn" : "good");
+
+  drawSites();
+
+  /* group actors by site so co-located sprites fan out deterministically */
+  const acts = w.actors || {};
+  const bySite = {};
+  Object.entries(acts).forEach(([id,info])=>{
+    (bySite[info.site] = bySite[info.site] || []).push(id);
+  });
+
+  Object.entries(acts).forEach(([id,info])=>{
+    const a = ensureActor(id, info);
+    const group = bySite[info.site];
+    const off = offsetFor(id, group.indexOf(id), group.length);
+    const p = pct(info.site);
+    a.tx = p.x + off.dx; a.ty = p.y + off.dy;
+    a.action = info.action;
+    a.badge.textContent = info.action;
+    a.el.title = ((ATLAS.characters[id]||{}).label||id) + " — " + (info.note||info.action);
+    a.el.classList.toggle("busy", BUSY.has(info.action));
+    a.el.classList.toggle("flag", FLAG.has(info.action));
+    a.el.classList.toggle("offline", info.action==="OFFLINE");
+    a.carrying = !!info.carrying;
+  });
+
+  /* relic */
+  const r = document.getElementById("relic");
+  if (w.relic && RMETA.rows[w.relic.state] !== undefined){
+    const p = pct(w.relic.site);
+    r.style.display = "";
+    r.style.left = p.x+"%"; r.style.top = (p.y-2)+"%";
+    r.className = "s-"+w.relic.state;
+    r.querySelector(".art").style.backgroundPosition =
+      "0px "+(-RMETA.rows[w.relic.state]*RCELL*spriteScale)+"px";
+    r.querySelector(".lbl").textContent =
+      w.relic.state.toUpperCase()+" · "+(w.relic.label||"");
+  } else {
+    r.style.display = "none";
+  }
+
+  /* banner + quiet state — the world is allowed to look idle */
+  set("bStage", (exp.stage||"—").replace("ABSORB","ABSORB / REJECT"));
+  document.getElementById("bWhat").textContent = exp.title || "No active expedition";
+  const act = document.getElementById("bAct");
+  act.textContent = exp.current_action || "";
+  act.className = "act" + (exp.blocked_reason ? " blocked" : "");
+  document.getElementById("quiet").classList.toggle("on",
+    !exp.id && !w.relic && (!exp.title || exp.title === "No active expedition"));
+}
+function set(id, html){ const n=document.getElementById(id); if(n) n.innerHTML=html; }
+
+/* ── movement: derived from targets only, never from a wander timer ───── */
+let last = 0;
+function tick(now){
+  const dt = Math.min(64, now-last); last = now;
+  Object.values(actors).forEach(a=>{
+    const dx = a.tx-a.x, dy = a.ty-a.y;
+    const dist = Math.hypot(dx,dy);
+    if (dist > 0.12){
+      const k = reduced ? 1 : 0.055;
+      a.x += dx*k; a.y += dy*k;
+      a.moving = true;
+      if (Math.abs(dx) > Math.abs(dy)*1.2){ a.pose="e"; a.flip = dx<0; }
+      else { a.pose = dy<0 ? "n" : "s"; }
+      a.phase += dt*0.012;
+      a.frame = (Math.floor(a.phase)%NFRAMES);
+    } else {
+      if (a.moving){ a.moving=false; a.frame=0; a.pose = a.pose==="n"?"n":"s"; }
+      /* idle: a single slow breath. Not work. Not thinking. */
+      if (!reduced && BUSY.has(a.action)){
+        a.phase += dt*0.0035;
+        a.frame = Math.floor(a.phase)%NFRAMES;
+      } else { a.frame = 0; }
+    }
+    a.el.style.left = a.x+"%"; a.el.style.top = a.y+"%";
+    setFrame(a, a.pose, a.frame);
+  });
+  /* If runtime marks an actor as carrying, the relic follows that actor. This is
+     presentation-only: the canonical relic state/site still decides whether it exists. */
+  const carrier = Object.values(actors).find(a=>a.carrying);
+  const relic = document.getElementById("relic");
+  if (carrier && relic && relic.style.display !== "none"){
+    relic.style.left = (carrier.x + 1.2) + "%";
+    relic.style.top  = (carrier.y - 3.0) + "%";
+  }
+  requestAnimationFrame(tick);
+}
+
+/* ── wiring ───────────────────────────────────────────────────────────── */
+const lg = document.getElementById("lgBtn"), lgBox = document.getElementById("legend");
+lg.addEventListener("click", ()=>{
+  const on = lgBox.classList.toggle("on");
+  lg.setAttribute("aria-expanded", on ? "true":"false");
+});
+addEventListener("resize", measure);
+addEventListener("message", e=>{
+  const d = e.data||{};
+  if (d.type==="sentinuity_canon_update" && d.state) apply(d.state);
+});
+window.applyCanonState = s => { apply(s); measure(); };
+
+measure();
+if (window.__CANON__) window.applyCanonState(window.__CANON__);
+requestAnimationFrame(tick);
+</script>
+</body></html>

@@ -113,15 +113,11 @@ def _positions(c: sqlite3.Connection, now: float) -> List[Dict[str, Any]]:
     sel.append("mint_address" if "mint_address" in cols else "'' AS mint_address")
     sel.append("COALESCE(opened_at,0) AS opened_at" if "opened_at" in cols else "0 AS opened_at")
     sel.append("COALESCE(position_size_usd,0) AS size_usd" if "position_size_usd" in cols else "0 AS size_usd")
-    # live pnl% — prefer explicit column, else derive from prices if available
-    if "pnl_pct" in cols:
-        sel.append("COALESCE(pnl_pct,0) AS pnl_pct")
-    elif {"entry_price", "current_price"}.issubset(cols):
-        sel.append("CASE WHEN COALESCE(entry_price,0)>0 THEN "
-                   "((COALESCE(current_price,entry_price)-entry_price)/entry_price)*100.0 "
-                   "ELSE 0 END AS pnl_pct")
-    else:
-        sel.append("0 AS pnl_pct")
+    # SIGNOFF_CANONICAL_OPEN_TRUTH_20260813
+    # Current PnL is intentionally NOT selected or re-derived here. The open
+    # position ID is hydrated from services.position_truth_payload after this
+    # bounded read. A missing canonical mark remains None / NO MARK.
+    sel.append("NULL AS pnl_pct")
     if "pnl_usd" in cols:
         sel.append("COALESCE(pnl_usd,0) AS pnl_usd")
     elif "unrealized_pnl_usd" in cols:
@@ -136,15 +132,41 @@ def _positions(c: sqlite3.Connection, now: float) -> List[Dict[str, Any]]:
         ).fetchall()
     except Exception:
         return []
+    # Build canonical open-position truth once for this state snapshot.
+    _truth_by_id = {}
+    try:
+        from services.position_truth_payload import build_open_position_truth_payloads
+        _payloads = build_open_position_truth_payloads(
+            matrix_db=str(DB_PATH), limit=max(24, len(rows)), now=now
+        )
+        _truth_by_id = {
+            int(x.get("position_id")): x
+            for x in _payloads
+            if x.get("position_id") is not None
+        }
+    except Exception:
+        _truth_by_id = {}
+
     out = []
     for r in rows:
         opened = _f(r["opened_at"])
+        _truth = _truth_by_id.get(int(r["pid"])) or {}
+        _raw_pct = _truth.get("hero_pnl_pct")
+        _has_mark = _raw_pct is not None
+        _hero_usd = _truth.get("hero_pnl_usd")
         out.append({
             "id": r["pid"],
             "token": (r["token_name"] or "")[:18] or (r["mint_address"] or "?")[:8],
             "mint": r["mint_address"] or "",
-            "pnl_pct": round(_f(r["pnl_pct"]), 2),
-            "pnl_usd": round(_f(r["pnl_usd"]), 2),
+            "pnl_pct": round(float(_raw_pct), 2) if _has_mark else None,
+            "mark_state": (
+                str(_truth.get("hero_stage") or "NO MARK")
+                if _has_mark else "NO MARK"
+            ),
+            "pnl_usd": round(
+                float(_hero_usd) if _hero_usd is not None else _f(r["pnl_usd"]),
+                2
+            ),
             "size_usd": round(_f(r["size_usd"]), 2),
             "opened_at": opened,
             "age_s": max(0, int(now - opened)) if opened > 0 else 0,

@@ -31,7 +31,9 @@ def canonical_realized_pnl_usd(row: Any) -> float:
     """
     status = str(_get(row, "pnl_integrity_status", "") or "").upper()
     if status == "CAPPED_STOP_FLOOR":
-        raw = _get(row, "raw_realized_pnl_usd")
+        raw = _get(row, "raw_pnl_usd_preclamp")
+        if raw is None:
+            raw = _get(row, "raw_realized_pnl_usd")
         if raw is not None:
             return _float(raw)
     trusted = _get(row, "trusted_realized_pnl_usd")

@@ -20,7 +20,7 @@ Tier C ⇒ FAILED_FINAL, never applied. Restart resumes from durable phase.
 """
 from __future__ import annotations
 import os
-import json, py_compile, re, shutil, sqlite3, subprocess, sys, time
+import json, py_compile, re, shutil, sqlite3, subprocess, sys, time, tempfile, difflib
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -32,6 +32,7 @@ BACKUP_DIR = ROOT / "backups" / "council_autobuild"
 
 from services import council_task_ledger as ledger
 from services import apply_policy
+from services import golden_latch_gate
 from services import debate_quorum
 from services import operator_approval
 
@@ -228,7 +229,6 @@ def substrate_chart_handler(task: dict, ctx: dict) -> Dict[str, Any]:
                                  "not by table existence.",
                 "suggested_action": "patch ui/substrate_node.py chart call",
                 "files": ["ui/substrate_node.py"],
-                "diff_chars": 400, "compile_ok": True,
                 "test_cmd": "py_compile + adapter selection assertion",
                 "current_has_defect":
                     'table="substrate_paper_positions" if _table_exists(' in src}
@@ -305,7 +305,6 @@ def generic_schema_authority_handler(task: dict, ctx: dict) -> Dict[str, Any]:
                                  "populated-row authority via adapter.",
                 "suggested_action": f"generated structural patch for {target.name}",
                 "files": [str(target.relative_to(ctx.get('ui_root', ROOT)))],
-                "diff_chars": 300, "compile_ok": True,
                 "test_cmd": "engine py_compile + structural assertion"}
 
     def build() -> Dict[str, Any]:
@@ -343,7 +342,7 @@ def intelligence_stage_rail_canary_handler(task: dict, ctx: dict) -> Dict[str, A
         src=target.read_text(encoding="utf-8") if target.exists() else ""
         return {"kind":"ui_canary_probe","summary":f"stage rail present={target.exists()} revision={'CANARY_REVISION' in src}","data":{"target":str(target)},"sample_size":1,"confidence":1.0,"methodology":"local source inspection","limitations":"transaction canary only"}
     def propose(evidence):
-        return {"proposal_type":"ui_canary","proposal_text":"Increment non-functional Council stage-rail canary revision.","suggested_action":"increment CANARY_REVISION","files":["ui/council_build_stage_rail.py"],"diff_chars":24,"compile_ok":True,"test_cmd":"py_compile + revision assertion","backup_planned":True}
+        return {"proposal_type":"ui_canary","proposal_text":"Increment non-functional Council stage-rail canary revision.","suggested_action":"increment CANARY_REVISION","files":["ui/council_build_stage_rail.py"],"test_cmd":"py_compile + revision assertion","backup_planned":True}
     def build():
         src=target.read_text(encoding="utf-8"); m=re.search(r"^CANARY_REVISION=(\d+)$",src,re.M)
         if not m: raise RuntimeError("CANARY_REVISION missing")
@@ -507,6 +506,49 @@ def release_canary_if_verified(canonical_id, db=None) -> dict:
         return {"state": "UNKNOWN", "released": False, "reason": f"error:{exc}"}
 
 
+
+def _rel_target(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(ROOT.resolve())).replace("\\", "/")
+    except Exception:
+        return ""
+
+def _measure_candidate(target: Path, new_content: str) -> Dict[str, Any]:
+    """Engine-measured facts only; never trust proposer verification fields."""
+    old = ""
+    if target.exists():
+        old = target.read_text(encoding="utf-8", errors="ignore")
+    matcher = difflib.SequenceMatcher(a=old, b=new_content, autojunk=False)
+    changed = 0
+    for tag, a0, a1, b0, b1 in matcher.get_opcodes():
+        if tag != "equal":
+            changed += (a1 - a0) + (b1 - b0)
+    changed = max(1, int(changed))
+
+    compile_ok = True
+    compile_error = ""
+    if target.suffix.lower() == ".py":
+        tmp_name = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", suffix=".py", delete=False,
+                dir=str(target.parent if target.parent.exists() else ROOT)
+            ) as tf:
+                tf.write(new_content)
+                tmp_name = tf.name
+            py_compile.compile(tmp_name, doraise=True)
+        except Exception as exc:
+            compile_ok = False
+            compile_error = str(exc)[:300]
+        finally:
+            if tmp_name:
+                try:
+                    Path(tmp_name).unlink(missing_ok=True)
+                except Exception:
+                    pass
+    return {"compile_ok": bool(compile_ok), "compile_error": compile_error,
+            "diff_chars": changed, "candidate_chars": len(new_content)}
+
 def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
              ctx: Optional[dict] = None,
              model_router: Optional[Callable] = None,
@@ -544,6 +586,52 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
             c.commit()
         finally:
             c.close()
+        # ── SIGNOFF_CAPABILITY_GAP_BRIDGE_20260813 ───────────────────────────
+        # DEFECT (causal, source-proven): this path records the gap in
+        # `council_capability_gaps` and parks the task with
+        # blocker_code='NO_HANDLER'. But the AUTOMATIC REOPEN path,
+        # council_handler_registry.restore_capabilities(), reads ONLY
+        # `council_capability_gaps_v2 WHERE status='OPEN'`.
+        #
+        # Two different tables. Consequence: a task parked here is INVISIBLE to
+        # the restore mechanism. Registering the missing handler later never
+        # reopens it. It stays NEEDS_OPERATOR | NO_HANDLER permanently and
+        # requires the manual operator step that restore_capabilities() was
+        # specifically built to eliminate. That is the "tasks stuck at
+        # NEEDS_OPERATOR | NO_HANDLER" symptom.
+        #
+        # Minimal safe bridge: ALSO record the gap in the v2 table the restore
+        # path actually reads. Additive only - the legacy row above is still
+        # written, so nothing that queries the old table regresses.
+        #
+        # Note on handler_key: restore_capabilities() skips any gap whose key is
+        # not in HANDLERS, so an UNMAPPED task behaves exactly as it does today
+        # (stays parked, needs an operator). A task WITH a handler_key becomes
+        # automatically restorable the moment that handler is registered. This
+        # is therefore a strict improvement with no new failure mode.
+        try:
+            from services.council_handler_registry import (
+                record_capability_gap as _rcg, resolve as _resolve_key)
+            _missing_key = str(task.get("handler_key") or "").strip().upper()
+            if not _missing_key:
+                _missing_key = _resolve_key(task)[1]      # 'UNMAPPED' when unknown
+            c2 = _con(db)
+            try:
+                _rcg(c2,
+                     original_task_id=int(canonical_id),
+                     missing_handler_key=_missing_key,
+                     reason="autobuilder: no registered handler for task",
+                     required_inputs=str(task.get("title") or "")[:400],
+                     expected_outputs="typed handler registration")
+            finally:
+                c2.close()
+        except Exception as _gap_exc:
+            # Never let the bridge break the park path - the legacy row and the
+            # operator notification above have already been committed.
+            import logging as _log   # module has no package-level logger
+            _log.warning("CAPABILITY_GAP_V2_BRIDGE_FAILED task=%s err=%s",
+                         canonical_id, _gap_exc)
+
         _transition(canonical_id, "NEEDS_OPERATOR", agent=AGENT,
                           reason="NO_HANDLER capability gap persisted; retry loop stopped",
                           next_action="operator reviews capability gap",
@@ -617,84 +705,54 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
     _transition(canonical_id, "PROPOSING", agent=AGENT,
                       reason=f"proposal #{proposal_id} created", db_path=db)
 
-    # DEBATING → degraded quorum
-    _transition(canonical_id, "DEBATING", agent=AGENT,
-                      reason="quorum debate start", db_path=db)
-    prop["proposal_id"] = proposal_id
-    verdict = debate_quorum.run_debate(prop, task["risk_tier"],
-                                       model_router=model_router, db_path=db)
-    if verdict["verdict"] == "DUPLICATE_SUPPRESSED":
-        _transition(canonical_id, "BLOCKED_TRANSIENT", agent=AGENT,
-                          reason="debate cooldown active — duplicate suppressed",
-                          db_path=db)
-        return {"ok": False, "reason": "COOLDOWN", "verdict": verdict}
-    if not verdict["consensus"]:
-        _transition(canonical_id, "FAILED_RETRYABLE", agent=AGENT,
-                          reason=f"debate rejected ({verdict['quorum']})",
-                          outputs=verdict, db_path=db)
-        return {"ok": False, "reason": "DEBATE_REJECTED", "verdict": verdict}
-
-    # GATED → capability matrix (config reader injected; core.schema optional)
+    # P0 PRE-GATE — constitutional territory is checked BEFORE content generation.
     _gcv = get_config
     if _gcv is None:
         try:
             from core.schema import get_config_value as _gcv
         except ImportError:
             _gcv = lambda key, default=None: default
-    allowed, tier, why = apply_policy.can_autoapply(prop["files"], _gcv)
-    # A previously sealed Tier-B request resumes through the exact same build,
-    # compile, smoke-test, rollback and verification path. Tier C never bypasses.
-    if tier == "B" and operator_approval.approval_is_valid(canonical_id, db):
-        allowed, why = True, "OPERATOR_APPROVED_TIER_B"
-    _transition(canonical_id, "GATED", agent=AGENT,
-                      reason=f"tier={tier} {why} quorum={verdict['quorum']}",
-                      db_path=db)
-    if tier == "C":
-        _transition(canonical_id, "FAILED_FINAL", agent=AGENT,
-                          reason=f"TIER C — never autonomous: {why}", db_path=db)
-        return {"ok": False, "reason": "TIER_C_REFUSED"}
-    if not allowed:
-        c = _con(db)
-        try:
-            c.execute("INSERT INTO council_needs_operator(canonical_id, ts,"
-                      " decision_needed, context) VALUES(?,?,?,?)"
-                      " ON CONFLICT(canonical_id) DO NOTHING",
-                      (canonical_id, time.time(),
-                       f"Approve Tier-{tier} patch for {prop['files']} "
-                       f"(proposal #{proposal_id}): {prop['suggested_action']}",
-                       why))
-            c.commit()
-        finally:
-            c.close()
-        _transition(canonical_id, "NEEDS_OPERATOR", agent=AGENT,
-                          reason=f"tier {tier}: {why}", db_path=db)
-        return {"ok": False, "reason": "NEEDS_OPERATOR", "tier": tier}
 
-    # PATCH_READY → generate
-    built = h["build"]()
+    pre_allowed, pre_tier, pre_why = apply_policy.can_autoapply(prop["files"], _gcv)
+    if pre_tier == "C":
+        _transition(canonical_id, "FAILED_FINAL", agent=AGENT,
+                    reason=f"TIER C PRE-BUILD — never autonomous: {pre_why}",
+                    db_path=db)
+        try:
+            c = _con(db); c.execute("UPDATE polaris_proposals SET status='needs_you' WHERE id=?", (proposal_id,)); c.commit(); c.close()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "TIER_C_REFUSED_PRE_BUILD"}
+
+    # Candidate generation is side-effect free by handler contract. Generate it
+    # before debate so verification facts can be ENGINE-MEASURED rather than
+    # asserted by the proposer.
+    try:
+        built = h["build"]()
+    except Exception as _bx:
+        _transition(canonical_id, "FAILED_RETRYABLE", agent=AGENT,
+                    reason=f"candidate build refused safely: {_bx}"[:200],
+                    db_path=db)
+        return {"ok": False, "reason": f"BUILD_REFUSED:{_bx}"[:200]}
+
     if built.get("already_applied"):
-        ledger.attach(canonical_id, verification="PASS_ALREADY_APPLIED",
-                      db_path=db)
+        ledger.attach(canonical_id, verification="PASS_ALREADY_APPLIED", db_path=db)
         _transition(canonical_id, "COMPLETED", agent=AGENT,
-                          reason="fix already present on target — verified, "
-                                 "no redundant patch generated", db_path=db)
-        return {"ok": True, "reason": "ALREADY_APPLIED",
-                "proposal_id": proposal_id, "verdict": verdict}
-    target: Path = built["target_file"]
-    # SIGNOFF_BUILD_CONTAINMENT_20260725 — WRITE-SITE PATH ALLOWLIST.
-    # Previously the ONLY thing preventing this daemon from writing to a
-    # funded-execution module was the accident of which regex a handler
-    # matched: generic_schema_authority_handler takes `target_file=` out of
-    # the task DESCRIPTION TEXT and joins it to ROOT with no containment
-    # check, so a crafted/incorrect task description could resolve to
-    # services/execution_engine.py (or traverse with ../) and be written if
-    # quorum passed. Risk tier gates the DEBATE, not the WRITE. This guard
-    # enforces the boundary in code: writes are permitted only inside the
-    # allowlisted non-funded roots, and never to a protected module.
+                    reason="fix already present on target — verified, no redundant patch generated",
+                    db_path=db)
+        try:
+            c = _con(db); c.execute("UPDATE polaris_proposals SET status='already_applied' WHERE id=?", (proposal_id,)); c.commit(); c.close()
+        except Exception:
+            pass
+        return {"ok": True, "reason": "ALREADY_APPLIED", "proposal_id": proposal_id}
+
+    target: Path = Path(built["target_file"])
+
+    # WRITE-SITE CONTAINMENT — preserve the 12-Aug opening-capable Council
+    # boundary.  Debate tier is not a substitute for a hard write allowlist.
     _ALLOWED_ROOTS = tuple(
-        (ROOT / r).resolve() for r in
-        (os.getenv("COUNCIL_BUILD_ALLOWED_ROOTS", "ui").split(",") if
-         os.getenv("COUNCIL_BUILD_ALLOWED_ROOTS") else ["ui"])
+        (ROOT / r.strip()).resolve() for r in
+        (os.getenv("COUNCIL_BUILD_ALLOWED_ROOTS", "ui").split(",")) if r.strip()
     )
     _PROTECTED_NAMES = {
         "execution_engine.py", "live_trading.py", "live_decision_contract.py",
@@ -704,20 +762,104 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
     }
     try:
         _resolved = target.resolve()
-        _inside = any(
-            _resolved == _root or _root in _resolved.parents
-            for _root in _ALLOWED_ROOTS
-        )
+        _inside = any(_resolved == _root or _root in _resolved.parents
+                      for _root in _ALLOWED_ROOTS)
     except Exception:
+        _resolved = target
         _inside = False
     if (not _inside) or _resolved.name in _PROTECTED_NAMES:
         _transition(canonical_id, "BLOCKED_EXTERNAL", agent=AGENT,
-                          reason=(f"BUILD_CONTAINMENT_DENIED target={target} "
-                                  f"outside allowlist {[str(r) for r in _ALLOWED_ROOTS]} "
-                                  f"or protected module — operator approval required"),
-                          db_path=db)
-        return {"ok": False, "reason": "BUILD_CONTAINMENT_DENIED",
-                "target": str(target)}
+                    reason=(f"BUILD_CONTAINMENT_DENIED target={target} "
+                            f"outside allowlist {[str(r) for r in _ALLOWED_ROOTS]} "
+                            f"or protected module — operator approval required"),
+                    db_path=db)
+        try:
+            c = _con(db); c.execute("UPDATE polaris_proposals SET status='needs_you' WHERE id=?", (proposal_id,)); c.commit(); c.close()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "BUILD_CONTAINMENT_DENIED", "target": str(target)}
+
+    if "new_content" not in built:
+        _transition(canonical_id, "FAILED_RETRYABLE", agent=AGENT,
+                    reason="candidate build returned no new_content", db_path=db)
+        return {"ok": False, "reason": "BUILD_NO_CONTENT"}
+
+    measurements = _measure_candidate(target, built["new_content"])
+    prop = dict(prop)
+    prop["proposal_id"] = proposal_id
+    prop["files"] = [_rel_target(target) or str(target)]
+    prop["_engine_measurements"] = measurements
+    prop["test_cmd"] = str(prop.get("test_cmd") or "handler smoke test")
+
+    # Persist the exact engine-measured candidate context so the parallel
+    # debate presenter can hydrate the same facts if it observes the row.
+    try:
+        c = _con(db)
+        c.execute(
+            "UPDATE polaris_proposals SET metrics_json=?, status='autobuild_measured' WHERE id=?",
+            (json.dumps({"files": prop["files"],
+                         "engine_measurements": measurements,
+                         "test_cmd": prop["test_cmd"],
+                         "canonical_task_id": canonical_id}, default=str),
+             proposal_id),
+        )
+        c.commit(); c.close()
+    except Exception as _persist_exc:
+        _transition(canonical_id, "FAILED_RETRYABLE", agent=AGENT,
+                    reason=f"measurement persistence failed: {_persist_exc}"[:200], db_path=db)
+        return {"ok": False, "reason": "MEASUREMENT_PERSIST_FAILED"}
+
+    # DEBATING — hardened quorum consumes only engine-measured facts.
+    _transition(canonical_id, "DEBATING", agent=AGENT,
+                reason="measured candidate -> hardened quorum", db_path=db)
+    verdict = debate_quorum.run_debate(prop, task["risk_tier"],
+                                       model_router=model_router, db_path=db)
+    if verdict.get("verdict") == "DUPLICATE_SUPPRESSED":
+        try:
+            c = _con(db); c.execute("UPDATE polaris_proposals SET status='debate_retryable' WHERE id=?", (proposal_id,)); c.commit(); c.close()
+        except Exception:
+            pass
+        _transition(canonical_id, "BLOCKED_TRANSIENT", agent=AGENT,
+                    reason="debate cooldown active — duplicate suppressed", db_path=db)
+        return {"ok": False, "reason": "COOLDOWN", "verdict": verdict}
+    if not verdict.get("consensus"):
+        _status = "insufficient_quorum" if verdict.get("quorum") == "INSUFFICIENT_QUORUM" else "debate_retryable"
+        try:
+            c = _con(db); c.execute("UPDATE polaris_proposals SET status=? WHERE id=?", (_status, proposal_id)); c.commit(); c.close()
+        except Exception:
+            pass
+        _transition(canonical_id, "FAILED_RETRYABLE", agent=AGENT,
+                    reason=f"debate rejected ({verdict.get('quorum')})",
+                    outputs=verdict, db_path=db)
+        return {"ok": False, "reason": "DEBATE_REJECTED", "verdict": verdict}
+
+    # GATED — quorum success still never bypasses territory/operator policy.
+    allowed, tier, why = apply_policy.can_autoapply(prop["files"], _gcv)
+    if tier == "B" and operator_approval.approval_is_valid(canonical_id, db):
+        allowed, why = True, "OPERATOR_APPROVED_TIER_B"
+    _transition(canonical_id, "GATED", agent=AGENT,
+                reason=f"tier={tier} {why} quorum={verdict.get('quorum')}", db_path=db)
+    if tier == "C":
+        _transition(canonical_id, "FAILED_FINAL", agent=AGENT,
+                    reason=f"TIER C — never autonomous: {why}", db_path=db)
+        return {"ok": False, "reason": "TIER_C_REFUSED"}
+    if not allowed:
+        c = _con(db)
+        try:
+            c.execute("INSERT INTO council_needs_operator(canonical_id, ts,"
+                      " decision_needed, context) VALUES(?,?,?,?)"
+                      " ON CONFLICT(canonical_id) DO NOTHING",
+                      (canonical_id, time.time(),
+                       f"Approve Tier-{tier} patch for {prop['files']} "
+                       f"(proposal #{proposal_id}): {prop['suggested_action']}", why))
+            c.execute("UPDATE polaris_proposals SET status='needs_you' WHERE id=?", (proposal_id,))
+            c.commit()
+        finally:
+            c.close()
+        _transition(canonical_id, "NEEDS_OPERATOR", agent=AGENT,
+                    reason=f"tier {tier}: {why}", db_path=db)
+        return {"ok": False, "reason": "NEEDS_OPERATOR", "tier": tier}
+
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     backup = BACKUP_DIR / f"{target.name}.{stamp}.bak"
@@ -731,8 +873,7 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
             " diff_chars, tier, status) VALUES(?,?,?,?,?,?,?,?, 'GENERATED')",
             (time.time(), proposal_id, canonical_id, str(target),
              str(patch_file), str(backup),
-             abs(len(built["new_content"]) - len(target.read_text(
-                 encoding="utf-8", errors="ignore"))), tier))
+             measurements["diff_chars"], tier))
         patch_id = cur.lastrowid
         c.commit()
     finally:
@@ -773,6 +914,10 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
             c.commit()
         finally:
             c.close()
+        try:
+            c3 = _con(db); c3.execute("UPDATE polaris_proposals SET status='apply_failed' WHERE id=?", (proposal_id,)); c3.commit(); c3.close()
+        except Exception:
+            pass
         _transition(canonical_id, "ROLLED_BACK", agent=AGENT,
                           reason=f"apply failed → restored backup: {exc}",
                           db_path=db)
@@ -819,8 +964,15 @@ def run_task(canonical_id: int, *, db_path: Optional[Path] = None,
         c.close()
     ledger.attach(canonical_id, verification="DONE_APPLIED_VERIFIED", db_path=db)
     _record_verified(canonical_id, patch_id, verdict, db)
-    _record_stage(canonical_id, "APPLYING", reason="patch applied",
+    # The durable stage contract requires explicit APPLIED evidence before
+    # RETROSPECTIVE can release the build-plane canary.  APPLYING only means
+    # the write began; it must never be treated as proof of a verified apply.
+    _record_stage(canonical_id, "APPLIED", reason="patch applied and verified",
                   outputs={"patch_id": patch_id}, db=db)
+    try:
+        c3 = _con(db); c3.execute("UPDATE polaris_proposals SET status='auto_applied' WHERE id=?", (proposal_id,)); c3.commit(); c3.close()
+    except Exception:
+        pass
     _transition(canonical_id, "COMPLETED", agent=AGENT,
                       reason="DONE_APPLIED_VERIFIED: applied+tested+verified; retrospective written",
                       outputs={"patch_id": patch_id, "terminal_status": "DONE_APPLIED_VERIFIED",
@@ -857,6 +1009,54 @@ def _seed_signoff_canary(db: Path) -> int:
     c = _con(db)
     try:
         now = time.time()
+        existing = c.execute(
+            "SELECT canonical_id, phase FROM council_task_ledger "
+            "WHERE source_table='SIGNOFF_CANARY' AND source_id=1"
+        ).fetchone()
+        if existing and str(existing[1] or '').upper() not in {
+                'OPEN', 'FAILED_RETRYABLE', 'BLOCKED_TRANSIENT'}:
+            # A terminal canary cannot be claimed while the durable build plane
+            # still requires proof. Re-open only this deterministic UI canary;
+            # never rewrite or delete operator work.
+            # COUNCIL_LEASE_SCHEMA_20260816 -- this statement aborted every
+            # build cycle with "no such column: lease_owner".
+            #
+            # It sets lease_owner / lease_until / blocker_reason / needs_you.
+            # None of those four exist on council_task_ledger. They belong to
+            # the polaris_standing_tasks / council_execution_spine family
+            # (services/council_execution_spine.py:81), and the statement was
+            # copied across table families. Because _seed_signoff_canary() is
+            # the FIRST statement of run_cycle() and run_cycle has no inner
+            # guard, the exception aborted the cycle before reap / import /
+            # claim / run -- so the durable build plane never ran at all, and
+            # council_chamber_bridge reported {'seeded':0,'recovered':0,
+            # 'events':0} forever.
+            #
+            # Schema history does not justify adding those columns here: the
+            # ledger's own lease vocabulary is claimed_by / claimed_at /
+            # lease_expires_at / heartbeat_at, and release_expired_leases()
+            # (council_task_ledger.py:314) already defines the intended reset.
+            # This mirrors it exactly.
+            c.execute(
+                "UPDATE council_task_ledger SET phase='OPEN', claimed_by=NULL, "
+                "claimed_at=NULL, lease_expires_at=NULL, heartbeat_at=NULL, "
+                "blocker_code=NULL, next_action=NULL, updated_at=? "
+                "WHERE canonical_id=?",
+                (now, int(existing[0])))
+            # Phase changes on this ledger are auditable. Reopening the canary
+            # is a phase change, so it gets a transition row like any other.
+            try:
+                c.execute(
+                    "INSERT INTO council_task_transitions"
+                    "(canonical_id, ts, agent, from_phase, to_phase, reason) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (int(existing[0]), now, "SIGNOFF_CANARY_SEEDER",
+                     str(existing[1] or ""), "OPEN",
+                     "canary re-opened: durable build plane still requires proof"))
+            except Exception:
+                pass
+            c.commit()
+            return 1
         cur = c.execute(
             "INSERT INTO council_task_ledger(source_table,source_id,title,description,"
             "domain,risk_tier,priority,owner,phase,created_at,updated_at) "
@@ -878,18 +1078,30 @@ def run_cycle(db_path: Optional[Path] = None, *,
     db = Path(db_path or BUILD_DB_PATH)
     if not db.exists():
         return {"ok": False, "reason": "BUILD_DB_MISSING_RUN_MIGRATION"}
-    seeded = _seed_signoff_canary(db)
+    # COUNCIL_LEASE_SCHEMA_20260816: canary seeding is a convenience, not a
+    # precondition for reap/import/claim/run. It previously had no guard, so a
+    # single bad column name in it silenced the entire durable build plane on
+    # every cycle. A seeding fault is now named, counted and stepped over.
+    seed_error = ""
+    try:
+        seeded = _seed_signoff_canary(db)
+    except Exception as _seed_exc:
+        seeded = 0
+        seed_error = f"{type(_seed_exc).__name__}:{_seed_exc}"
+        print(f"[AUTOBUILDER] canary seeding failed (cycle continues): {seed_error}")
     reaped = ledger.release_expired_leases(db)
     # Intake is read-only against market truth and writes only to build DB.
     imported = ledger.import_sources(db, source_db_path=MARKET_DB_PATH)
     stag = ledger.enforce_progress(db)
     candidate = ledger.claim(AGENT, db_path=db)
     if not candidate:
-        return {"reaped": reaped, "imported": imported,
+        return {"reaped": reaped, "imported": imported, "seeded_canary": seeded,
+                "seed_error": seed_error,
                 "stagnation": stag, "claimed": None, "result": None}
     result = run_task(candidate["canonical_id"], db_path=db, ctx=ctx,
                       model_router=model_router, get_config=get_config)
     return {"reaped": reaped, "imported": imported, "seeded_canary": seeded,
+            "seed_error": seed_error,
             "stagnation": stag, "claimed": candidate["canonical_id"], "result": result}
 
 

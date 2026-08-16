@@ -269,6 +269,40 @@ def should_guard_first_tick_stop(*, is_live_mode: bool, opened_at: Any, now: Opt
     return False, "PAST_FIRST_TICK_WINDOW"
 
 
+def _clamp_enabled(cap_enabled: bool = True) -> bool:
+    """
+    PNL_TRUTH_SIGNOFF_20260808.
+
+    The synthetic paper stop floor is now OFF by default. Observed market truth
+    is canonical for paper realised PnL.
+
+    Set PAPER_STOP_FLOOR_CLAMP_ENABLED=1 to restore the pre-2026-08-08
+    behaviour. Doing so re-introduces the defect where a -94% collapse is
+    credited as -4.00% in every reader that touches realized_pnl_usd, so it
+    should only ever be used for a deliberate A/B against historical rows.
+    """
+    if not cap_enabled:
+        return False
+    try:
+        from core.schema import get_config_value
+        return str(get_config_value("PAPER_STOP_FLOOR_CLAMP_ENABLED", "0")).strip().lower() in (
+            "1", "true", "on", "yes")
+    except Exception:
+        return False
+
+
+def _apply_floor_if_clamped(out: dict, entry: float, stop: float, pnl: float,
+                            clamp_on: bool) -> None:
+    """Apply the legacy synthetic floor only when explicitly re-enabled."""
+    if not clamp_on:
+        return
+    out.update(
+        capped=True,
+        exit_price=entry * (1.0 - stop / 100.0),
+        exit_reason=f"HARD_STOP_LOSS_CAPPED_{stop:.1f}pct_raw{pnl:.1f}pct",
+    )
+
+
 def paper_hard_stop_exit_policy(*, is_live_mode: bool, entry_price: Any, current_price: Any,
                                 pnl_pct: Any, hard_stop_pct: Any, opened_at: Any,
                                 price_integrity_status: Any = None,
@@ -328,18 +362,51 @@ def paper_hard_stop_exit_policy(*, is_live_mode: bool, entry_price: Any, current
         out["exit_reason"] = f"HARD_STOP_LOSS_CAPPED_{stop:.1f}pct_raw{pnl:.1f}pct"
         return out
 
-    # SIGNOFF_UNIVERSAL_PAPER_STOP_FLOOR_20260725:
-    # This policy is called only after the executor has observed pnl <= -stop.
-    # Paper accounting must therefore represent the configured stop doctrine,
-    # even when the first observable mark arrives below the threshold. Preserve
-    # the raw trigger separately in the executor; use the synthetic floor only
-    # for SIM accounting. REAL positions remain chain-settled above.
-    out.update(
-        capped=True,
-        exit_price=entry * (1.0 - stop / 100.0),
-        exit_reason=f"HARD_STOP_LOSS_CAPPED_{stop:.1f}pct_raw{pnl:.1f}pct",
-        audit_reason="UNIVERSAL_PAPER_STOP_FLOOR",
-    )
+    # PNL_TRUTH_SIGNOFF_20260808 — REVERSAL OF SIGNOFF_UNIVERSAL_PAPER_STOP_FLOOR_20260725.
+    #
+    # PREVIOUS BEHAVIOUR (defective): every paper hard stop was recorded at
+    # exactly entry*(1-stop/100) regardless of the observed mark. A token that
+    # collapsed -94.6% was credited as -4.00%. The raw value was preserved in
+    # side columns that only services/pnl_truth.py reads, while 240 call sites
+    # across the codebase consume realized_pnl_usd -- the clamped value. Every
+    # dashboard, calibration input, Council judgement and audit therefore
+    # trained on an outcome that never happened. The 2026-08-07/08 window
+    # reported +$99.70 realised while concealing roughly -208 percentage points
+    # of loss across nine visible rows alone.
+    #
+    # CORRECTED BEHAVIOUR: the observed mark is canonical. The configured stop
+    # floor is retained as explicit modelled telemetry (modelled_floor_pct /
+    # modelled_floor_price) for anything that legitimately wants the doctrine
+    # value, but it no longer overwrites realised truth.
+    #
+    # The original justification for the clamp -- preventing calibration from
+    # training on a spurious -90% mark from a suspect source -- is preserved by
+    # a different and already-existing mechanism: those rows are still flagged
+    # dirty/outlier_rejected below, and is_dirty_outcome() excludes them from
+    # calibration. Excluding a suspect row is correct; overwriting it with an
+    # invented -4% is not.
+    #
+    # PAPER ONLY. REAL positions remain chain-settled and were never clamped.
+    _clamp_on = _clamp_enabled(cap_enabled)
+    out["modelled_floor_pct"] = -stop
+    out["modelled_floor_price"] = entry * (1.0 - stop / 100.0)
+    out["observed_exit_price"] = current
+    out["observed_pnl_pct"] = pnl
+
+    if _clamp_on:
+        out.update(
+            capped=True,
+            exit_price=entry * (1.0 - stop / 100.0),
+            exit_reason=f"HARD_STOP_LOSS_CAPPED_{stop:.1f}pct_raw{pnl:.1f}pct",
+            audit_reason="UNIVERSAL_PAPER_STOP_FLOOR",
+        )
+    else:
+        out.update(
+            capped=False,
+            exit_price=current,
+            exit_reason=f"HARD_STOP_LOSS_{pnl:.1f}pct",
+            audit_reason="OBSERVED_STOP_TRUTH",
+        )
 
     source_blob = _src_text(price_source, first_mark_source, entry_price_source, price_integrity_reason)
     trigger_source_suspect = _is_suspect_source(price_source) or any(tok in source_blob for tok in (
@@ -358,32 +425,31 @@ def paper_hard_stop_exit_policy(*, is_live_mode: bool, entry_price: Any, current
         # This is the 5964/6007 class: a huge loss asserted by suspect source.
         # Do not close if the executor patch honors defer_close. If it does not,
         # the cap still prevents calibration from absorbing a -90% mark.
+        # PNL_TRUTH_SIGNOFF_20260808: the row stays dirty and outlier_rejected
+        # so is_dirty_outcome() keeps it out of calibration. That is the correct
+        # defence against a spurious mark. Overwriting the realised value is not.
         out.update(
-            capped=True,
             dirty=True,
             defer_close=False,
             outlier_rejected=True,
-            audit_reason="MARK_OUTLIER_CAPPED:SUSPECT_SOURCE_CATASTROPHIC_HARD_STOP",
-            exit_price=entry * (1.0 - stop / 100.0),
-            exit_reason=f"HARD_STOP_LOSS_CAPPED_{stop:.1f}pct_raw{pnl:.1f}pct",
+            audit_reason="MARK_OUTLIER:SUSPECT_SOURCE_CATASTROPHIC_HARD_STOP",
         )
+        _apply_floor_if_clamped(out, entry, stop, pnl, _clamp_on)
         return out
 
     if first_tick_guard and (integrity_unstable or spread_unstable or first_mark_unstable or catastrophic):
         out.update(
-            capped=True,
             dirty=True,
             defer_close=False,
             outlier_rejected=True,
-            audit_reason=f"MARK_OUTLIER_CAPPED:{first_tick_reason}",
-            exit_price=entry * (1.0 - stop / 100.0),
-            exit_reason=f"HARD_STOP_LOSS_CAPPED_{stop:.1f}pct_raw{pnl:.1f}pct",
+            audit_reason=f"MARK_OUTLIER:{first_tick_reason}",
         )
+        _apply_floor_if_clamped(out, entry, stop, pnl, _clamp_on)
         return out
 
     if catastrophic or integrity_unstable or spread_unstable or first_mark_unstable or guard_n > 0:
-        # Trusted/confirmed catastrophic paper loss: close, but cap to the stop floor
-        # so paper training/calibration reflects the configured 4% doctrine.
+        # Trusted/confirmed catastrophic paper loss: close at the observed
+        # mark and flag dirty so calibration excludes it.
         reasons = []
         if catastrophic: reasons.append(f"CATASTROPHIC_GAP_{pnl:.1f}pct")
         if integrity_unstable: reasons.append(f"STATUS_{price_integrity_status}")
@@ -391,12 +457,10 @@ def paper_hard_stop_exit_policy(*, is_live_mode: bool, entry_price: Any, current
         if first_mark_unstable: reasons.append(f"FIRST_MARK_{first_drift:.1f}pct")
         if guard_n > 0: reasons.append(f"GUARD_COUNT_{guard_n}")
         out.update(
-            capped=True,
             dirty=True,
-            audit_reason="|".join(reasons) or "PAPER_HARD_STOP_CAP",
-            exit_price=entry * (1.0 - stop / 100.0),
-            exit_reason=f"HARD_STOP_LOSS_CAPPED_{stop:.1f}pct_raw{pnl:.1f}pct",
+            audit_reason="|".join(reasons) or "PAPER_HARD_STOP_OBSERVED",
         )
+        _apply_floor_if_clamped(out, entry, stop, pnl, _clamp_on)
         return out
 
     return out

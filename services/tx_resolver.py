@@ -61,6 +61,16 @@ class ResolverResult:
     resolver_version: str = RESOLVER_VERSION
     resolved_at: float = 0.0
     notes: str = ""
+    # BUNDLE_A_20260810 lane-scoped scaffold:
+    # live_confidence is the frozen current feature set (identical to calibrated
+    # until experimental PAPER features are deliberately enabled).
+    # paper_delta is a bounded PAPER-only contribution (default 0).
+    # paper_confidence = live_confidence + paper_delta.
+    # Callers that do not request PAPER experimentation continue to see
+    # calibrated_confidence / confidence exactly as before.
+    live_confidence: float = 0.0
+    paper_delta: float = 0.0
+    paper_confidence: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         out = asdict(self)
@@ -659,10 +669,15 @@ def calibrate_confidence(snapshot: Mapping[str, Any], db_path: Optional[str] = N
     if evidence_count <= 2:
         notes.append("insufficient_independent_evidence")
 
+    _live = round(confidence, 4)
+    # Scaffold only: paper_delta remains 0 until a deliberate PAPER experiment
+    # supplies a bounded, ledgered contribution. Live callers are unaffected.
+    _paper_delta = 0.0
+    _paper = round(min(MAX_CONFIDENCE, max(MIN_CONFIDENCE, _live + _paper_delta)), 4)
     return ResolverResult(
         token=token,
-        confidence=round(confidence, 4),
-        calibrated_confidence=round(confidence, 4),
+        confidence=_live,
+        calibrated_confidence=_live,
         raw_confidence=None if raw_conf is None else round(raw_conf, 4),
         runner_conviction=runner_conviction,
         runner_tier=runner_tier,
@@ -671,6 +686,9 @@ def calibrate_confidence(snapshot: Mapping[str, Any], db_path: Optional[str] = N
         confidence_source=confidence_source,
         resolved_at=time.time(),
         notes=";".join(notes),
+        live_confidence=_live,
+        paper_delta=_paper_delta,
+        paper_confidence=_paper,
     )
 
 

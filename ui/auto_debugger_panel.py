@@ -23,7 +23,12 @@ try:
 except Exception:  # pragma: no cover
     st = None  # type: ignore
 
-from core.sovereign_gate_map import collect_gate_map
+# SIGNOFF_IMPORT_PATH_20260812: module lives at services/sovereign_gate_map.py,
+# not core/. This import was unguarded, so the panel crashed on import.
+try:
+    from services.sovereign_gate_map import collect_gate_map
+except Exception:
+    from sovereign_gate_map import collect_gate_map  # type: ignore
 
 
 def _age(v: Any) -> str:

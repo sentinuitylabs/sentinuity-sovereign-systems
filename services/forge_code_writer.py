@@ -56,6 +56,41 @@ AUTONOMOUS_TARGETS = {
     "services/forge_research_bridge.py",
 }
 
+
+CODE_PATCHES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS code_patches(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at REAL NOT NULL, proposal_id INTEGER, project_key TEXT,
+    target_file TEXT NOT NULL, new_code TEXT, old_code TEXT, description TEXT,
+    author_agent TEXT, axon_dry_run TEXT, axon_passed INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'pending', applied_at REAL, notes TEXT,
+    canonical_task_id INTEGER, patch_kind TEXT, patch_path TEXT, backup_path TEXT,
+    diff_chars INTEGER, tier TEXT, rolled_back_at REAL, test_result TEXT,
+    verify_result TEXT, file_path TEXT, patch_diff TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_code_patches_proposal ON code_patches(proposal_id);
+CREATE INDEX IF NOT EXISTS idx_code_patches_status ON code_patches(status);
+"""
+
+def _ensure_matrix_patch_schema() -> None:
+    """Create/upgrade the matrix-side Lane-D patch journal idempotently."""
+    with get_connection() as conn:
+        conn.executescript(CODE_PATCHES_SCHEMA)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(code_patches)")}
+        required = {
+            "project_key":"TEXT", "new_code":"TEXT", "old_code":"TEXT",
+            "description":"TEXT", "author_agent":"TEXT", "axon_dry_run":"TEXT",
+            "axon_passed":"INTEGER DEFAULT 0", "notes":"TEXT",
+            "canonical_task_id":"INTEGER", "patch_kind":"TEXT",
+            "patch_path":"TEXT", "backup_path":"TEXT", "diff_chars":"INTEGER",
+            "tier":"TEXT", "rolled_back_at":"REAL", "test_result":"TEXT",
+            "verify_result":"TEXT", "file_path":"TEXT", "patch_diff":"TEXT",
+        }
+        for name, decl in required.items():
+            if name not in cols:
+                conn.execute(f'ALTER TABLE code_patches ADD COLUMN "{name}" {decl}')
+        conn.commit()
+
 HITL_REQUIRED_TARGETS = {
     "services/execution_engine.py",
     "services/neural_supervisor.py",
@@ -446,6 +481,7 @@ def _check_approved_proposals() -> int:
 
 
 def run() -> None:
+    _ensure_matrix_patch_schema()
     log.info("Forge code writer started — cycle=%ds", CYCLE_SECONDS)
     log.info("Autonomous targets: %d files | HITL targets: %d files",
              len(AUTONOMOUS_TARGETS), len(HITL_REQUIRED_TARGETS))

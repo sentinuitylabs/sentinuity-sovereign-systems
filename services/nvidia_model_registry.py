@@ -36,7 +36,7 @@ def _connect():
     avoidable write-lock pressure to the pricing/execution hot path."""
     global _DDL_DONE
     c=sqlite3.connect(DB, timeout=15); c.row_factory=sqlite3.Row
-    c.execute("PRAGMA busy_timeout=20000")
+    c.execute("PRAGMA busy_timeout=5000")
     if not _DDL_DONE:
         c.executescript('''
     CREATE TABLE IF NOT EXISTS llm_model_catalog(model_id TEXT PRIMARY KEY,provider TEXT,first_seen_at REAL,last_seen_at REAL,available INTEGER DEFAULT 1,chat_capable INTEGER,health_status TEXT,median_latency_ms REAL,last_error TEXT,last_probed_at REAL,capability_json TEXT);
@@ -158,25 +158,6 @@ def fetch_catalogue(timeout=30)->List[dict]:
 
 def _chat_capable(mid:str)->bool: return not any(x in mid.lower() for x in NON_CHAT_MARKERS)
 
-
-def _role_pool(rows: List[dict], role: str) -> List[str]:
-    """Return current-catalogue candidates, static preferences first.
-
-    NVIDIA rotates/renames hosted models. Static role lists are preferences, not
-    truth. A model is eligible for autonomous failover only if it exists in the
-    provider's current catalogue and is chat-capable; runtime probing still has
-    to succeed before it can become the active IVARIS assignment.
-    """
-    ids=[str(x.get("id") or "") for x in rows if x.get("id") and _chat_capable(str(x.get("id")))]
-    present=set(ids)
-    preferred=[m for m in ROLE_CANDIDATES.get(str(role).upper(), []) if m in present]
-    # Dynamic tail keeps the council recoverable when NVIDIA retires every
-    # static preferred model. Prefer general instruction/chat families, but do
-    # not assign any dynamic model until _probe() proves the endpoint works.
-    markers=("qwen","deepseek","nemotron","mistral","llama","glm","kimi","gpt-oss")
-    dynamic=sorted((m for m in ids if m not in preferred), key=lambda m:(0 if any(x in m.lower() for x in markers) else 1,m))
-    return preferred+dynamic
-
 def _probe(mid:str, timeout=35)->Tuple[bool,float,str]:
     k=_key(); started=time.perf_counter()
     payload=json.dumps({"model":mid,"max_tokens":24,"temperature":0,"messages":[{"role":"user","content":"Return exactly: {\"ok\":true}"}]}).encode()
@@ -188,136 +169,268 @@ def _probe(mid:str, timeout=35)->Tuple[bool,float,str]:
     except Exception as e: return False,(time.perf_counter()-started)*1000,f"{type(e).__name__}: {e}"
 
 def scan_and_align(probe=True)->Dict[str,object]:
-    """Refresh catalogue and assignments without holding SQLite over network I/O.
-
-    Phase 1 is a short catalogue write. Phase 2 probes providers with no DB
-    connection open. Phase 3 writes probe/assignment results in a short
-    transaction. This removes the lock-amplification path that previously held
-    a write transaction across repeated 35-second HTTP probes.
-    """
-    rows=fetch_catalogue(); now=time.time()
-    ids={str(x.get('id')) for x in rows if x.get('id')}
-    version=hashlib.sha256("\n".join(sorted(ids)).encode()).hexdigest()[:16]
-
-    # Phase 1: catalogue truth only; commit before any provider probe.
+    rows=fetch_catalogue(); now=time.time(); ids={str(x.get('id')) for x in rows if x.get('id')}; version=hashlib.sha256("\n".join(sorted(ids)).encode()).hexdigest()[:16]
     con=_connect()
     try:
-        try: con.execute("PRAGMA journal_mode=WAL")
-        except Exception: pass
         con.execute("UPDATE llm_model_catalog SET available=0")
         for x in rows:
             mid=str(x.get("id") or ""); prov=str(x.get("owned_by") or mid.split('/')[0])
             if not mid: continue
             con.execute("INSERT INTO llm_model_catalog(model_id,provider,first_seen_at,last_seen_at,available,chat_capable,health_status) VALUES(?,?,?,?,1,?,?) ON CONFLICT(model_id) DO UPDATE SET provider=excluded.provider,last_seen_at=excluded.last_seen_at,available=1,chat_capable=excluded.chat_capable",(mid,prov,now,now,int(_chat_capable(mid)),"UNTESTED"))
-        con.commit()
-    finally:
-        con.close()
-
-    # Phase 2: network I/O with no SQLite connection held.
-    probe_results={}
-    role_candidates={}
-    for role in ROLE_CANDIDATES:
-        available=_role_pool(rows, role)
-        role_candidates[role]=available
-        for mid in available[:6]:
-            if mid in probe_results: continue
-            if probe:
-                probe_results[mid]=_probe(mid)
-            else:
-                probe_results[mid]=(True,999999.0,"")
-
-    # Phase 3: short result/assignment write transaction.
-    changes=[]; write_now=time.time(); con=_connect()
-    try:
-        try: con.execute("PRAGMA journal_mode=WAL")
-        except Exception: pass
-        for mid,(ok,lat,err) in probe_results.items():
-            con.execute("UPDATE llm_model_catalog SET health_status=?,median_latency_ms=?,last_error=?,last_probed_at=? WHERE model_id=?",("HEALTHY" if ok else "FAILED",lat,"" if ok else err,write_now,mid))
-        for role,available in role_candidates.items():
-            healthy=[(m,probe_results[m][1]) for m in available[:6] if probe_results.get(m,(False,0,''))[0]]
+        changes=[]
+        for role,cands in ROLE_CANDIDATES.items():
+            available=[m for m in cands if m in ids and _chat_capable(m)]
+            if not available: continue
+            healthy=[]
+            for m in available[:3]:
+                if probe:
+                    ok,lat,err=_probe(m)
+                    con.execute("UPDATE llm_model_catalog SET health_status=?,median_latency_ms=?,last_error=?,last_probed_at=? WHERE model_id=?",("HEALTHY" if ok else "FAILED",lat,"" if ok else err,now,m))
+                    if ok: healthy.append((m,lat))
+                else: healthy.append((m,999999))
             if not healthy: continue
-            eligible=[m for m,_ in healthy if not is_quarantined(m,con)]
-            if not eligible: continue
-            chosen=eligible[0]; fallback=eligible[1] if len(eligible)>1 else chosen
+            chosen=healthy[0][0]; fallback=healthy[1][0] if len(healthy)>1 else (available[1] if len(available)>1 else chosen)
             old=con.execute("SELECT model_id FROM council_model_assignments WHERE agent_name=?",(role,)).fetchone(); oldm=old[0] if old else None
+            # SIGNOFF_MODEL_RESILIENCE_20260725: never assign a model that is
+            # still inside its quarantine cooldown.
+            if is_quarantined(chosen, con):
+                _alt = next((m for m in ROLE_CANDIDATES.get(role, [])
+                             if m in ids and not is_quarantined(m, con)), "")
+                if _alt:
+                    chosen = _alt
             reason="best validated role candidate available in current NVIDIA catalogue"
-            con.execute("INSERT INTO council_model_assignments(agent_name,provider,model_id,fallback_model_id,assignment_reason,capability_score,assigned_at,catalogue_version,assignment_source,health_status) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent_name) DO UPDATE SET provider=excluded.provider,model_id=excluded.model_id,fallback_model_id=excluded.fallback_model_id,assignment_reason=excluded.assignment_reason,assigned_at=excluded.assigned_at,catalogue_version=excluded.catalogue_version,assignment_source=excluded.assignment_source,health_status=excluded.health_status",(role,"nim",chosen,fallback,reason,100.0,write_now,version,"AUTO_DISCOVERY","HEALTHY"))
+            con.execute("INSERT INTO council_model_assignments(agent_name,provider,model_id,fallback_model_id,assignment_reason,capability_score,assigned_at,catalogue_version,assignment_source,health_status) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent_name) DO UPDATE SET provider=excluded.provider,model_id=excluded.model_id,fallback_model_id=excluded.fallback_model_id,assignment_reason=excluded.assignment_reason,assigned_at=excluded.assigned_at,catalogue_version=excluded.catalogue_version,assignment_source=excluded.assignment_source,health_status=excluded.health_status",(role,"nim",chosen,fallback,reason,100.0,now,version,"AUTO_DISCOVERY","HEALTHY"))
             con.execute("INSERT INTO system_config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(CONFIG_KEYS[role],chosen))
             if oldm!=chosen:
-                con.execute("INSERT INTO council_model_assignment_history(agent_name,old_model_id,new_model_id,reason,changed_at,catalogue_version) VALUES(?,?,?,?,?,?)",(role,oldm,chosen,reason,write_now,version)); changes.append((role,oldm,chosen))
+                con.execute("INSERT INTO council_model_assignment_history(agent_name,old_model_id,new_model_id,reason,changed_at,catalogue_version) VALUES(?,?,?,?,?,?)",(role,oldm,chosen,reason,now,version)); changes.append((role,oldm,chosen))
+        con.commit(); return {"count":len(ids),"catalogue_version":version,"changes":changes}
+    finally: con.close()
+
+
+_LAST_RUNTIME_SCAN_AT = 0.0
+_RUNTIME_SCAN_COOLDOWN_SEC = 300.0
+
+def _catalogue_candidate(con, role: str, exclude=()) -> str:
+    """Best known unquarantined chat model from persisted catalogue.
+
+    Role candidates are preferred, but the catalogue is authoritative for
+    what NVIDIA actually exposes.  This prevents a stale hard-coded model list
+    from leaving IVARIS permanently UNASSIGNED after provider catalogue churn.
+    """
+    role = str(role or "").upper().strip()
+    excluded = {str(x or "").strip() for x in exclude if str(x or "").strip()}
+    try:
+        rows = con.execute(
+            "SELECT model_id,available,chat_capable,health_status,last_probed_at "
+            "FROM llm_model_catalog WHERE COALESCE(available,1)=1"
+        ).fetchall()
+    except Exception:
+        return ""
+
+    preferred = {m: idx for idx, m in enumerate(ROLE_CANDIDATES.get(role, []))}
+    candidates = []
+    for row in rows:
+        mid = str(row["model_id"] or "").strip()
+        if not mid or mid in excluded or not _chat_capable(mid):
+            continue
+        try:
+            if is_quarantined(mid, con):
+                continue
+        except Exception:
+            continue
+        health = str(row["health_status"] or "").upper()
+        # FAILED is not a candidate until a later catalogue/probe changes it.
+        if health == "FAILED":
+            continue
+        chat = row["chat_capable"]
+        if chat not in (None, 1, True, "1"):
+            continue
+        pref = preferred.get(mid, 10_000)
+        healthy_rank = 0 if health == "HEALTHY" else 1
+        probed = float(row["last_probed_at"] or 0.0)
+        candidates.append((pref, healthy_rank, -probed, mid))
+    candidates.sort()
+    return candidates[0][3] if candidates else ""
+
+def _persist_runtime_assignment(con, role: str, model: str, old_model: str = "",
+                                reason: str = "runtime catalogue failover") -> str:
+    if not model:
+        return ""
+    now = time.time()
+    fallback = _catalogue_candidate(con, role, exclude=(model,))
+    con.execute(
+        "INSERT INTO council_model_assignments("
+        "agent_name,provider,model_id,fallback_model_id,assignment_reason,"
+        "capability_score,assigned_at,catalogue_version,assignment_source,health_status"
+        ") VALUES(?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(agent_name) DO UPDATE SET "
+        "provider=excluded.provider,model_id=excluded.model_id,"
+        "fallback_model_id=excluded.fallback_model_id,"
+        "assignment_reason=excluded.assignment_reason,"
+        "assigned_at=excluded.assigned_at,"
+        "assignment_source=excluded.assignment_source,"
+        "health_status=excluded.health_status",
+        (role, "nim", model, fallback, reason, 100.0, now,
+         "runtime-catalogue", "RUNTIME_RECOVERY", "HEALTHY"),
+    )
+    key = CONFIG_KEYS.get(role)
+    if key:
+        con.execute(
+            "INSERT INTO system_config(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, model),
+        )
+    if old_model != model:
+        con.execute(
+            "INSERT INTO council_model_assignment_history("
+            "agent_name,old_model_id,new_model_id,reason,changed_at,catalogue_version"
+            ") VALUES(?,?,?,?,?,?)",
+            (role, old_model or None, model, reason, now, "runtime-catalogue"),
+        )
+    con.commit()
+    return model
+
+
+def rotate_after_failure(role: str, failed_model: str, error: str = "", *,
+                         refresh: bool = True) -> str:
+    """Quarantine one failed model and immediately choose another known model.
+
+    Runtime failover first consumes the stored fallback, then the persisted
+    NVIDIA catalogue.  A network catalogue refresh is bounded and does not
+    probe every model: the actual IVARIS call is the health probe.
+    """
+    global _LAST_RUNTIME_SCAN_AT
+    role = str(role or "").upper().strip()
+    failed_model = str(failed_model or "").strip()
+    now = time.time()
+    con = _connect()
+    try:
+        row = con.execute(
+            "SELECT model_id,fallback_model_id FROM council_model_assignments "
+            "WHERE agent_name=?", (role,)
+        ).fetchone()
+        current = str(row["model_id"] or "").strip() if row else ""
+        fallback = str(row["fallback_model_id"] or "").strip() if row else ""
+
+        if failed_model:
+            con.execute(
+                "UPDATE llm_model_catalog SET health_status='FAILED',last_error=?,"
+                "last_probed_at=? WHERE model_id=?",
+                (str(error or "runtime failure")[:400], now, failed_model),
+            )
+            _quarantine(con, failed_model, role, error or "runtime failure")
+
+        if (
+            fallback and fallback != failed_model
+            and not is_quarantined(fallback, con)
+        ):
+            return _persist_runtime_assignment(
+                con, role, fallback, failed_model or current,
+                "runtime stored-fallback failover",
+            )
+
+        candidate = _catalogue_candidate(
+            con, role, exclude=(failed_model, current)
+        )
+        if candidate:
+            return _persist_runtime_assignment(
+                con, role, candidate, failed_model or current,
+                "runtime persisted-catalogue failover",
+            )
         con.commit()
-        return {"count":len(ids),"catalogue_version":version,"changes":changes}
     finally:
         con.close()
 
-def rotate_after_failure(role: str, failed_model: str, error: str = "", *, refresh: bool = True) -> str:
-    """Rotate a failed Council model only to catalogue-confirmed healthy truth.
-
-    A stale fallback string is not a fallback.  The prior implementation could
-    rotate IVARIS from one retired model to another because it checked only the
-    quarantine table.  This path also retries short SQLite lock contention; it
-    never touches trading/capital tables.
-    """
-    role=str(role or "").upper().strip(); failed_model=str(failed_model or "").strip()
-    now=time.time()
-
-    def _eligible(con, mid: str) -> bool:
-        if not mid or mid == failed_model or is_quarantined(mid, con): return False
-        row=con.execute("SELECT available,chat_capable,health_status FROM llm_model_catalog WHERE model_id=?",(mid,)).fetchone()
-        if not row: return False
-        return int(row["available"] or 0)==1 and int(row["chat_capable"] or 0)==1 and str(row["health_status"] or "").upper() not in {"FAILED","RETIRED","UNAVAILABLE"}
-
-    for db_attempt in range(3):
-        con=None
+    # Refresh at most once per five minutes and do not probe every advertised
+    # model here.  A stale catalogue should not trap IVARIS indefinitely, but a
+    # provider outage should not trigger a scan storm either.
+    if refresh and (time.time() - _LAST_RUNTIME_SCAN_AT) >= _RUNTIME_SCAN_COOLDOWN_SEC:
+        _LAST_RUNTIME_SCAN_AT = time.time()
         try:
-            con=_connect()
-            row=con.execute("SELECT model_id,fallback_model_id FROM council_model_assignments WHERE agent_name=?",(role,)).fetchone()
-            fallback=str(row["fallback_model_id"] or "").strip() if row else ""
-            if failed_model:
-                con.execute("UPDATE llm_model_catalog SET health_status='FAILED',last_error=?,last_probed_at=? WHERE model_id=?",(str(error or "runtime failure")[:400],now,failed_model))
-                _quarantine(con,failed_model,role,error or "runtime failure")
-            candidates=[]
-            if _eligible(con,fallback): candidates.append(fallback)
-            # Use only models already proven HEALTHY by the current catalogue.
-            for rr in con.execute("SELECT model_id FROM llm_model_catalog WHERE available=1 AND chat_capable=1 AND health_status='HEALTHY' ORDER BY last_probed_at DESC").fetchall():
-                mid=str(rr[0] or "")
-                if mid not in candidates and _eligible(con,mid): candidates.append(mid)
-            if candidates:
-                chosen=candidates[0]; next_fb=candidates[1] if len(candidates)>1 else ""
-                con.execute("UPDATE council_model_assignments SET model_id=?,fallback_model_id=?,health_status='HEALTHY',assignment_reason=?,assigned_at=? WHERE agent_name=?",(chosen,next_fb,"runtime failover to catalogue-confirmed healthy model",now,role))
-                key=CONFIG_KEYS.get(role)
-                if key: con.execute("INSERT INTO system_config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,chosen))
-                con.execute("INSERT INTO council_model_assignment_history(agent_name,old_model_id,new_model_id,reason,changed_at,catalogue_version) VALUES(?,?,?,?,?,?)",(role,failed_model,chosen,str(error or "runtime failure")[:300],now,"runtime-failover"))
-                con.commit(); return chosen
-            con.commit()
-            break
-        except sqlite3.OperationalError as exc:
-            if "locked" not in str(exc).lower() or db_attempt>=2: raise
-            time.sleep(0.35*(db_attempt+1))
-        finally:
-            if con is not None:
-                try: con.close()
-                except Exception: pass
-
-    if refresh:
-        # Provider catalogue refresh/probing occurs after the short DB write
-        # transaction is closed, avoiding a network call while holding SQLite.
-        try:
-            scan_and_align(probe=True)
-            candidate=get_assignment(role, "")
-            if candidate and candidate != failed_model and not is_quarantined(candidate):
-                return candidate
+            scan_and_align(probe=False)
         except Exception:
             return ""
+
+        con = _connect()
+        try:
+            candidate = _catalogue_candidate(con, role, exclude=(failed_model,))
+            if candidate:
+                return _persist_runtime_assignment(
+                    con, role, candidate, failed_model,
+                    "runtime refreshed-catalogue failover",
+                )
+        finally:
+            con.close()
     return ""
 
-def get_assignment(role:str, default:str="")->str:
-    role=role.upper()
+
+def get_assignment(role: str, default: str = "") -> str:
+    """Return a healthy, non-quarantined runtime assignment.
+
+    If the explicit assignment/config model is unusable, fall through to the
+    persisted NVIDIA catalogue rather than repeatedly returning a dead default.
+    """
+    global _LAST_RUNTIME_SCAN_AT
+    role = str(role or "").upper().strip()
+    con = _connect()
     try:
-        con=_connect(); row=con.execute("SELECT model_id FROM council_model_assignments WHERE agent_name=? AND health_status='HEALTHY'",(role,)).fetchone(); con.close()
-        if row and row[0]: return str(row[0])
-    except Exception: pass
-    return os.getenv(CONFIG_KEYS.get(role,""),default) or default
+        row = con.execute(
+            "SELECT model_id FROM council_model_assignments "
+            "WHERE agent_name=? AND health_status='HEALTHY'", (role,)
+        ).fetchone()
+        assigned = str(row["model_id"] or "").strip() if row else ""
+        if assigned and not is_quarantined(assigned, con):
+            return assigned
+
+        key = CONFIG_KEYS.get(role)
+        configured = ""
+        if key:
+            try:
+                cr = con.execute(
+                    "SELECT value FROM system_config WHERE key=?", (key,)
+                ).fetchone()
+                configured = str(cr["value"] or "").strip() if cr else ""
+            except Exception:
+                configured = ""
+            configured = os.getenv(key, configured or "").strip()
+
+        if configured and not is_quarantined(configured, con):
+            return _persist_runtime_assignment(
+                con, role, configured, assigned,
+                "runtime configured-model recovery",
+            )
+
+        candidate = _catalogue_candidate(con, role, exclude=(assigned, configured))
+        if candidate:
+            return _persist_runtime_assignment(
+                con, role, candidate, assigned or configured,
+                "runtime persisted-catalogue recovery",
+            )
+
+        if default and not is_quarantined(default, con):
+            return default
+    finally:
+        con.close()
+
+    # One bounded catalogue refresh when there is literally no usable model.
+    if _key() and (time.time() - _LAST_RUNTIME_SCAN_AT) >= _RUNTIME_SCAN_COOLDOWN_SEC:
+        _LAST_RUNTIME_SCAN_AT = time.time()
+        try:
+            scan_and_align(probe=False)
+        except Exception:
+            return ""
+        con = _connect()
+        try:
+            candidate = _catalogue_candidate(con, role)
+            if candidate:
+                return _persist_runtime_assignment(
+                    con, role, candidate, "",
+                    "runtime refreshed-catalogue recovery",
+                )
+        finally:
+            con.close()
+    return ""
+
 
 def get_assignments()->Dict[str,dict]:
     try:

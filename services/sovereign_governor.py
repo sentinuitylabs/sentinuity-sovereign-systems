@@ -1995,7 +1995,7 @@ def _call_nim_ivaris(
                         refresh=True,
                     )
                 except Exception as _rotate_exc:
-                    log.error("IVARIS NIM model rotation failed: %s: %s", type(_rotate_exc).__name__, _rotate_exc)
+                    log.error("IVARIS NIM model rotation failed: %s", _rotate_exc)
                     _next = ""
                 if _next and _next not in attempted:
                     log.warning(

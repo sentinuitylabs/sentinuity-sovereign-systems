@@ -84,6 +84,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("execution_engine")
 
+# HOTPATH_TRUTH_CACHE_20260809
+# mark_tape is diagnostic/history state, not a queue. Re-reading 512 rows and
+# rewriting the same cached Jupiter quote on every exit sweep caused needless
+# DB work and polluted tape health with carried/duplicate marks. These caches
+# are process-local accelerators only; durable authority remains in SQLite.
+_MARK_TAPE_VERSION: dict[int, int] = {}
+_TRUSTED_PEAK_CACHE: dict[int, tuple[int, float, tuple]] = {}
+_TRUSTED_PEAK_CACHE_MAX_AGE_SEC = max(1.0, float(os.getenv(
+    "TRUSTED_PEAK_CACHE_MAX_AGE_SEC", "10")))
+
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -93,6 +103,7 @@ if str(BASE_DIR) not in sys.path:
 load_dotenv(BASE_DIR / ".env", override=True)
 
 from core.schema import DB_PATH, get_connection, get_intel_connection, update_heartbeat, get_config_value
+from services.telemetry_redaction import redact as _redact_telemetry, warn_once as _warn_once
 
 try:
     from services.pattern_live_arming import evaluate_pattern_permission as _pattern_live_permission
@@ -116,8 +127,16 @@ try:
         classify_exit_validity as _tle_validity,
     )
     _TLE_AVAILABLE = True
-except ImportError:
+    _TLE_IMPORT_ERROR = ""
+except Exception as _tle_import_exc:
+    # OBSERVABILITY_SIGNOFF_20260808: this was `except ImportError: pass`, so a
+    # failure anywhere in the trade_lifecycle import chain silently disabled the
+    # entire lifecycle spine. trade_lifecycle_events held 0 rows for the whole
+    # 2026-08-07/08 window and the runtime audit had to infer every exit
+    # decision from other tables. A telemetry spine that can vanish without a
+    # single log line is worse than no spine at all.
     _TLE_AVAILABLE = False
+    _TLE_IMPORT_ERROR = f"{type(_tle_import_exc).__name__}: {_tle_import_exc}"
 
 try:
     from services.cognition_logger import log_cognition as _log_cog_fn
@@ -147,19 +166,32 @@ try:
     from services.price_router import get_execution_price as _router_exec_price
     from services.price_router import get_ui_price as _router_ui_price
     from services.price_router import get_live_liquidation_price as _router_live_liquidation_price
+    from services.price_router import get_cached_position_liquidation_price as _router_cached_position_liquidation_price
     _PRICE_ROUTER_AVAILABLE = True
 except Exception:
     _PRICE_ROUTER_AVAILABLE = False
     def _router_exec_price(mint, entry_price, opened_at): return None
     def _router_ui_price(mint, entry_price, opened_at): return None
     def _router_live_liquidation_price(mint, quantity, entry_price, opened_at): return None
+    def _router_cached_position_liquidation_price(position_id, mint, quantity, entry_price, opened_at): return None
 
 try:
     from services.live_trading import execute_live_sell as _live_sell, execute_live_buy as _live_buy
     _LIVE_TRADING_AVAILABLE = True
 except Exception:
     _LIVE_TRADING_AVAILABLE = False
+
+    def _live_buy(mint, size_usd, expected_price, position_id=None):
+        """Fail-closed live-buy stub used only when live_trading cannot import."""
+        return {
+            "success": False,
+            "error": "live_trading not available",
+            "mint": mint,
+            "position_id": position_id,
+        }
+
     def _live_sell(mint, qty, pos_id, price, emergency=False):
+        """Fail-closed live-sell stub used only when live_trading cannot import."""
         return {"success": False, "error": "live_trading not available"}
 
 # logging.basicConfig and log = ... moved above service imports - prevents [MARKET_INTEL] format collision
@@ -222,22 +254,149 @@ def _live_lane_armed() -> bool:
     )
 
 
+def _live_calibration_mode() -> bool:
+    """Resolve the explicit operator-selected calibration profile robustly.
+
+    The launcher stamps both LIVE_MIRROR_POLICY=ALL_PAPER_ADMISSIONS and
+    LIVE_CALIBRATION_MODE=1. Accept either canonical stamp, but only while the
+    live lane itself is armed. This prevents a child process with stale or
+    missing environment state from silently collapsing Calibration to Selective.
+    """
+    env_policy = os.getenv("SENTINUITY_LIVE_MIRROR_POLICY", "").strip().upper()
+    db_policy = str(
+        get_config_value("LIVE_MIRROR_POLICY", "NORMAL") or "NORMAL"
+    ).strip().upper()
+    db_calibration = str(
+        get_config_value("LIVE_CALIBRATION_MODE", "0") or "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    return _live_lane_armed() and (
+        env_policy == "ALL_PAPER_ADMISSIONS"
+        or db_policy == "ALL_PAPER_ADMISSIONS"
+        or db_calibration
+    )
+
+def _coverage_reference_timestamp(price_ts, now, *, mint: str = "",
+                                  position_id=None) -> tuple[float, dict]:
+    """Resolve the executable-coverage reference timestamp, bounded.
+
+    SENTINUITY_EXIT_INFRA_20260805.
+
+    The reference timestamp exists to exclude rows that predate the candidate.
+    It was never intended to enforce recency -- recency is enforced downstream
+    and independently by price_router (can_execute_exit = not (age >
+    EXECUTION_STALE_SEC)) and by Mode B (LIVE_MAX_PRICE_AGE_SEC).
+
+    When price_ts was absent the previous `float(price_ts or now)` fallback
+    demanded a tick at or after *now*, which is close to unsatisfiable: the
+    oracle writes in the past. Measured on sdAVx (2026-08-05), ticks existed at
+    T-11.6s and T+4.9s, so a reference of price_ts would have matched and a
+    reference of now could not -- producing NO_DATA_POST_REFERENCE and the
+    9999.0 default age. This restores a bounded lookback of exactly the
+    configured live maximum price age.
+
+    LOOSENS NOTHING: a tick older than the configured maximum still yields an
+    age above LIVE_MAX_PRICE_AGE_SEC and still fails closed downstream. Verified
+    by tests V3 (T-11s passes with a real age) and V4 (T-45s still blocks).
+    """
+    _diag = {"patch": "SENTINUITY_EXIT_INFRA_20260805",
+             "incoming_price_ts": None, "reference_ts": None,
+             "fallback_used": False, "lookback_sec": None,
+             "latest_candidate_tick_ts": None, "latest_tick_age_sec": None,
+             "db_path": "", "mint": str(mint or "")[:24],
+             "position_id": position_id}
+    try:
+        _now = float(now or time.time())
+    except Exception:
+        _now = time.time()
+    try:
+        _pts = float(price_ts or 0.0)
+    except Exception:
+        _pts = 0.0
+    _diag["incoming_price_ts"] = _pts if _pts > 0 else None
+
+    if _pts > 0:
+        _ref = _pts
+    else:
+        try:
+            _lookback = float(get_config_value("LIVE_MAX_PRICE_AGE_SEC", 30.0))
+        except Exception:
+            _lookback = 30.0
+        _lookback = max(0.0, _lookback)
+        _ref = _now - _lookback
+        _diag["fallback_used"] = True
+        _diag["lookback_sec"] = _lookback
+    _diag["reference_ts"] = _ref
+
+    # Observability only: the newest tick actually visible for this mint at read
+    # time. This is the measurement that settles whether a race remains.
+    try:
+        import sqlite3 as _sq3
+        _ip = Path(__file__).resolve().parent.parent / "sentinuity_intelligence.db"
+        _diag["db_path"] = str(_ip)
+        from core.schema import get_critical_connection as _m3_crit
+        _ic = _m3_crit("intel")
+        _r = _ic.execute(
+            "SELECT MAX(ts_ms) FROM mtm_ticks WHERE mint_address=?",
+            (str(mint),),
+        ).fetchone()
+        _ic.close()
+        _lt = float((_r or [0])[0] or 0.0) / 1000.0
+        if _lt > 0:
+            _diag["latest_candidate_tick_ts"] = _lt
+            _diag["latest_tick_age_sec"] = round(_now - _lt, 3)
+    except Exception as _exc:
+        _diag["db_path"] = _diag.get("db_path") or f"probe_error:{type(_exc).__name__}"
+
+    try:
+        log.info("[COVERAGE_REFERENCE] %s", json.dumps(_diag, sort_keys=True,
+                                                      default=str)[:600])
+    except Exception:
+        pass
+    try:
+        with get_connection() as _cc:
+            _cc.execute(
+                """CREATE TABLE IF NOT EXISTS coverage_reference_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL, position_id INTEGER, mint_address TEXT,
+                    incoming_price_ts REAL, reference_ts REAL,
+                    fallback_used INTEGER, lookback_sec REAL,
+                    latest_candidate_tick_ts REAL, latest_tick_age_sec REAL,
+                    db_path TEXT)"""
+            )
+            _cc.execute(
+                "INSERT INTO coverage_reference_audit (ts,position_id,mint_address,"
+                "incoming_price_ts,reference_ts,fallback_used,lookback_sec,"
+                "latest_candidate_tick_ts,latest_tick_age_sec,db_path) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (_now, position_id, str(mint), _diag["incoming_price_ts"],
+                 _diag["reference_ts"], 1 if _diag["fallback_used"] else 0,
+                 _diag["lookback_sec"], _diag["latest_candidate_tick_ts"],
+                 _diag["latest_tick_age_sec"], _diag["db_path"]),
+            )
+            _cc.commit()
+    except Exception:
+        pass
+    return float(_ref), _diag
+
+
 def _live_oracle_coverage_guard(candidate_mint: str, candidate_entry_price: float,
-                                candidate_opened_at: float) -> tuple[bool, str]:
-    """Non-bypassable final guard immediately before an on-chain live buy.
+                                candidate_opened_at: float, *,
+                                live_notional_usd: float | None = None) -> tuple[bool, str]:
+    """Final funded-entry coverage guard, anchored to actual route truth.
 
-    A candidate may score highly and pass its quote preflight while the shared
-    MTM/exit-price fabric is dark.  The July 16 runtime proved that condition:
-    open positions repeatedly logged NO_LIVE_PRICE and exit evaluation was
-    suppressed.  New funded exposure is therefore forbidden unless:
+    A live canary does not need a second UI/MTM observation to prove that the
+    proposed notional is sellable.  The mandatory live preflight already does
+    something stronger: canonical token provenance, an exact-notional Jupiter
+    buy route, and a bounded reverse Jupiter sell route for the quantity that
+    buy would receive.  The old final guard re-ran ``get_execution_price()``
+    here, which is a post-reference MTM mark rather than an executable route; a
+    missing oracle write in the few seconds around qualification could therefore
+    veto a perfectly valid round-trip canary.
 
-      1. the global oracle state is not ERROR/DEAD;
-      2. the durable intelligence tick stream has written recently;
-      3. the candidate itself has an executable router price; and
-      4. every already-open REAL position has an executable router exit price.
-
-    Paper learning remains unaffected.  Any uncertainty fails closed for only
-    the live mirror and is recorded in the executor log.
+    We still require the global durable tick stream to be alive so discovery /
+    telemetry is not flying blind, and every already-open REAL position must
+    have its own fresh full-position Jupiter liquidation quote.  Uncertainty
+    remains fail-closed for live capital.
     """
     if not _PRICE_ROUTER_AVAILABLE:
         return False, "price_router_unavailable"
@@ -246,16 +405,37 @@ def _live_oracle_coverage_guard(candidate_mint: str, candidate_entry_price: floa
         _state = str(get_config_value("WS_ORACLE_STATE", "UNKNOWN")).strip().upper()
     except Exception:
         _state = "UNKNOWN"
-    if _state in {"ERROR", "DEAD"}:
-        return False, f"oracle_state={_state}"
+    if _state not in {"HEALTHY", "DEGRADED", "STALLED"}:
+        return False, f"oracle_state={_state}_not_entry_eligible"
 
-    # Cross-process liveness truth comes from the intelligence DB, not the
-    # oracle process's in-memory counters.
+    # Telemetry must itself be current.  STALLED is permitted only to reach the
+    # stronger route checks below; it is never treated as HEALTHY.
+    try:
+        _tele_max_age = float(get_config_value("LIVE_ORACLE_TELEMETRY_MAX_AGE_SEC", 60.0))
+        _sampled_at = float(get_config_value("WS_ORACLE_SAMPLED_AT", 0.0))
+        _wpm = float(get_config_value("WS_ORACLE_WPM", 0.0))
+        _wpm_min = float(get_config_value("LIVE_ORACLE_GLOBAL_WPM_MIN", 2.0))
+    except Exception:
+        _tele_max_age, _sampled_at, _wpm, _wpm_min = 60.0, 0.0, 0.0, 2.0
+    if _sampled_at <= 0 or time.time() - _sampled_at > _tele_max_age:
+        return False, "oracle_telemetry_stale"
+    if _state != "STALLED" and _wpm < _wpm_min:
+        return False, f"oracle_wpm={_wpm:.1f}<{_wpm_min:.1f}"
+
+    # Invariant D: a known critical-write failure blocks new funded exposure.
+    try:
+        from core.schema import is_live_entry_blocked as _m3_blocked
+        _blk, _blk_why = _m3_blocked()
+        if _blk:
+            return False, _blk_why
+    except Exception:
+        pass
+
+    # Cross-process liveness: require at least one recent durable oracle write.
     _max_age = float(get_config_value("LIVE_ORACLE_NEW_ENTRY_MAX_AGE_SEC", 90.0))
     try:
-        import sqlite3 as _sqlite3
-        _intel_path = Path(__file__).resolve().parent.parent / "sentinuity_intelligence.db"
-        _ic = _sqlite3.connect(str(_intel_path), timeout=3.0)
+        from core.schema import get_critical_connection as _m3_crit
+        _ic = _m3_crit("intel")
         _row = _ic.execute("SELECT MAX(ts_ms) FROM mtm_ticks").fetchone()
         _ic.close()
         _last_tick = float(_row[0] or 0.0) / 1000.0 if _row else 0.0
@@ -265,42 +445,57 @@ def _live_oracle_coverage_guard(candidate_mint: str, candidate_entry_price: floa
     if _age > _max_age:
         return False, f"oracle_tick_age={_age:.1f}s>{_max_age:.1f}s"
 
-    # Candidate must have fresh executable price truth at the final fire point.
+    # Candidate authority: use the exact funded-entry contract, not an MTM mark.
+    # This is read-only: no signature and no transaction submission occurs here.
     try:
-        _candidate = _router_exec_price(
-            candidate_mint, float(candidate_entry_price), float(candidate_opened_at)
-        )
+        _notional = float(live_notional_usd if live_notional_usd is not None else
+                          get_config_value("LIVE_POSITION_SIZE_USD", 0.0) or 0.0)
+    except Exception:
+        _notional = 0.0
+    if _notional <= 0:
+        return False, "candidate_preflight_live_size_unset"
+    try:
+        from services.live_trading import preflight_live_buy as _live_entry_preflight
+        _pf = _live_entry_preflight(str(candidate_mint), _notional) or {}
     except Exception as _exc:
-        return False, f"candidate_router_error={type(_exc).__name__}"
-    if not _candidate or not bool(_candidate.get("can_execute_exit")):
-        _age_txt = (_candidate or {}).get("age_sec", "n/a")
-        return False, f"candidate_not_executable age={_age_txt}"
+        return False, f"candidate_preflight_error={type(_exc).__name__}"
+    if not bool(_pf.get("viable")):
+        return False, "candidate_preflight=" + str(_pf.get("reason") or "not_viable")[:160]
 
-    # Never increase funded exposure while an existing REAL position cannot be
-    # priced for exit. This directly prevents stacking capital during the exact
-    # NO_LIVE_PRICE state observed in the recent runtime.
+    # Never stack funded exposure while an existing REAL position lacks a fresh
+    # exact-quantity Jupiter liquidation route.  This is stronger and more
+    # economically relevant than requiring an MTM mark for that position.
     try:
         with get_connection() as _cov_conn:
             _real_rows = _cov_conn.execute(
-                "SELECT id,mint_address,entry_price,opened_at FROM paper_positions "
+                "SELECT id,mint_address,entry_price,opened_at,quantity FROM paper_positions "
                 "WHERE status='OPEN' AND UPPER(COALESCE(funding_mode,'SIM'))='REAL'"
             ).fetchall()
         for _rr in _real_rows:
-            _rr_price = _router_exec_price(
-                str(_rr["mint_address"]), float(_rr["entry_price"] or 0.0),
+            _qty = float(_rr["quantity"] or 0.0)
+            if _qty <= 0:
+                return False, f"real_pos={int(_rr['id'])}_quantity_unresolved"
+            _rr_price = _router_live_liquidation_price(
+                str(_rr["mint_address"]), _qty, float(_rr["entry_price"] or 0.0),
                 float(_rr["opened_at"] or 0.0),
             )
             if not _rr_price or not bool(_rr_price.get("can_execute_exit")):
                 _rr_age = (_rr_price or {}).get("age_sec", "n/a")
-                return False, f"real_pos={int(_rr['id'])}_exit_uncovered age={_rr_age}"
+                _rr_warn = str((_rr_price or {}).get("warning") or "")[:80]
+                return False, (f"real_pos={int(_rr['id'])}_exit_uncovered age={_rr_age}"
+                               + (f" warning={_rr_warn}" if _rr_warn else ""))
     except Exception as _exc:
         return False, f"real_exit_coverage_error={type(_exc).__name__}"
 
-    return True, f"covered tick_age={_age:.1f}s candidate_age={float(_candidate.get('age_sec') or 0.0):.1f}s"
+    _ret = ((_pf.get("reverse_sellability") or {}).get("round_trip_retention"))
+    _ret_txt = f"{float(_ret):.3f}" if _ret is not None else "n/a"
+    return True, (f"covered tick_age={_age:.1f}s route_preflight=PASS "
+                  f"round_trip_retention={_ret_txt}")
 
 
 def _position_is_real(position: dict) -> bool:
     return str(position.get("funding_mode") or "SIM").strip().upper() == "REAL"
+
 
 # -- Zombie threading state ----------------------------------------------------
 # Thread-safe queue: zombie threads post (position_id, action) here.
@@ -323,16 +518,61 @@ def ensure_executor_schema() -> None:
     try:
         with get_connection() as conn:
             # Instrument trade lifecycle event spine
+            # OBSERVABILITY_SIGNOFF_20260808: report the state of the spine at
+            # startup. Silence here is what allowed 0 lifecycle rows to go
+            # unnoticed across a 12-hour window.
             if _TLE_AVAILABLE:
                 try:
                     _tle_ensure(conn)
-                except Exception:
-                    pass
+                    log.info("[LIFECYCLE_SPINE] available=1 schema=ok")
+                except Exception as _tle_schema_exc:
+                    log.error(
+                        "[LIFECYCLE_SPINE] available=1 schema=FAILED err=%s -- "
+                        "trade_lifecycle_events will not populate",
+                        _tle_schema_exc,
+                    )
+            else:
+                log.error(
+                    "[LIFECYCLE_SPINE] available=0 import_error=%s -- "
+                    "trade_lifecycle_events will contain NO rows this run",
+                    _TLE_IMPORT_ERROR or "unknown",
+                )
             # paper_positions columns
             pp_cols = {r["name"] for r in conn.execute(
                 "PRAGMA table_info(paper_positions)"
             ).fetchall()}
             for col, typedef in [
+                # PNL_TRUTH_SIGNOFF_20260808: the hard-stop audit write filters
+                # its column list against PRAGMA table_info and silently drops
+                # any column that does not exist. If these are absent the
+                # observed loss is never persisted anywhere and the clamped
+                # value becomes the only record. Declare them explicitly.
+                ("raw_pnl_pct_preclamp",      "REAL"),
+                ("raw_pnl_usd_preclamp",      "REAL"),
+                ("raw_realized_pnl_pct",      "REAL"),
+                ("raw_realized_pnl_usd",      "REAL"),
+                ("modelled_floor_pnl_pct",    "REAL"),
+                ("trusted_realized_pnl_pct",  "REAL"),
+                ("trusted_realized_pnl_usd",  "REAL"),
+                ("pnl_integrity_status",      "TEXT"),
+                ("pnl_integrity_reason",      "TEXT"),
+                ("close_price_source",        "TEXT"),
+                ("entry_tape_quality",        "TEXT"),
+                ("entry_trusted_mark_pct",    "REAL"),
+                # EDGE_BASIS_TRUTH_SIGNOFF_20260813: preserve the unslipped
+                # market observation separately from paper accounting cost.
+                # entry_price intentionally remains cost/slippage-inclusive.
+                # These fields are observational only and are not consumed by
+                # admission, stop, runner, sizing, or funded-live authority.
+                ("entry_mark_price",           "REAL"),
+                ("entry_mark_price_ts",        "REAL"),
+                ("entry_mark_price_source",    "TEXT"),
+                # EDGE_RESTORE_SIGNOFF_20260810: first exact executable bid
+                # after entry. Risk stops use this basis; accounting PnL keeps
+                # the true entry_price and therefore remains economically honest.
+                ("executable_entry_basis",    "REAL"),
+                ("executable_entry_basis_at", "REAL"),
+                ("executable_entry_basis_source", "TEXT"),
                 ("last_price",           "REAL"),
                 ("last_marked_at",       "REAL"),
                 ("highest_price_seen",   "REAL"),
@@ -368,6 +608,36 @@ def ensure_executor_schema() -> None:
                     conn.execute(
                         f"ALTER TABLE paper_positions ADD COLUMN {col} {typedef}"
                     )
+
+            # PRICE_TRUTH_EXEC_SEPARATION_20260809_FINAL:
+            # Earlier builds allowed observational curve/MTM marks to populate
+            # live_exec_* and, in turn, derived runner authority.  An open
+            # position carrying that contamination must re-qualify from clean
+            # Layer-C evidence after restart; clearing only the displayed exec
+            # price would leave a false armed floor alive.
+            _pp_now = {r["name"] for r in conn.execute("PRAGMA table_info(paper_positions)").fetchall()}
+            _decon_sets = []
+            for _col, _expr in (
+                ("live_exec_price", "NULL"), ("live_exec_pct", "NULL"),
+                ("live_exec_source", "NULL"), ("live_exec_updated_at", "NULL"),
+                ("live_exec_age_sec", "NULL"), ("live_exec_confidence", "NULL"),
+                ("live_exec_band", "NULL"), ("live_exec_can_exit", "0"),
+                ("trusted_peak_price", "NULL"), ("trusted_peak_pct", "NULL"),
+                ("trusted_peak_at", "NULL"), ("trusted_peak_source", "NULL"),
+                ("runner_peak_pct", "NULL"), ("runner_lock_floor_pct", "NULL"),
+                ("runner_lock_price", "NULL"), ("runner_protected", "0"),
+                ("runner_peak_trust_source", "NULL"),
+                ("runner_floor_state", "'DECONTAMINATED_REQUALIFY'"),
+            ):
+                if _col in _pp_now:
+                    _decon_sets.append(f"{_col}={_expr}")
+            if _decon_sets and "live_exec_source" in _pp_now:
+                conn.execute(
+                    "UPDATE paper_positions SET " + ", ".join(_decon_sets) +
+                    " WHERE status='OPEN' AND COALESCE(live_exec_source,'')<>''"
+                    " AND LOWER(COALESCE(live_exec_source,'')) NOT LIKE '%jupiter%'"
+                    " AND LOWER(COALESCE(live_exec_source,'')) NOT LIKE '%metis%'"
+                )
 
             # PHASE 1 schema additions - explicit try/except per column
             # so each is independently idempotent regardless of DB state.
@@ -596,6 +866,7 @@ def count_open_positions(funding_mode: str | None = None) -> int:
 
 
 def get_wallet_balance() -> float:
+    """Legacy/shared wallet field. Never use this as PAPER cash authority."""
     try:
         with get_connection() as conn:
             row = conn.execute(
@@ -604,6 +875,81 @@ def get_wallet_balance() -> float:
         return float(row["wallet_balance"] or 0) if row else 0.0
     except Exception:
         return 0.0
+
+
+def get_paper_cash_balance(conn=None) -> float:
+    """
+    Canonical available PAPER cash, derived from the same ledger contract as
+    services.paper_wallet_refresher.
+
+    PAPER/live separation deliberately stopped mirroring paper cash into the
+    shared system_state.wallet_balance field.  Entry admission therefore must
+    not depend on that legacy/live-compatible field.
+
+    Fail closed: if canonical paper truth cannot be read, return 0.0.
+    """
+    own_conn = conn is None
+    c = None
+    try:
+        c = get_connection() if own_conn else conn
+        # Primary authority: paper_wallet.main starting capital + canonical
+        # realised PnL - stake currently reserved by OPEN paper positions.
+        row = c.execute(
+            "SELECT starting_balance FROM paper_wallet "
+            "WHERE wallet_name='main' LIMIT 1"
+        ).fetchone()
+        if row:
+            try:
+                starting = float(row["starting_balance"] or 0.0)
+            except Exception:
+                starting = float(row[0] or 0.0)
+            realised = float(c.execute(
+                "SELECT COALESCE(SUM(realized_pnl_usd),0) FROM paper_positions "
+                "WHERE status='CLOSED'"
+            ).fetchone()[0] or 0.0)
+            reserved = float(c.execute(
+                "SELECT COALESCE(SUM(position_size_usd),0) FROM paper_positions "
+                "WHERE status='OPEN'"
+            ).fetchone()[0] or 0.0)
+            return max(0.0, starting + realised - reserved)
+
+        # Compatibility fallback only to PAPER-specific state/config.  Never
+        # fall back to system_state.wallet_balance because that field may be
+        # funded/live truth in dual/live operation.
+        try:
+            ss = c.execute(
+                "SELECT paper_cash FROM system_state WHERE id=1"
+            ).fetchone()
+            if ss:
+                v = float(ss["paper_cash"] if hasattr(ss, "keys") else ss[0])
+                if v > 0:
+                    return v
+        except Exception:
+            pass
+        for key in (
+            "PAPER_WALLET_CASH_USD", "SOLANA_PAPER_CASH_USD",
+            "PAPER_CASH", "PAPER_BALANCE_USD",
+        ):
+            try:
+                r = c.execute(
+                    "SELECT value FROM system_config WHERE key=? LIMIT 1", (key,)
+                ).fetchone()
+                if r:
+                    v = float(r["value"] if hasattr(r, "keys") else r[0])
+                    if v > 0:
+                        return v
+            except Exception:
+                continue
+        return 0.0
+    except Exception as exc:
+        log.warning("PAPER cash authority unavailable: %s", exc)
+        return 0.0
+    finally:
+        if own_conn and c is not None:
+            try:
+                c.close()
+            except Exception:
+                pass
 
 
 def get_last_executor_heartbeat() -> float:
@@ -817,6 +1163,21 @@ def get_last_price_ts(mint: str) -> Optional[float]:
 
 
 def get_peak_price_since_open(mint: str, opened_at: float) -> Optional[float]:
+    """RAW DIAGNOSTIC ONLY -- NOT A PEAK AUTHORITY SOURCE.
+
+    PEAK_AUTHORITY_P6: this is MAX(observed_price) over market_snapshots with no
+    source filter, no provenance and no corroboration. One poisoned tick sets it
+    permanently. It must never populate trusted_peak_*, runner_peak_*, a runner
+    floor, RUNNER_PROFIT_LOCK, pattern authority or live authority. Use
+    _trusted_peak_from_tape() for anything that can influence an exit.
+
+    Retained deliberately: raw diagnostic visibility must not be deleted.
+    """
+    try:
+        log.debug("[RAW_UNFILTERED_PEAK_READ] mint=%s -- diagnostic only",
+                  str(mint)[:16])
+    except Exception:
+        pass
     try:
         with get_connection() as conn:
             row = conn.execute(
@@ -996,22 +1357,37 @@ def update_position_mark(
             # ── MERGED SINGLE UPDATE ─────────────────────────────────────────
             # Base columns (always written) + live_exec_* columns (when router
             # available) merged into one UPDATE to halve write round-trips.
+            # PRICE_TRUTH_SIGNOFF_20260806:
+            # `current_price` is an observational/display mark. It must never
+            # advance the authoritative high-water mark by itself. Preserve it
+            # separately; only a fresh exact-size executable quote may advance
+            # `highest_price_seen` in this compatibility patch.
             _set_parts = [
                 "unrealized_pnl_usd=?",
                 "last_price=?",
                 "last_marked_at=?",
-                "highest_price_seen = CASE WHEN COALESCE(highest_price_seen,0) > ? THEN highest_price_seen ELSE ? END",
             ]
-            _vals = [unrealized_pnl_usd, current_price, marked_at,
-                     current_price, current_price]
+            _vals = [unrealized_pnl_usd, current_price, marked_at]
+            if "display_high_price" in cols:
+                _set_parts.append(
+                    "display_high_price=CASE WHEN COALESCE(display_high_price,0)>? "
+                    "THEN display_high_price ELSE ? END"
+                )
+                _vals.extend([current_price, current_price])
+            if "display_high_source" in cols:
+                _set_parts.append("display_high_source=?")
+                _vals.append(source)
 
             if "mark_source" in cols:
                 _set_parts.append("mark_source=?")
                 _vals.append(source)
 
-            # Live exec columns - only when router has a price
+            # Live-exec columns are economic truth, not display truth.
+            # A fresh native/curve/indexer mark may update last_price, but it
+            # can never populate live_exec_* unless the router contract says
+            # the exact position is presently executable.
             _rpct = 0.0
-            if router_result is not None and router_result.get("price", 0) > 0:
+            if _router_executable:
                 _rp  = router_result["price"]
                 _rs  = router_result.get("source", source)
                 _ra  = router_result.get("age_sec", 9999.0)
@@ -1032,35 +1408,218 @@ def update_position_mark(
                         _set_parts.append(f"{col}=?")
                         _vals.append(val)
 
+                # Authoritative compatibility high: exact-size executable,
+                # independently fresh, and explicitly sellable. Divergence of
+                # a reference mark does not remove liquidation capability.
+                # REAL direct quotes should be near-immediate. PAPER consumes
+                # an asynchronously refreshed exact-size Layer-C cache, so a 3s
+                # requirement would silently retire this compatibility high-water
+                # path.  Use the same bounded freshness contract as the cache.
+                _peak_age_cap = 3.0
+                if "cached" in str(_rs or "").lower():
+                    try:
+                        _peak_age_cap = max(3.0, float(os.getenv("PAPER_EXECUTABLE_QUOTE_MAX_AGE_SEC", "45")))
+                    except Exception:
+                        _peak_age_cap = 45.0
+                _peak_fresh = bool(_rce and float(_ra or 9999.0) <= _peak_age_cap and float(_rp or 0.0) > 0.0)
+                if _peak_fresh:
+                    _set_parts.append(
+                        "highest_price_seen=CASE WHEN COALESCE(highest_price_seen,0)>? "
+                        "THEN highest_price_seen ELSE ? END"
+                    )
+                    _vals.extend([_rp, _rp])
+                    if "authoritative_high_source" in cols:
+                        _set_parts.append("authoritative_high_source=?")
+                        _vals.append(str(_rs or "executable_quote"))
+                    if "authoritative_high_at" in cols:
+                        _set_parts.append("authoritative_high_at=?")
+                        _vals.append(marked_at)
+
             _vals.append(position_id)
             conn.execute(
                 f"UPDATE paper_positions SET {', '.join(_set_parts)} WHERE id=?",
                 tuple(_vals),
             )
 
-            # ── MARK TAPE (instrumentation, 2026-07-08) ──────────────────
-            # Append-only tape of every mark the exit manager can see.
-            # Powers dwell/velocity/shelf calibration + phantom-peak forensics.
-            # Configurable retention preserves enough path history for exit-policy
-            # replay. Default 30 days. Failure here never affects marking.
+            # Operational carrier writes are not new market observations.
+            # They update paper_positions above, but recording them into
+            # mark_tape every sweep created hundreds of `unknown` rows and made
+            # runner-health telemetry report the machinery as inert.
+            if router_result is None and str(source or "").strip().lower() in {
+                "fallback", "router-held", "gate_blocked", "router-stale"
+            }:
+                return
+
+            # ── MARK TAPE + RUNNER TRUTH INTEGRATION (2026-08-03) ───────
+            # Preserve raw provenance and evaluate every genuinely new mark before it can
+            # influence trusted peak or runner authority. Raw observations are
+            # always retained; quarantined observations are diagnostic only.
             try:
                 conn.execute(
                     "CREATE TABLE IF NOT EXISTS mark_tape ("
                     " position_id INTEGER, mint TEXT, ts REAL,"
                     " price REAL, pct REAL, source TEXT)"
                 )
+                _mt_cols = {r[1] for r in conn.execute("PRAGMA table_info(mark_tape)").fetchall()}
+                _mt_wanted = {
+                    "nominal_source": "TEXT",
+                    "raw_source": "TEXT",
+                    "qualified_source": "TEXT",
+                    "source_subtype": "TEXT",
+                    "precision_class": "TEXT",
+                    "trusted_source": "INTEGER DEFAULT 0",
+                    "integrity_state": "TEXT",
+                    "quarantine_reason": "TEXT",
+                    "upstream_ts_ms": "INTEGER DEFAULT 0",
+                    "upstream_tick_id": "TEXT",
+                }
+                for _col, _typ in _mt_wanted.items():
+                    if _col not in _mt_cols:
+                        conn.execute(f"ALTER TABLE mark_tape ADD COLUMN {_col} {_typ}")
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_mark_tape_pos"
                     " ON mark_tape(position_id, ts)"
                 )
                 _tape_pct = ((current_price - _entry_price) / _entry_price * 100.0
                              if _entry_price > 0 else 0.0)
-                conn.execute(
-                    "INSERT INTO mark_tape(position_id,mint,ts,price,pct,source)"
-                    " VALUES(?,?,?,?,?,?)",
-                    (position_id, _mint_address, marked_at,
-                     float(current_price or 0), _tape_pct, str(source or "?")),
-                )
+                _rr = router_result if isinstance(router_result, dict) else {}
+                _nominal = str(_rr.get("nominal_source") or source or "engine")
+                _raw_src = str(_rr.get("raw_source") or source or "unknown")
+                _qualified = str(_rr.get("qualified_source") or _rr.get("source")
+                                 or source or "unknown")
+                _subtype = str(_rr.get("source_subtype") or "unknown")
+                _precision = str(_rr.get("precision_class") or "unknown")
+                _trusted_src = 1 if bool(_rr.get("trusted_source", False)) else 0
+                _upstream_ts_ms = int(_rr.get("upstream_ts_ms") or 0)
+                _upstream_tick_id = str(_rr.get("upstream_tick_id") or "")
+
+                # Continuity uses the latest non-quarantined observation, not
+                # only a previously trusted mark. Trust authority remains
+                # separate in _trusted_peak_from_tape().
+                _prev = conn.execute(
+                    "SELECT price, raw_source, source_subtype, precision_class FROM mark_tape "
+                    "WHERE position_id=? AND COALESCE(mint,'')=COALESCE(?, '') "
+                    "AND integrity_state IN ('UNCONFIRMED','TRUSTED','RUNNER_CONFIRMED') "
+                    "AND COALESCE(price,0)>0 ORDER BY ts DESC LIMIT 1",
+                    (position_id, _mint_address),
+                ).fetchone()
+                _prev_px = float(_prev[0]) if _prev and _prev[0] else None
+                _prev_raw = str(_prev[1] or "") if _prev else None
+
+                # PRICE_FAMILY_TRUTH_20260803: recover only the executable
+                # pool_quote representation after a frozen incompatible anchor.
+                # Three distinct upstream pool ticks that agree within 1% form
+                # a provisional baseline. Synthetic curve_reserve never rebases
+                # or gains runner authority here.
+                if _subtype == "pool_quote" and _upstream_tick_id:
+                    _cand = conn.execute(
+                        "SELECT price,raw_source,upstream_tick_id,upstream_ts_ms "
+                        "FROM mark_tape WHERE position_id=? "
+                        "AND COALESCE(mint,'')=COALESCE(?, '') "
+                        "AND source_subtype='pool_quote' "
+                        "AND precision_class=? AND COALESCE(price,0)>0 "
+                        "ORDER BY ts DESC LIMIT 2",
+                        (position_id, _mint_address, _precision),
+                    ).fetchall()
+                    if len(_cand) == 2:
+                        _ids = [str(r[2] or "") for r in _cand] + [_upstream_tick_id]
+                        _times = [int(r[3] or 0) for r in _cand] + [_upstream_ts_ms]
+                        _prices = [float(r[0]) for r in _cand] + [float(current_price or 0)]
+                        _distinct = len(set(_ids)) == 3 and all(_ids) and all(t > 0 for t in _times)
+                        _separated = min(abs(_times[i]-_times[j]) for i in range(3) for j in range(i+1,3)) >= 5000
+                        # REPRESENTATION_REBASE_V2: consistency is not the same as
+                        # price stagnation. A genuine runner may trend strongly while
+                        # staying on one representation. Accept a provisional baseline
+                        # only when three distinct upstream pool ticks are monotonic
+                        # (or flat), have no direction reversal, and each adjacent move
+                        # is bounded. This remains continuity-only; it grants no runner
+                        # authority by itself.
+                        _moves = [(_prices[i+1]-_prices[i])/_prices[i] if _prices[i] > 0 else 999.0 for i in range(2)]
+                        _bounded = all(abs(m) <= 0.35 for m in _moves)
+                        _monotonic = (_moves[0] >= 0 and _moves[1] >= 0) or (_moves[0] <= 0 and _moves[1] <= 0)
+                        if _distinct and _separated and _bounded and _monotonic:
+                            _prev_px = float(_cand[0][0])
+                            _prev_raw = str(_cand[0][1] or _raw_src)
+                try:
+                    from services.mark_provenance import evaluate_mark, record_quarantine
+                    _verdict = evaluate_mark(
+                        price=float(current_price or 0),
+                        prev_trusted_price=_prev_px,
+                        raw_source=_raw_src,
+                        prev_raw_source=_prev_raw,
+                    )
+                except Exception as _mp_err:
+                    _verdict = {
+                        "integrity_state": "LEGACY_PROVENANCE_UNAVAILABLE",
+                        "quarantined": False,
+                        "quarantine_reason": f"integration_error={type(_mp_err).__name__}",
+                    }
+                _integrity = str(_verdict.get("integrity_state") or "UNCONFIRMED")
+                _q_reason = str(_verdict.get("quarantine_reason") or "")[:400]
+                # A cached executable quote is consumed many times between mesh
+                # refreshes. Preserve it ONCE by stable upstream identity rather
+                # than manufacturing a new tape observation every exit sweep.
+                _duplicate_upstream = False
+                if _upstream_tick_id:
+                    try:
+                        _last_tick = conn.execute(
+                            "SELECT upstream_tick_id FROM mark_tape WHERE position_id=? "
+                            "AND COALESCE(upstream_tick_id,'')<>'' ORDER BY ts DESC LIMIT 1",
+                            (position_id,),
+                        ).fetchone()
+                        _duplicate_upstream = bool(
+                            _last_tick and str(_last_tick[0] or "") == _upstream_tick_id
+                        )
+                    except Exception:
+                        _duplicate_upstream = False
+                if not _duplicate_upstream:
+                    conn.execute(
+                        "INSERT INTO mark_tape("
+                        "position_id,mint,ts,price,pct,source,nominal_source,raw_source,"
+                        "qualified_source,source_subtype,precision_class,trusted_source,"
+                        "integrity_state,quarantine_reason,upstream_ts_ms,upstream_tick_id) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (position_id, _mint_address, marked_at,
+                         float(current_price or 0), _tape_pct, _qualified, _nominal,
+                         _raw_src, _qualified, _subtype, _precision, _trusted_src,
+                         _integrity, _q_reason, _upstream_ts_ms, _upstream_tick_id),
+                    )
+                    _MARK_TAPE_VERSION[position_id] = _MARK_TAPE_VERSION.get(position_id, 0) + 1
+                if (not _duplicate_upstream) and bool(_verdict.get("quarantined")):
+                    # PEAK_AUTHORITY_P2: CREATE TABLE IF NOT EXISTS does not add
+                    # columns to a ledger an older build already created, so the
+                    # INSERT failed silently and quarantined marks had no ledger
+                    # row. record_quarantine_strict() repairs schema drift, keeps
+                    # an overflow copy, and reports rather than discards.
+                    _q_res = None
+                    try:
+                        from services.peak_authority import record_quarantine_strict
+                        _q_res = record_quarantine_strict(
+                            conn, _verdict, position_id=position_id,
+                            mint_address=_mint_address, raw_source=_raw_src,
+                            qualified_source=_qualified)
+                    except Exception as _q_err:
+                        _q_res = {"persisted": False, "overflow": False,
+                                  "error": f"{type(_q_err).__name__}: {_q_err}"}
+                        try:
+                            record_quarantine(conn, _verdict,
+                                              position_id=position_id,
+                                              mint_address=_mint_address)
+                        except Exception:
+                            pass
+                    try:
+                        if _q_res and not _q_res.get("persisted"):
+                            log.error(
+                                "[MARK_QUARANTINE_PERSIST_FAILED] pos=%s mint=%s "
+                                "state=%s overflow=%s error=%s",
+                                position_id, _mint_address[:16], _integrity,
+                                _q_res.get("overflow"), _q_res.get("error"))
+                        elif _q_res and _q_res.get("repaired"):
+                            log.warning(
+                                "[MARK_QUARANTINE_SCHEMA_REPAIRED] added=%s",
+                                _q_res.get("repaired"))
+                    except Exception:
+                        pass
                 # opportunistic cheap prune (~1 in 200 marks)
                 import random as _rnd
                 if _rnd.random() < 0.005:
@@ -1071,9 +1630,12 @@ def update_position_mark(
                     _retention_days = min(365.0, max(2.0, _retention_days))
                     conn.execute("DELETE FROM mark_tape WHERE ts < ?",
                                  (time.time() - (_retention_days * 86400.0),))
-            except Exception:
-                pass
-            # ── /MARK TAPE ───────────────────────────────────────────────
+            except Exception as _mark_truth_err:
+                try:
+                    log.debug("mark truth tape skipped pos=%s: %s", position_id, _mark_truth_err)
+                except Exception:
+                    pass
+            # ── /MARK TAPE + RUNNER TRUTH INTEGRATION ─────────────────────
 
             # TLE event - reuses pre-fetched entry_price + mint_address
             if _TLE_AVAILABLE and router_result and router_result.get("can_execute_exit") and router_result.get("price", 0) > 0:
@@ -1123,7 +1685,7 @@ def update_drawdown_after_close(conn, pnl_usd: float, pos_size_usd: float) -> No
         threshold = float(float(get_config_value("DRAWDOWN_HALT_THRESHOLD_PCT", 25.0)))
         current   = float(float(get_config_value("DRAWDOWN_ACCUMULATED_PCT",    0.0)))
 
-        wallet_bal     = get_wallet_balance()
+        wallet_bal     = get_paper_cash_balance(conn)
         portfolio_base = max(wallet_bal, pos_size_usd * 4, 1.0)
         loss_pct       = abs(pnl_usd) / portfolio_base * 100
 
@@ -1235,11 +1797,11 @@ def close_position_canonical(
         # ── PAPER EXIT SLIPPAGE SIMULATION ───────────────────────────────
         # Real pump.fun sells receive 1-4% less due to thin bids + slippage.
         # Apply in paper mode only, never on scratch/zombie exits.
+        _is_synthetic_stop_floor = str(exit_reason or "").upper().startswith(
+            "HARD_STOP_LOSS_CAPPED_"
+        )
         if not force_scratch and not is_real_position:
             try:
-                _is_synthetic_stop_floor = str(exit_reason or "").upper().startswith(
-                    "HARD_STOP_LOSS_CAPPED_"
-                )
                 _fee_exit = max(0.0, float(get_config_value("PAPER_FEE_PER_TX_USD", 0.10)))
                 # A synthetic paper stop-floor is already the complete configured
                 # accounting outcome. Applying generic exit slippage again would
@@ -1266,7 +1828,7 @@ def close_position_canonical(
         gross_pnl_pct = ((exit_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0.0
         _paper_entry_fee = 0.0
         _paper_exit_fee = 0.0
-        if not force_scratch and not is_real_position:
+        if not force_scratch and not is_real_position and not _is_synthetic_stop_floor:
             try:
                 _paper_entry_fee = max(0.0, float(position.get("entry_fee_usd") or get_config_value("PAPER_FEE_PER_TX_USD", 0.10)))
                 _paper_exit_fee = max(0.0, float(get_config_value("PAPER_FEE_PER_TX_USD", 0.10)))
@@ -1385,6 +1947,19 @@ def close_position_canonical(
                         log.critical("[LIVE_SELL_PENDING_WRITE_FAIL] pos=%d %s", position_id, _pending_err)
                 log.critical("[LIVE_SELL_FAIL] REAL pos=%d error=%s; keeping unresolved/open",
                              position_id, _ls.get("error"))
+                try:
+                    from services.canary_governor import mark_failed_unresolved
+                    from services.paper_live_parity import record as _plp_record, LIVE_SELL_UNRESOLVED
+                    _sim_parent = int(position.get("sim_parent_position_id") or position_id)
+                    with get_connection() as _sfc:
+                        mark_failed_unresolved(_sfc, position_id=_sim_parent, note=str(_ls.get("error")))
+                        _plp_record(_sfc, mint=mint, state=LIVE_SELL_UNRESOLVED,
+                                    paper_position_id=_sim_parent, live_position_id=int(position_id),
+                                    sell_signature=str(_ls.get("tx_sig") or ""),
+                                    terminal_reason=str(_ls.get("error")))
+                        _sfc.commit()
+                except Exception:
+                    pass
                 return False
             _live_sig = _ls.get("tx_sig")
             log.info("[LIVE_SELL] REAL pos=%d sig=%s", position_id, str(_live_sig or "")[:20])
@@ -1481,6 +2056,32 @@ def close_position_canonical(
                  _paper_exit_fee) + _fep_val + _hp_val + (position_id,),
             )
 
+            # EDGE_TRUTH_CANONICAL_CLOSE_20260802:
+            # Every production close writes observed/pre-clamp market truth from
+            # the pre-UPDATE position snapshot. Credited/modelled PnL remains
+            # separate and can never fabricate missing market truth.
+            try:
+                from services.close_truth import record_canonical_close_truth
+                record_canonical_close_truth(
+                    conn,
+                    position_id=position_id,
+                    position=position,
+                    final_exit_price=exit_price,
+                    credited_pnl_usd=pnl_usd,
+                    exit_reason=exit_reason,
+                    closed_at=now,
+                    is_real_position=is_real_position,
+                    force_scratch=force_scratch,
+                    synthetic_stop_floor=_is_synthetic_stop_floor,
+                    total_fee_usd=_total_paper_fees,
+                    chain_source=(str(_live_sig) if _live_sig else None),
+                    quote_source=("CHAIN_FILL" if is_real_position else "ENGINE_MARK"),
+                    quote_age=0.0 if is_real_position else None,
+                )
+            except Exception as _truth_exc:
+                # Evidence failure must never strand an otherwise valid close.
+                log.warning("[CLOSE_TRUTH_WRITE_FAIL] pos=%d error=%s", position_id, _truth_exc)
+
             if is_real_position:
                 try:
                     conn.execute(
@@ -1493,6 +2094,28 @@ def close_position_canonical(
                 except Exception as exc:
                     log.critical("[LIVE_SETTLEMENT_WRITE_FAIL] pos=%d error=%s", position_id, exc)
                     raise
+
+            # PARITY_AND_CANARY_CLOSE_SETTLEMENT_20260803_FINAL
+            try:
+                from services.paper_live_parity import record as _plp_record, DUAL_SETTLED, TERMINAL_COMPLETE
+                _sim_parent = int(position.get("sim_parent_position_id") or position_id)
+                _plp_state = DUAL_SETTLED if is_real_position else TERMINAL_COMPLETE
+                _plp_record(conn, mint=mint, state=_plp_state,
+                            paper_position_id=_sim_parent,
+                            live_position_id=(int(position_id) if is_real_position else None),
+                            paper_exit_at=(None if is_real_position else float(now)),
+                            paper_exit_price=(None if is_real_position else float(exit_price)),
+                            paper_credited_pnl_usd=(None if is_real_position else float(pnl_usd)),
+                            paper_market_true_pnl_usd=(None if is_real_position else float(pnl_usd)),
+                            settled_exit_price=(float(exit_price) if is_real_position else None),
+                            settlement_pnl_usd=(float(pnl_usd) if is_real_position else None),
+                            sell_signature=(str(_live_sig or "") if is_real_position else None),
+                            reconciliation_status=("SETTLED" if is_real_position else "PAPER_CLOSED"))
+                if is_real_position:
+                    from services.canary_governor import settle_attempt
+                    settle_attempt(conn, position_id=_sim_parent, realised_pnl_usd=float(pnl_usd), reconciliation_ok=True)
+            except Exception:
+                pass
 
             conn.execute(
                 """
@@ -1509,21 +2132,17 @@ def close_position_canonical(
             # this transaction (SIGNOFF_CEILING_REMOVAL_20260715 above).
             _wallet_delta = pos_size_usd + pnl_usd
 
-            # In live mode: skip paper tracker - real balance synced from chain
-            if not is_real_position:
-                conn.execute(
-                    "UPDATE system_state SET wallet_balance = wallet_balance + ? WHERE id=1",
-                    (_wallet_delta,),
-                )
-
-            # SIM wallet audit only. REAL wallet truth is recorded by live transaction telemetry.
+            # PAPER/live wallet separation: PAPER cash is derived from the
+            # canonical paper ledger. Never credit shared system_state.wallet_balance
+            # on a SIM close; that field may represent funded/live truth.
             if not is_real_position:
                 try:
+                    _paper_cash_after = get_paper_cash_balance(conn)
                     conn.execute(
                         """INSERT INTO wallet_write_log
                             (position_id, delta_usd, new_balance, source, token_name, pnl_usd, pnl_pct, timestamp)
-                            VALUES (?, ?, (SELECT wallet_balance FROM system_state WHERE id=1), ?, ?, ?, ?, ?)""",
-                        (position_id, _wallet_delta, f"CLOSE_{closure_mode}",
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (position_id, _wallet_delta, _paper_cash_after, f"CLOSE_{closure_mode}",
                          token_name, pnl_usd, pnl_pct, now),
                     )
                 except Exception:
@@ -1867,7 +2486,8 @@ def scan_for_entries() -> int:
                 _os.path.dirname(_os.path.dirname(__file__)),
                 "sentinuity_intelligence.db"
             )
-            _ic = _sq3.connect(_idb_path, timeout=2)
+            from core.schema import get_critical_connection as _m3_crit
+            _ic = _m3_crit("intel")
             _latest = _ic.execute("SELECT MAX(ts_ms) FROM mtm_ticks").fetchone()[0]
             _ic.close()
             if not _latest:
@@ -1915,9 +2535,9 @@ def scan_for_entries() -> int:
     max_pos = _paper_max
 
     # Gate 3: wallet balance
-    balance = get_wallet_balance()
+    balance = get_paper_cash_balance()
     if balance <= 0:
-        log.warning("ENTRY SCAN BLOCKED - wallet balance zero or negative")
+        log.warning("ENTRY SCAN BLOCKED - canonical PAPER cash zero or unavailable")
         return 0
 
     # Position sizing
@@ -1993,8 +2613,16 @@ def scan_for_entries() -> int:
     try:
         with get_connection() as _sc:
             _ms_cols = {r[1] for r in _sc.execute("PRAGMA table_info(market_snapshots)").fetchall()}
-        if "mint_confidence" in _ms_cols:
-            _snap_conf_expr = "mint_confidence"
+        # SIGNOFF_EDGE_RESTORE_20260731 R2a: NEVER source entry confidence from mint_confidence.
+        # mint_confidence answers "is this the right mint address" (0.89 for every
+        # *pump mint), not "how good is this trade". Runtime 2026-07-31: six
+        # distinct decision scores (50.3/55.3/65.3/70.3/74.3/79.3) all recorded as
+        # confidence 0.890. Prefer the real calibrated/decision score; a missing
+        # score must surface as 0.0 and be gated, never silently backfilled.
+        if "calibrated_confidence" in _ms_cols:
+            _snap_conf_expr = "calibrated_confidence"
+        elif "confidence_score" in _ms_cols:
+            _snap_conf_expr = "confidence_score"
         elif "confidence" in _ms_cols:
             _snap_conf_expr = "confidence"
         else:
@@ -2004,27 +2632,69 @@ def scan_for_entries() -> int:
 
     fetch_limit = 25  # always scan full candidate pool; degraded_mode limits opens, not inspections
 
+    # LATCH_PICKUP_TRUTH_SIGNOFF_20260814:
+    # The entry SELECT intentionally has a loose 1800s discovery-age prefilter,
+    # followed by stricter Python gates. Rows older than that loose prefilter were
+    # never selected again, so terminal stale latches could remain latched forever
+    # and inflate console/heartbeat counts even though they were categorically
+    # ineligible for execution. Clear only that unreachable residue; this does not
+    # loosen, tighten, or otherwise alter any executable admission threshold.
+    _scan_now = time.time()
+    try:
+        with get_connection() as _stale_conn:
+            _stale_cur = _stale_conn.execute(
+                """
+                UPDATE market_snapshots
+                   SET execution_ready=0,
+                       latched=0,
+                       candidate_state='EXECUTOR_STALE_GATE',
+                       quality_reason=CASE
+                           WHEN COALESCE(NULLIF(quality_reason,''),'')=''
+                           THEN 'SIGNAL_TOO_OLD_FOR_EXEC_PREFILTER'
+                           ELSE quality_reason
+                       END
+                 WHERE latched=1
+                   AND COALESCE(execution_ready,0) IN (1,2)
+                   AND candidate_state='latched'
+                   AND (? - COALESCE(signal_discovered_at, first_seen_at,
+                                     created_at, timestamp, 0)) > 1800
+                """,
+                (_scan_now,),
+            )
+            _stale_reaped = int(_stale_cur.rowcount or 0)
+            _stale_conn.commit()
+        if _stale_reaped:
+            log.info(
+                "LATCH_STALE_REAP count=%d reason=older_than_loose_exec_prefilter",
+                _stale_reaped,
+            )
+    except Exception as _stale_err:
+        log.warning("LATCH_STALE_REAP failed non-fatally: %s", _stale_err)
+
     try:
         with get_connection() as conn:
             rows = conn.execute(
                 (
                     "SELECT id, mint_address, token_name, observed_price, price_updated_at,"
-                    " COALESCE(created_at, timestamp, price_updated_at, 0) AS created_at,"
+                    # SIGNOFF_EDGE_RESTORE_20260731 R3b: discovery-anchored age, never the price clock.
+                    " COALESCE(signal_discovered_at, first_seen_at, created_at, timestamp, 0) AS created_at,"
                     " " + _snap_conf_expr + " AS snap_confidence"
                     " FROM market_snapshots"
                     " WHERE latched=1 AND COALESCE(execution_ready,0) IN (1,2)"
                     "   AND candidate_state=\'latched\'"
                     "   AND observed_price IS NOT NULL AND observed_price > 0"
                     "   AND COALESCE(tx_hash, \'\') NOT LIKE \'mtm:%\'"
-                    "   AND (? - COALESCE(created_at, timestamp, price_updated_at, 0)) <= ?"
+                    "   AND (? - COALESCE(signal_discovered_at, first_seen_at, created_at, timestamp, 0)) <= ?"
                     " ORDER BY"
-                    "   COALESCE(created_at, timestamp, price_updated_at, 0) DESC,"
+                    "   COALESCE(signal_discovered_at, first_seen_at, created_at, timestamp, 0) DESC,"
                     "   price_updated_at DESC,"
                     "   id DESC"
                     " LIMIT ?"
                 ),
                 (time.time(), 1800, fetch_limit),  # 1800s loose SQL prefilter - Python hard gate enforces exact max_signal_age below
             ).fetchall()
+            if rows:
+                log.info("ENTRY_SCAN_PICKUP rows=%d", len(rows))
             # Note: SQL prefilter uses 10x the Python gate as a loose first pass.
             # The Python hard gate below enforces the exact max_signal_age.
             # Using 10x in SQL avoids rejecting tokens whose created_at is slightly
@@ -2097,10 +2767,11 @@ def scan_for_entries() -> int:
 
             # BATCH DEDUP: skip if same mint already opened this scan cycle
             if mint in mints_opened_this_batch:
-                log.debug("BATCH DEDUP: skip %s", mint[:16])
+                log.info("ENTRY_SCAN_BLOCK snap=%d %s reason=BATCH_DEDUP", snap_id, mint[:16])
                 continue
 
             if not entry_price or not mint:
+                log.info("ENTRY_SCAN_BLOCK snap=%d %s reason=INVALID_MINT_OR_PRICE", snap_id, mint[:16])
                 continue
 
             # HARD STALE GUARD - NON-BYPASSABLE (belt-and-suspenders with SQL filter above)
@@ -2144,6 +2815,7 @@ def scan_for_entries() -> int:
                         (snap_id,),
                     )
                     conn.commit()
+                    log.info("ENTRY_SCAN_BLOCK snap=%d %s reason=BLACKLISTED", snap_id, mint[:16])
                     continue
 
             # Explicit OPEN guard: never open second position for same mint
@@ -2160,6 +2832,7 @@ def scan_for_entries() -> int:
                         (snap_id,),
                     )
                     conn.commit()
+                    log.info("ENTRY_SCAN_BLOCK snap=%d %s reason=OPEN_POSITION_EXISTS", snap_id, mint[:16])
                     continue
 
             # Reentry gate - configurable via REENTRY_COOLDOWN_SECONDS (default 300s).
@@ -2185,6 +2858,7 @@ def scan_for_entries() -> int:
                             "WHERE id=?", (snap_id,),
                         )
                         conn.commit()
+                        log.info("ENTRY_SCAN_BLOCK snap=%d %s reason=REENTRY_COOLDOWN", snap_id, mint[:16])
                         continue
                 else:
                     # Paper trading mode (default): only block if OPEN position exists
@@ -2242,7 +2916,7 @@ def scan_for_entries() -> int:
                 with get_connection() as _tg_conn:
                     _tg_row = _tg_conn.execute(
                         """SELECT price_updated_at, created_at, first_seen_at,
-                                  timestamp, active_cognition, freshness_score,
+                                  timestamp, latched_at, active_cognition, freshness_score,
                                   tier, token_name
                            FROM market_snapshots WHERE id=?""",
                         (snap_id,)
@@ -2271,7 +2945,7 @@ def scan_for_entries() -> int:
                     # discovery timestamps. This measures "time since supervisor approved"
                     # not "time since discovery" - eliminates double-gating pipeline latency.
                     _latch_ts = (
-                        _pts_exec(_tg_row.get("latched_at"))
+                        _pts_exec(_tg_row["latched_at"])
                         or _pts_exec(_tg_row["price_updated_at"])
                         or max(
                             _pts_exec(_tg_row["created_at"]),
@@ -2480,6 +3154,52 @@ def scan_for_entries() -> int:
                              "(entry=%.12f) skipping", snap_id, quantity, entry_price)
                 continue
 
+            # SIGNOFF_FINAL_ENTRY_REVALIDATION_20260812
+            # Runtime evidence showed candidates passing PHASE_A at ~15-30s but
+            # reaching EXECUTION_ATTEMPT 60-100+ seconds later after downstream
+            # checks/DB waits. Revalidate *at the capital boundary* using the same
+            # Phase-A configuration. This closes the time-of-check/time-of-use gap
+            # without changing thresholds. Both PAPER and LIVE refuse an expired
+            # handoff; live retains its stricter Mode-B safety gates afterward.
+            _final_now = time.time()
+            try:
+                _final_signal_age = max(0.0, _final_now - float(_latch_ts or 0.0)) if float(_latch_ts or 0.0) > 0 else float("inf")
+            except Exception:
+                _final_signal_age = float("inf")
+            try:
+                _final_price_age = max(0.0, _final_now - float(price_ts or 0.0)) if float(price_ts or 0.0) > 0 else float("inf")
+            except Exception:
+                _final_price_age = float("inf")
+            _final_signal_max = float(locals().get("_phase_a_signal_max", get_config_value("EXECUTOR_PHASE_A_MAX_SIGNAL_AGE", 120.0)))
+            _final_price_max = float(locals().get("_phase_a_price_max", get_config_value("EXECUTOR_PHASE_A_MAX_PRICE_AGE", 120.0)))
+            _final_stale_reason = None
+            if _final_signal_age > _final_signal_max:
+                _final_stale_reason = f"FINAL_SIGNAL_TOO_OLD_{int(_final_signal_age)}s"
+            elif _final_price_age > _final_price_max:
+                _final_stale_reason = f"FINAL_PRICE_TOO_OLD_{int(_final_price_age)}s"
+            if _final_stale_reason:
+                log.warning(
+                    "FINAL_ENTRY_REVALIDATION_BLOCKED snap=%d %s reason=%s "
+                    "signal_age=%.1fs price_age=%.1fs",
+                    snap_id, mint[:16], _final_stale_reason,
+                    _final_signal_age, _final_price_age,
+                )
+                try:
+                    with get_connection() as _fr_conn:
+                        _fr_conn.execute(
+                            "UPDATE market_snapshots SET execution_ready=0, "
+                            "candidate_state='EXECUTOR_STALE_GATE', quality_reason=? WHERE id=?",
+                            (_final_stale_reason, snap_id),
+                        )
+                        _fr_conn.commit()
+                except Exception:
+                    pass
+                continue
+            # Keep diagnostics truthful: EXECUTION_ATTEMPT must report the age
+            # at the actual open boundary, not the earlier scan snapshot.
+            signal_age = _final_signal_age
+            price_age = _final_price_age
+
             # CLAIM this snapshot for execution (prevents guardian from resetting it
             # as orphaned while we are in the process of opening the position).
             try:
@@ -2509,6 +3229,7 @@ def scan_for_entries() -> int:
             #   * price/oracle/liquidity/impact protections remain hard safety gates.
             # Paper mode still learns independently and is never blocked here.
             _mode_b_live_pass = False
+            _calibration_mirror = _live_calibration_mode()
             _mb_live_score = 0.0
             # SIGNOFF_LIVE_LANE_REPAIR_20260715: candidate-specific oracle
             # authority + evidence-led curve reserve. Defined unconditionally so
@@ -2538,13 +3259,47 @@ def scan_for_entries() -> int:
                 except Exception:
                     pass
 
-                # Confidence: hard safety floor plus graduated conviction score.
-                _mb_conf_hard_floor = float(get_config_value("LIVE_CONFIDENCE_HARD_FLOOR", 0.65))
-                if _mb_conf_eval < _mb_conf_hard_floor:
-                    _mb_hard_blocks.append(
-                        f"conf={_mb_conf_eval:.3f}<{_mb_conf_hard_floor:.3f}"
+                # Confidence calibration admission contract.
+                #
+                # SIGNOFF_MODE_B_CALIBRATION_SHADOW_20260801:
+                # The latest truthful calibrator is still being measured against
+                # sub-minute outcomes. In shadow mode it must not re-enter the
+                # capital path here after being deliberately removed as a hard
+                # supervisor/executor admission gate. The previous implementation
+                # still imposed BOTH a 0.65 hard veto and up to 35 score points in
+                # Mode B, which recreated the zero-open regression despite latches
+                # returning.
+                #
+                # Shadow mode performs a mathematical ablation: confidence adds
+                # zero points and the threshold is reduced later by the same maximum
+                # 35-point weight. No synthetic confidence is invented. Enforce mode
+                # retains the original hard floor and score contribution. All route,
+                # liquidity, impact, oracle, freshness, momentum, wallet, reserve,
+                # sellability and reconciliation controls remain unchanged.
+                _calibration_mode = str(
+                    get_config_value("CALIBRATION_ADMISSION_MODE", "shadow")
+                ).strip().lower()
+                _mb_conf_hard_floor = float(
+                    get_config_value("LIVE_CONFIDENCE_HARD_FLOOR", 0.65)
+                )
+                _mb_conf_weight_max = 35.0
+                _mb_calibration_note = "calibration_enforced"
+                if _calibration_mode == "enforce":
+                    if _mb_conf_eval < _mb_conf_hard_floor:
+                        _mb_hard_blocks.append(
+                            f"conf={_mb_conf_eval:.3f}<{_mb_conf_hard_floor:.3f}"
+                        )
+                    _mb_live_score += max(
+                        0.0,
+                        min(
+                            _mb_conf_weight_max,
+                            (_mb_conf_eval - 0.50) / 0.45 * _mb_conf_weight_max,
+                        ),
                     )
-                _mb_live_score += max(0.0, min(35.0, (_mb_conf_eval - 0.50) / 0.45 * 35.0))
+                else:
+                    _mb_calibration_note = (
+                        f"calibration_shadow={_mb_conf_eval:.3f}:telemetry_only"
+                    )
 
                 # Smart money is optional evidence. Missing/NOISE contributes zero,
                 # while verified RUNNER evidence reduces the required score.
@@ -2909,18 +3664,34 @@ def scan_for_entries() -> int:
                     "LIVE_SAFE_SCORE_MIN_WITH_SM" if _mb_sm_bonus > 0 else "LIVE_SAFE_SCORE_MIN_NO_SM",
                     66.0 if _mb_sm_bonus > 0 else 74.0,
                 ))
+                if _calibration_mode != "enforce":
+                    # Remove exactly the confidence lane's maximum contribution
+                    # from the threshold while calibration is observational. This
+                    # preserves the relative burden carried by every non-confidence
+                    # evidence lane instead of fabricating a passing confidence.
+                    _mb_threshold = max(0.0, _mb_threshold - _mb_conf_weight_max)
                 _mb_live_score = max(0.0, min(100.0, _mb_live_score))
                 if _mb_live_score < _mb_threshold:
                     _mb_reasons.append(
                         f"score={_mb_live_score:.1f}<{_mb_threshold:.1f}"
                     )
                 _mb_reasons.extend(_mb_hard_blocks)
+                if _calibration_mirror and not _mb_hard_blocks:
+                    # Calibration mirrors ordinary paper admissions while retaining
+                    # every hard data/route/liquidity/oracle/token/capital guard.
+                    # Only the aggregate strategy score is advisory here.
+                    _mode_b_live_pass = True
+                    _mb_reasons = []
+                    _mb_calibration_note = (
+                        f"dual_calibration_score_advisory={_mb_live_score:.1f}/{_mb_threshold:.1f}"
+                    )
 
                 # Authoritative audit row. Existing databases are migrated in place.
                 try:
                     _mb_verdict = "BLOCKED" if _mb_reasons else "PASS"
                     _mb_reason_text = " | ".join(_mb_reasons) if _mb_reasons else (
-                        f"LIVE_SAFE_SCORE={_mb_live_score:.1f}>={_mb_threshold:.1f}"
+                        f"LIVE_SAFE_SCORE={_mb_live_score:.1f}>={_mb_threshold:.1f} | "
+                        f"{_mb_calibration_note}"
                     )
                     with get_connection() as _mb_audit:
                         _mb_audit.execute(
@@ -3013,6 +3784,37 @@ def scan_for_entries() -> int:
                             _mb_veto.commit()
                     except Exception:
                         pass
+
+                    # SIGNOFF_EDGE_RESTORE_20260731 R1: THE PAPER LANE NOW HONOURS THIS GATE.
+                    # Previously this branch logged LIVE_SAFE_BLOCKED and then fell
+                    # straight through into the unconditional paper_positions INSERT
+                    # below, so a candidate the scorer had just refused was opened
+                    # anyway. The gate result governs BOTH lanes.
+                    #
+                    # PAPER_HONOURS_MODE_B=0 restores the old behaviour and is
+                    # intended ONLY for deliberate gate-calibration research runs
+                    # where the corrupted entry population is the object of study.
+                    try:
+                        _paper_honours_gate = int(float(
+                            get_config_value("PAPER_HONOURS_MODE_B", 1)))
+                    except Exception:
+                        _paper_honours_gate = 1
+                    # Mode B is the funded-live overlay. Paper must continue to
+                    # provide the counterfactual lane in dual mode even when live is
+                    # refused; otherwise no paper-vs-live evidence can be collected
+                    # and a live-only block starves the entire execution pipeline.
+                    # PAPER_HONOURS_MODE_B remains available only as an explicit
+                    # research override, but defaults to disabled in true dual.
+                    if _paper_honours_gate and _calibration_mode == "enforce":
+                        log.warning(
+                            "[PAPER_GATE_ENFORCED] snap=%d %s refused for paper lane: %s",
+                            snap_id, token_name, " | ".join(_mb_reasons),
+                        )
+                        continue
+                    log.info(
+                        "[PAPER_COUNTERFACTUAL_CONTINUES] snap=%d %s live_refused=%s",
+                        snap_id, token_name, " | ".join(_mb_reasons),
+                    )
                 else:
                     _mode_b_live_pass = True
                     log.info(
@@ -3031,6 +3833,15 @@ def scan_for_entries() -> int:
             # ── PAPER SLIPPAGE SIMULATION ─────────────────────────────────
             # Real pump.fun buys via Jupiter cost 0.5-2.5% slippage + fees.
             # Apply in paper mode only so paper results reflect live reality.
+            #
+            # EDGE_BASIS_TRUTH_SIGNOFF_20260813:
+            # Preserve the actual observed market mark BEFORE cost modelling.
+            # The accounting entry_price below remains deliberately slipped;
+            # entry_mark_price gives audits an uncontaminated market basis for
+            # MFE/population-quality analysis.  No trading gate reads this.
+            _entry_mark_price = float(entry_price or 0.0)
+            _entry_mark_price_ts = float(price_ts or now)
+            _entry_mark_price_source = str(price_source or "unknown")
             if True:  # paper/SIM lane always models slippage
                 _slip_entry = float(get_config_value("PAPER_SLIPPAGE_ENTRY_PCT", 1.5)) / 100.0
                 _fee_entry  = max(0.0, float(get_config_value("PAPER_FEE_PER_TX_USD", 0.10)))
@@ -3054,21 +3865,34 @@ def scan_for_entries() -> int:
                         realized_pnl_usd, unrealized_pnl_usd, opened_at,
                         last_price, last_marked_at,
                         entry_price_source, entry_price_ts,
+                        entry_mark_price, entry_mark_price_ts, entry_mark_price_source,
                         confidence, entry_confidence, strategy_version,
                         funding_mode, money_source, execution_source, mode,
                         fee_usd, entry_fee_usd, exit_fee_usd
-                    ) VALUES (?, ?, 'OPEN', ?, ?, ?, ?, ?, 0.0, 0.0, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ) VALUES (?, ?, 'OPEN', ?, ?, ?, ?, ?, 0.0, 0.0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                               'SIM', 'SIM_EQUITY', 'PAPER_ENGINE', 'paper', ?, ?, 0.0)
                     """,
                     (token_name, mint, entry_price, quantity, pos_size_usd,
                      tp_pct, sl_pct, now, entry_price, now,
                      # Tag tide state in source so FLOOD trades are filterable
                      f"{price_source}|tide={str(get_config_value('MARKET_TIDE_STATE','NORMAL')).upper()}",
-                     price_ts, conf, entry_conf,
+                     price_ts, _entry_mark_price, _entry_mark_price_ts, _entry_mark_price_source,
+                     conf, entry_conf,
                      str(get_config_value("ACTIVE_STRATEGY_VERSION", "UNVERSIONED")),
                      _fee_entry, _fee_entry),
                 )
                 position_id = cur.lastrowid
+
+                # PARITY_PAPER_ADMISSION_20260803_FINAL
+                try:
+                    from services.paper_live_parity import record as _plp_record, PAPER_ONLY_ADMITTED
+                    _plp_record(conn, mint=mint, state=PAPER_ONLY_ADMITTED,
+                                paper_position_id=int(position_id), paper_admitted=1,
+                                paper_admitted_at=float(now), decision_at=float(now), paper_intent_at=float(now),
+                                paper_entry_price=float(entry_price or 0.0),
+                                token_name=str(token_name or ""), confidence=float(entry_conf or 0.0))
+                except Exception:
+                    pass
 
                 # COPYTRADE ADVISORY RESTORE — SIM annotation only.
                 #
@@ -3196,20 +4020,16 @@ def scan_for_entries() -> int:
                      entry_price, quantity, pos_size_usd, pos_size_usd, now),
                 )
 
-                # TRUE DUAL: SIM lane always uses simulated paper accounting.
-                if True:
-                    conn.execute(
-                        "UPDATE system_state SET wallet_balance = wallet_balance - ? WHERE id=1",
-                        (pos_size_usd,),
-                    )
-
-                # Log entry wallet debit
+                # PAPER/live wallet separation: the OPEN paper_positions row
+                # itself reserves stake under the canonical ledger contract.
+                # Never debit shared system_state.wallet_balance for SIM.
                 try:
+                    _paper_cash_after = get_paper_cash_balance(conn)
                     conn.execute(
                         """INSERT INTO wallet_write_log
                             (position_id, delta_usd, new_balance, source, token_name, pnl_usd, pnl_pct, timestamp)
-                            VALUES (?, ?, (SELECT wallet_balance FROM system_state WHERE id=1), 'ENTRY', ?, 0.0, 0.0, ?)""",
-                        (position_id, -pos_size_usd, token_name, now),
+                            VALUES (?, ?, ?, 'ENTRY', ?, 0.0, 0.0, ?)""",
+                        (position_id, -pos_size_usd, _paper_cash_after, token_name, now),
                     )
                 except Exception:
                     pass  # never block an entry on log failure
@@ -3227,7 +4047,43 @@ def scan_for_entries() -> int:
                             source=price_source)
                     except Exception:
                         pass
+
+                # ORACLE_CONTINUITY_SIGNOFF_20260808: record whether the mark
+                # tape could support runner qualification AT ENTRY. Without
+                # this, a window where harvesting was structurally impossible
+                # is indistinguishable from a window where the market simply
+                # produced no runners -- which is precisely the ambiguity that
+                # made the 2026-08-07/08 result unreadable. Analysis must be
+                # able to segment on it.
+                try:
+                    from services.mark_provenance import tape_quality
+                    _tq_entry = tape_quality(conn)
+                    conn.execute(
+                        "UPDATE paper_positions SET entry_tape_quality=?, "
+                        "entry_trusted_mark_pct=? WHERE id=?",
+                        (str(_tq_entry["verdict"])[:32],
+                         float(_tq_entry["qualifying_pct"]),
+                         position_id),
+                    )
+                except Exception:
+                    pass
                 conn.commit()
+
+            # EDGE_MEASUREMENT_SIGNOFF_20260802:
+            # Link the canonical paper position to the most recent confidence
+            # decision for this mint. Failure is observational only and must
+            # never block paper or live execution.
+            try:
+                from services.edge_ledger import attach_paper_open as _edge_attach_paper_open
+                _edge_linked = _edge_attach_paper_open(
+                    mint=mint, position_id=int(position_id),
+                    entry_at=float(now), entry_price=float(entry_price),
+                )
+                if not _edge_linked:
+                    log.warning("[EDGE_LEDGER_LINK_MISS] pos=%s mint=%s", position_id, mint[:16])
+            except Exception as _edge_link_err:
+                log.debug("edge ledger paper-open link skipped pos=%s: %s",
+                          position_id, _edge_link_err)
 
             # PATTERN_PERSISTENCE_LIVE_ARMING_20260715:
             # Reconstruct causal state from closes that existed before this candidate
@@ -3292,6 +4148,33 @@ def scan_for_entries() -> int:
             except Exception as _pat_audit_err:
                 log.debug("pattern audit stamp skipped pos=%s: %s", position_id, _pat_audit_err)
 
+            # LIVE_EXECUTABILITY_SIGNOFF_20260802:
+            # Resolve final candidate/exit coverage BEFORE publishing the
+            # canonical decision. This prevents FIRE_PATH_OPEN from being
+            # recorded and then contradicted by candidate_not_executable.
+            _ldc_coverage_ok = False
+            _ldc_coverage_reason = "coverage_not_evaluated"
+            try:
+                _coverage_reference_ts, _coverage_ref_diag = \
+                    _coverage_reference_timestamp(price_ts, now, mint=mint,
+                                                  position_id=position_id)
+                _cov_req_size = float(get_config_value("LIVE_POSITION_SIZE_USD", 0.0) or 0.0)
+                _cov_exp_cap = float(get_config_value("LIVE_MAX_TOTAL_EXPOSURE_USD", 0.0) or 0.0)
+                _cov_notional = min(_cov_req_size, _cov_exp_cap) if (_cov_req_size > 0 and _cov_exp_cap > 0) else 0.0
+                _cov_mult = 1.0
+                if _pattern_required:
+                    _cov_mult = min(_cov_mult, max(0.0, min(1.0, float(_pattern_size_multiplier))))
+                if _mb_half_size:
+                    _cov_mult = min(_cov_mult, 0.5)
+                _cov_notional *= _cov_mult
+                _ldc_coverage_ok, _ldc_coverage_reason = _live_oracle_coverage_guard(
+                    mint, entry_price, _coverage_reference_ts,
+                    live_notional_usd=_cov_notional,
+                )
+            except Exception as _coverage_preflight_err:
+                _ldc_coverage_ok = False
+                _ldc_coverage_reason = f"coverage_preflight_error={type(_coverage_preflight_err).__name__}"
+
             # SIGNOFF_LIVE_LEDGER_20260716 — EXECUTOR DECISION CONTRACT.
             # The executor publishes its OWN verdict here, at the exact point it
             # decides. ui/live_gate_constellation.py reads this record; it no
@@ -3321,10 +4204,26 @@ def scan_for_entries() -> int:
                                  ("live_trading module unavailable" if not _LIVE_TRADING_AVAILABLE
                                   else "disarmed by config")),
                      "contract": "DUAL_MODE_ENABLED+DUAL_MODE_ARMED+LIVE_TRADING_ENABLED+LIVE_MODE_B_ENABLED+LIVE_ARMED"},
-                    {"name": "MODE_B", "state": "PASS" if _mode_b_live_pass else "BLOCK",
-                     "current": ("passed" if _mode_b_live_pass else "mode B refused this candidate")
-                                + (" (half size)" if _mb_half_size else ""),
-                     "contract": "services/execution_engine.py mode B decision"},
+                    {"name": "MODE_B",
+                     "state": "PASS" if (
+                         _mode_b_live_pass
+                         or (_calibration_mirror and not locals().get("_mb_hard_blocks", ["mode_b_not_evaluated"]))
+                     ) else "BLOCK",
+                     "current": (
+                         "calibration strategy score advisory; hard Mode-B safety passed"
+                         if (_calibration_mirror and not locals().get("_mb_hard_blocks", ["mode_b_not_evaluated"]))
+                         else ("passed" if _mode_b_live_pass else (
+                             "mode B hard safety refused this candidate | blocks="
+                             + ("; ".join(str(_x) for _x in (locals().get("_mb_hard_blocks") or []))[:220]
+                                or "mode_b_not_evaluated")
+                             + f" | score={locals().get('_mb_live_score', 'n/a')}"
+                             + f"/{locals().get('_mb_threshold', 'n/a')}"
+                             + f" | calibration={bool(_calibration_mirror)}"))
+                     ) + (" (half size)" if _mb_half_size else ""),
+                     "contract": (
+                         "Selective: full Mode-B decision. Calibration: aggregate strategy score advisory; "
+                         "freshness/oracle/route/impact/token/capital hard blocks remain mandatory"
+                     )},
                     {"name": "PATTERN", "state": "PASS" if _pattern_live_pass else "BLOCK",
                      "current": (f"{_pattern_perm.state} · {_pattern_perm.confirmations} confirms · "
                                  f"{_pattern_size_multiplier:.2f}x" if _pattern_perm
@@ -3338,6 +4237,10 @@ def scan_for_entries() -> int:
                                  f"(size={_ldc_req_size} cap={_ldc_exp_cap}); rerun launcher interview"),
                      "contract": "LIVE_POSITION_SIZE_USD>0 and LIVE_MAX_TOTAL_EXPOSURE_USD>0, "
                                  "stamped by the launcher interview"},
+                    {"name": "EXECUTABLE_COVERAGE",
+                     "state": "PASS" if _ldc_coverage_ok else "BLOCK",
+                     "current": str(_ldc_coverage_reason)[:200],
+                     "contract": "fresh executable candidate price and exit coverage before canonical verdict"},
                 ]
                 _ldc_verdict, _ldc_blocker = _derive_live_verdict(
                     lane_armed=_ldc_lane_armed,
@@ -3364,14 +4267,40 @@ def scan_for_entries() -> int:
                     position_id=position_id,
                     authored_by="execution_engine.scan_for_entries",
                 )
+
+                # PARITY_LIVE_DECISION_20260803_FINAL
+                try:
+                    from services.paper_live_parity import record as _plp_record, LIVE_REFUSED, PAPER_ONLY_ADMITTED
+                    _plp_state = PAPER_ONLY_ADMITTED if _ldc_verdict == "FIRE_PATH_OPEN" else LIVE_REFUSED
+                    _plp_record(
+                        get_connection(), mint=mint, state=_plp_state,
+                        paper_position_id=int(position_id), live_eligible=int(_ldc_verdict == "FIRE_PATH_OPEN"),
+                        live_verdict=str(_ldc_verdict), live_refusal_reason=(None if _ldc_verdict == "FIRE_PATH_OPEN" else str(_ldc_blocker or "blocked")),
+                        gate_state_json=_ldc_gates, selected_size_usd=float(_ldc_would_fire or 0.0),
+                        pattern_stage=(_pattern_perm.state if _pattern_perm else None),
+                        confidence=float(entry_conf or 0.0), executability_state=str(_ldc_coverage_reason),
+                    )
+                except Exception:
+                    pass
             except Exception as _ldc_err:
                 log.debug("decision contract publish skipped pos=%s: %s",
                           position_id, _ldc_err)
 
-            # TRUE_DUAL_LIVE_MIRROR_20260713:
-            # Paper trade is already committed. A separate REAL row is created only
-            # after Mode B and the causal pattern gate pass and the on-chain buy confirms.
-            if _LIVE_TRADING_AVAILABLE and _live_lane_armed() and _mode_b_live_pass and _pattern_live_pass:
+            # TRUE_DUAL_LIVE_MIRROR_20260713 / DUAL_CALIBRATION_20260805:
+            # Both lanes derive from the same paper admission. Calibration makes
+            # aggregate Mode-B score and pattern selectivity advisory, but never
+            # bypasses coverage, capital, route, token, canary or submission guards.
+            _pattern_live_effective_pass = bool(_pattern_live_pass or _calibration_mirror)
+            # Calibration keeps Mode-B hard blocks mandatory, but makes only the
+            # aggregate strategy score advisory. Resolve the effective pass from
+            # the hard-block list so stale child-process environment state cannot
+            # silently fall back to Selective behaviour.
+            _mode_b_effective_pass = bool(
+                _mode_b_live_pass
+                or (_calibration_mirror and not locals().get("_mb_hard_blocks", ["mode_b_not_evaluated"]))
+            )
+            if (_LIVE_TRADING_AVAILABLE and _live_lane_armed() and _mode_b_effective_pass
+                    and _pattern_live_effective_pass and _ldc_coverage_ok):
                 try:
                     # Operator-owned live amount. Launch_Sentinuity.bat stamps this
                     # from the startup interview; no dollar amount is hard-wired here.
@@ -3405,6 +4334,21 @@ def scan_for_entries() -> int:
                         _real_exposure = float(_lc.execute(
                             "SELECT COALESCE(SUM(position_size_usd),0) FROM paper_positions WHERE UPPER(COALESCE(funding_mode,'SIM'))='REAL' AND (status='OPEN' OR COALESCE(live_state,'') IN ('BUY_SUBMITTED','BUY_CONFIRMED_UNRESOLVED','OPEN_REAL','SELL_TRIGGERED','SELL_SUBMITTED','SELL_CONFIRMED_UNRESOLVED'))"
                         ).fetchone()[0] or 0.0)
+                    if _calibration_mirror:
+                        _cal_started = float(get_config_value(
+                            "LIVE_CALIBRATION_SESSION_STARTED_AT", time.time()) or time.time())
+                        _cal_max_trades = max(1, int(float(get_config_value(
+                            "LIVE_CALIBRATION_MAX_TRADES", 3) or 3)))
+                        with get_connection() as _cal_conn:
+                            _cal_used = int(_cal_conn.execute(
+                                "SELECT COUNT(*) FROM paper_positions WHERE "
+                                "UPPER(COALESCE(funding_mode,'SIM'))='REAL' AND opened_at>=?",
+                                (_cal_started,),
+                            ).fetchone()[0] or 0)
+                        if _cal_used >= _cal_max_trades:
+                            raise RuntimeError(
+                                f"calibration_session_trade_cap:{_cal_used}>={_cal_max_trades}"
+                            )
                     _daily_limit = float(
                         get_config_value("LIVE_DAILY_LOSS_LIMIT_USD", _exposure_cap)
                     )
@@ -3425,6 +4369,15 @@ def scan_for_entries() -> int:
                     if _day_loss >= _daily_limit:
                         log.critical("[LIVE_RISK_HALT] day_loss=$%.2f limit=$%.2f; no new live buy",
                                      _day_loss, _daily_limit)
+
+                        try:
+                            from services.paper_live_parity import record as _plp_record, LIVE_REFUSED
+                            with get_connection() as _pc:
+                                _plp_record(_pc, mint=mint, state=LIVE_REFUSED, paper_position_id=int(position_id),
+                                            live_verdict="BLOCKED", live_refusal_reason="LIVE_RISK_DAILY_LIMIT")
+                                _pc.commit()
+                        except Exception:
+                            pass
                         # SIGNOFF_FIRE_TRUTH_20260724: a candidate must never
                         # disappear after FIRE_PATH_OPEN. Record the terminal
                         # outcome and republish so the contract cannot linger
@@ -3454,6 +4407,15 @@ def scan_for_entries() -> int:
                     elif _real_open >= _live_max or _real_exposure + _live_size > _exposure_cap + 1e-9:
                         log.warning("[LIVE_MIRROR_BLOCKED] open=%d/%d exposure=$%.2f cap=$%.2f",
                                     _real_open, _live_max, _real_exposure, _exposure_cap)
+
+                        try:
+                            from services.paper_live_parity import record as _plp_record, LIVE_REFUSED
+                            with get_connection() as _pc:
+                                _plp_record(_pc, mint=mint, state=LIVE_REFUSED, paper_position_id=int(position_id),
+                                            live_verdict="BLOCKED", live_refusal_reason="LIVE_CAPS")
+                                _pc.commit()
+                        except Exception:
+                            pass
                         # SIGNOFF_FIRE_TRUTH_20260724: terminal truth (see above).
                         try:
                             from services.fire_path_ledger import record_terminal as _fpt
@@ -3486,7 +4448,9 @@ def scan_for_entries() -> int:
                         # during the few milliseconds before the oracle wrote its next tick.
                         # `price_ts` is the timestamp of the exact price that qualified this
                         # candidate; the guard still enforces its own freshness threshold.
-                        _coverage_reference_ts = float(price_ts or now)
+                        _coverage_reference_ts, _coverage_ref_diag = \
+                            _coverage_reference_timestamp(price_ts, now, mint=mint,
+                                                          position_id=position_id)
                         _coverage_ok, _coverage_reason = _live_oracle_coverage_guard(
                             mint, entry_price, _coverage_reference_ts
                         )
@@ -3507,6 +4471,16 @@ def scan_for_entries() -> int:
                             except Exception:
                                 pass
                             _lr = {"success": False, "error": _coverage_reason}
+
+                            try:
+                                from services.paper_live_parity import record as _plp_record, LIVE_REFUSED
+                                with get_connection() as _pc:
+                                    _plp_record(_pc, mint=mint, state=LIVE_REFUSED, paper_position_id=int(position_id),
+                                                live_verdict="BLOCKED", live_refusal_reason=str(_coverage_reason),
+                                                executability_state=str(_coverage_reason))
+                                    _pc.commit()
+                            except Exception:
+                                pass
                             # SIGNOFF_FIRE_TRUTH_20260724: coverage refusal is a
                             # canonical terminal, distinct from a submit failure.
                             try:
@@ -3535,12 +4509,79 @@ def scan_for_entries() -> int:
                                 "[LIVE_ORACLE_COVERAGE_PASS] SIM pos=%d mint=%s %s",
                                 position_id, mint[:16], _coverage_reason,
                             )
-                            _lr = _live_buy(mint, _live_size, entry_price, position_id)
+                            # CANARY_GOVERNOR_BEFORE_LIVE_BUY_20260803_FINAL
+                            _canary_reservation_token = None
+                            try:
+                                from services.stop_realisability import readiness as _stop_readiness
+                                from services.canary_governor import may_fire_canary, reserve_attempt
+                                with get_connection() as _cg:
+                                    _rd = _stop_readiness(_cg)
+                                    _p90 = ((_rd.get("stats") or {}).get("p90_executable_pct"))
+                                    _gov = may_fire_canary(
+                                        _cg,
+                                        projected_executable_loss_pct=(abs(float(_p90)) if _p90 is not None else None),
+                                        lane_armed=True, mode_b_pass=True, pattern_pass=True,
+                                        executability_ok=True, paper_enabled=True,
+                                        readiness_status=_rd.get("status"),
+                                        readiness_blocking=_rd.get("blocking"),
+                                        readiness_stats=_rd.get("stats"),
+                                    )
+                                    if _gov.get("allowed"):
+                                        _canary_reservation_token = reserve_attempt(
+                                            _cg, position_id=int(position_id), mint=mint,
+                                            size_usd=float(_live_size), note="execution_engine_pre_submit")
+                                    _cg.commit()
+                                if not _gov.get("allowed"):
+                                    _lr = {"success": False, "error": "CANARY_GOVERNOR:" + str(_gov.get("reason"))}
+                                elif not _canary_reservation_token:
+                                    _lr = {"success": False, "error": "CANARY_RESERVATION_REFUSED"}
+                                else:
+                                    _live_intent_at = time.time()
+                                    _lr = _live_buy(mint, _live_size, entry_price, position_id)
+                            except Exception as _gov_exc:
+                                _lr = {"success": False, "error": "CANARY_GOVERNOR_ERROR:" + type(_gov_exc).__name__}
                         if _lr.get("success"):
                             _live_qty = float(_lr["actual_qty"])
                             _live_entry_price = float(_lr["actual_price"])
                             _actual_cost_usd = float(_lr.get("actual_cost_usd") or _live_size)
                             _sig = str(_lr.get("tx_sig") or "")
+
+                            # CANARY_AND_PARITY_SUBMISSION_20260803_FINAL
+                            try:
+                                from services.canary_governor import mark_submitted
+                                from services.paper_live_parity import record as _plp_record, LIVE_SUBMITTED
+                                with get_connection() as _txc:
+                                    if _canary_reservation_token:
+                                        mark_submitted(_txc, reservation_token=_canary_reservation_token)
+                                    _tl = dict(_lr.get("timeline") or {})
+                                    _tm = dict(_lr.get("timings") or {})
+                                    _paper_at = float(now)
+                                    _intent_at = float(locals().get("_live_intent_at", _paper_at))
+                                    _submit_at = float(_tl.get("submitted_at") or time.time())
+                                    _plp_record(
+                                        _txc, mint=mint, state=LIVE_SUBMITTED,
+                                        paper_position_id=int(position_id),
+                                        decision_at=_paper_at, paper_intent_at=_paper_at,
+                                        live_intent_at=_intent_at,
+                                        route_requested_at=_tl.get("route_requested_at"),
+                                        route_received_at=_tl.get("route_received_at"),
+                                        signing_started_at=_tl.get("signing_started_at"),
+                                        live_submit_at=_submit_at,
+                                        confirmed_local_at=_tl.get("confirmed_local_at"),
+                                        chain_block_time=_tl.get("chain_block_time"),
+                                        reconciled_at=_tl.get("reconciled_at"),
+                                        decision_to_submit_ms=(_submit_at - _paper_at) * 1000.0,
+                                        paper_to_live_intent_ms=(_intent_at - _paper_at) * 1000.0,
+                                        entry_slippage_pct=(
+                                            ((_live_entry_price / float(entry_price)) - 1.0) * 100.0
+                                            if float(entry_price or 0.0) > 0 else None
+                                        ),
+                                        buy_signature=_sig, selected_size_usd=float(_live_size),
+                                        quote_evidence_json={"timings": _tm, "timeline": _tl},
+                                    )
+                                    _txc.commit()
+                            except Exception:
+                                pass
                             _chain_opened_at = float(_lr.get("chain_confirmed_at") or time.time())
                             _reconciled_at = float(_lr.get("reconciled_at") or time.time())
                             _fill_json = json.dumps(_lr.get("fill_meta") or {}, sort_keys=True, separators=(",", ":"))
@@ -3569,6 +4610,17 @@ def scan_for_entries() -> int:
                                      _fill_json,position_id,_live_entry_price),
                                 )
                                 _real_id = int(_real_cur.lastrowid)
+
+                                # PARITY_LIVE_BUY_SETTLED_20260803_FINAL
+                                try:
+                                    from services.paper_live_parity import record as _plp_record, DUAL_OPEN
+                                    _plp_record(_real_conn, mint=mint, state=DUAL_OPEN,
+                                                paper_position_id=int(position_id), live_position_id=int(_real_id),
+                                                chain_fill_at=float(_chain_opened_at), live_fill_price=float(_live_entry_price),
+                                                raw_token_quantity=int(_live_qty) if float(_live_qty).is_integer() else None,
+                                                buy_signature=_sig, reconciliation_status="BUY_RECONCILED")
+                                except Exception:
+                                    pass
                                 _real_conn.execute(
                                     "INSERT INTO paper_executions (position_id,token_name,mint_address,side,price,quantity,notional_usd,value_usd,reason,timestamp) "
                                     "VALUES (?,?,?,'BUY',?,?,?,?,?,?)",
@@ -3610,6 +4662,19 @@ def scan_for_entries() -> int:
                                 _real_conn.commit()
                             log.critical("[LIVE_BUY_UNRESOLVED] sig=%s mint=%s; live lane must remain blocked",
                                          _sig[:20], mint[:16])
+
+                            try:
+                                from services.canary_governor import mark_failed_unresolved
+                                from services.paper_live_parity import record as _plp_record, LIVE_SELL_UNRESOLVED
+                                with get_connection() as _uc:
+                                    mark_failed_unresolved(_uc, reservation_token=_canary_reservation_token,
+                                                           position_id=int(position_id), note="buy confirmed unresolved")
+                                    _plp_record(_uc, mint=mint, state=LIVE_SELL_UNRESOLVED,
+                                                paper_position_id=int(position_id), buy_signature=_sig,
+                                                terminal_reason="BUY_CONFIRMED_UNRESOLVED")
+                                    _uc.commit()
+                            except Exception:
+                                pass
                             # SIGNOFF_FIRE_TRUTH_20260724: chain accepted the tx;
                             # this IS a submission even though the fill is
                             # unresolved. Terminal SUBMITTED with the state noted.
@@ -3624,6 +4689,18 @@ def scan_for_entries() -> int:
                         else:
                             log.warning("[LIVE_BUY_FAIL] SIM pos=%d error=%s; paper remains OPEN, no REAL row",
                                         position_id, _lr.get("error"))
+
+                            try:
+                                from services.canary_governor import mark_failed_unresolved
+                                from services.paper_live_parity import record as _plp_record, LIVE_EXCEPTION
+                                with get_connection() as _fc:
+                                    mark_failed_unresolved(_fc, reservation_token=_canary_reservation_token,
+                                                           position_id=int(position_id), note=str(_lr.get("error")))
+                                    _plp_record(_fc, mint=mint, state=LIVE_EXCEPTION,
+                                                paper_position_id=int(position_id), terminal_reason=str(_lr.get("error")))
+                                    _fc.commit()
+                            except Exception:
+                                pass
                             # SIGNOFF_FIRE_TRUTH_20260724: terminal truth. The
                             # coverage branch already recorded its own terminal;
                             # only a genuine submit-path failure lands here with
@@ -3653,6 +4730,18 @@ def scan_for_entries() -> int:
                 except Exception as _le:
                     log.error("[LIVE_BUY_ERROR] SIM pos=%d: %s; paper remains OPEN, no REAL row",
                               position_id, _le)
+
+                    try:
+                        from services.canary_governor import mark_failed_unresolved
+                        from services.paper_live_parity import record as _plp_record, LIVE_EXCEPTION
+                        with get_connection() as _ec:
+                            mark_failed_unresolved(_ec, reservation_token=locals().get("_canary_reservation_token"),
+                                                   position_id=int(position_id), note=str(_le))
+                            _plp_record(_ec, mint=mint, state=LIVE_EXCEPTION,
+                                        paper_position_id=int(position_id), terminal_reason=str(_le))
+                            _ec.commit()
+                    except Exception:
+                        pass
                     # SIGNOFF_FIRE_TRUTH_20260724: terminal truth on the
                     # exception path too (republish below already existed).
                     try:
@@ -3778,24 +4867,42 @@ def scan_for_entries() -> int:
 # LIVE EXIT EVALUATION
 # -----------------------------------------------------------------------------
 
-def check_open_positions() -> None:
-    """Evaluate all open positions for exit conditions."""
-    for position in get_open_positions():
+_POST_ENTRY_TICK_AUDIT_LAST: dict[int, float] = {}
+_POST_ENTRY_TICK_AUDIT_INTERVAL_SEC = 30.0
+
+
+def check_open_positions(funding_lane: str | None = None) -> None:
+    """Evaluate open positions, optionally isolating REAL from SIM/non-REAL.
+
+    The funded lane is intentionally schedulable independently so a slow paper
+    sweep cannot delay the only position carrying real capital.  Exit semantics
+    inside evaluate_exit_for_position() are unchanged.
+    """
+    _positions = get_open_positions()
+    if funding_lane == "REAL":
+        _positions = [p for p in _positions if _position_is_real(p)]
+    elif funding_lane == "NONREAL":
+        _positions = [p for p in _positions if not _position_is_real(p)]
+    for position in _positions:
         try:
             # PATCH C - post-entry coverage audit: warn if oracle has no ticks
             # for a position older than 5s. Proof panel for oracle coverage gaps.
             _pos_age = time.time() - float(position.get("opened_at") or 0)
-            if _pos_age > 5.0:
+            _pos_id_audit = int(position.get("id") or 0)
+            _audit_now = time.time()
+            _audit_due = (_audit_now - _POST_ENTRY_TICK_AUDIT_LAST.get(_pos_id_audit, 0.0)) >= _POST_ENTRY_TICK_AUDIT_INTERVAL_SEC
+            if _pos_age > 5.0 and _audit_due:
+                _POST_ENTRY_TICK_AUDIT_LAST[_pos_id_audit] = _audit_now
                 try:
                     _mint_chk = str(position.get("mint_address") or "")
                     _opened_ms = float(position.get("opened_at") or 0) * 1000
-                    _iconn = get_intel_connection()
-                    _tick_count = _iconn.execute(
-                        "SELECT COUNT(*) FROM mtm_ticks WHERE mint_address=? AND ts_ms>=?",
-                        (_mint_chk, _opened_ms),
-                    ).fetchone()[0]
-                    _iconn.close()
-                    if _tick_count == 0:
+                    # REGRESSION_AUDIT_20260805: the previous implementation opened a
+                    # fresh intel connection (5 PRAGMAs) per position per cycle
+                    # and ran a full COUNT(*) whose result was only ever
+                    # compared against zero. Cached handle + EXISTS/LIMIT 1.
+                    from services.exit_hotpath import intel_ticks_exist as _eh_ticks
+                    _tick_present = _eh_ticks(_mint_chk, _opened_ms)
+                    if _tick_present is False:
                         log.warning(
                             "[NO_POST_ENTRY_TICKS] pos=%d %s age=%.0fs "
                             "- oracle has ZERO ticks since open. Meter will be blind.",
@@ -3829,13 +4936,23 @@ def check_open_positions() -> None:
                 )
                 _pli_act = _pli_result.get("action", "HOLD")
                 if _pli_act == "EXIT":
-                    _pli_price = float(position.get("last_price") or position.get("entry_price") or 0)
-                    if _pli_price > 0:
-                        close_position_canonical(
-                            int(position["id"]), _pli_price, "LIFECYCLE_EXIT",
-                            closure_mode="normal",
+                    # EXECUTABLE_TRUTH_FINAL_SIGNOFF_20260809:
+                    # PLI is advisory only.  It must never close directly at
+                    # position.last_price because last_price intentionally accepts
+                    # observational marks. Carry the request into the canonical
+                    # evaluator; only an executable current-cycle price may action it.
+                    position["_pli_exit_requested"] = str(_pli_result.get("reason") or "PLI_EXIT")[:240]
+                    _pli_runner = _fresh_runner_floor_state(int(position["id"]))
+                    if _pli_runner.get("protected"):
+                        log.info(
+                            "[PLI_EXIT_DEFERRED_TO_RUNNER] pos=%d peak=%.2f floor=%.2f state=%s reason=%s",
+                            int(position["id"]), float(_pli_runner.get("peak_pct") or 0.0),
+                            float(_pli_runner.get("floor_pct") or 0.0),
+                            _pli_runner.get("state") or "ARMED", _pli_result.get("reason", ""),
                         )
-                        continue
+                    else:
+                        log.info("[PLI_EXIT_PENDING_EXECUTABLE] pos=%d reason=%s",
+                                 int(position["id"]), position["_pli_exit_requested"])
                 elif _pli_act in ("SCALE_IN", "PARTIAL_PROFIT"):
                     log.info("PLI %s pos=%d reason=%s",
                              _pli_act, position["id"], _pli_result.get("reason", ""))
@@ -4120,7 +5237,9 @@ def _lilypad_sub100_decision(position_id: int, mint: str, opened_at: float,
         _new_high_epsilon = _lp_float("LILYPAD_NEW_HIGH_EPSILON_PCT", 0.25)
         _plateau_band = _lp_float("LILYPAD_PLATEAU_BAND_PP", 5.0)
         _plateau_marks_needed = max(3, int(_lp_float("LILYPAD_PLATEAU_MARKS", 3.0)))
-        _shadow = _lp_cfg_bool("LILYPAD_SUB100_SHADOW_ONLY", False)
+        # Lilypad is an observational challenger by default; it must not
+        # pre-empt qualified runner protection in the +50..99% band.
+        _shadow = _lp_cfg_bool("LILYPAD_SUB100_SHADOW_ONLY", True)
         _decision = None
         _event_type = None
         _level = None
@@ -4312,36 +5431,46 @@ def _runner_profit_lock_enabled() -> bool:
 
 
 def _runner_profit_lock_floor_pct(peak_pct: float) -> float | None:
-    """
-    Paper runner protection ladder.
+    """Monotonic Mode 3 profit-lock ladder for qualified peaks.
 
-    Once a position has proven a major run, max-hold/stagnation should not be
-    allowed to recycle it flat/negative. These are conservative paper stop-fill
-    floors based on the observed high-water mark.
+    Protects qualified +20% to +74% runs with ~9 percentage points giveback,
+    preserves the existing 75-99 and 100-149 policies, and clamps every band
+    boundary so a higher peak can never produce a lower protective floor.
     """
     try:
-        peak_pct = float(peak_pct or 0.0)
+        p = float(peak_pct or 0.0)
     except Exception:
-        peak_pct = 0.0
-    # 2026-07-13 sign-off: preserve the proven monster pathway, but stop
-    # ordinary 75-149% poppers from recycling to the old +25/+40 floors.
-    # A peak is only trusted after the exit evaluator recorded it in mark_tape.
-    if peak_pct >= 400.0:
-        return float(get_config_value("RUNNER_LOCK_FLOOR_400_PCT", 125.0))
-    if peak_pct >= 250.0:
-        return float(get_config_value("RUNNER_LOCK_FLOOR_250_PCT", 90.0))
-    if peak_pct >= 150.0:
-        return float(get_config_value("RUNNER_LOCK_FLOOR_150_PCT", 60.0))
-    if peak_pct >= 100.0:
-        absolute = float(get_config_value("RUNNER_LOCK_FLOOR_100_PCT", 75.0))
-        drawdown = float(get_config_value("RUNNER_LOCK_MAX_GIVEBACK_100_149_PP", 18.0))
-        return max(absolute, peak_pct - drawdown)
-    if peak_pct >= 75.0:
-        absolute = float(get_config_value("RUNNER_LOCK_FLOOR_75_PCT", 60.0))
-        drawdown = float(get_config_value("RUNNER_LOCK_MAX_GIVEBACK_75_99_PP", 10.0))
-        return max(absolute, peak_pct - drawdown)
-    return None
+        return None
+    if p < 20.0:
+        return None
 
+    def raw(x: float) -> float | None:
+        if x >= 400.0:
+            absolute = float(get_config_value("RUNNER_LOCK_FLOOR_400_PCT", 125.0))
+            retention = max(0.0, min(0.95, float(get_config_value("RUNNER_LOCK_RETENTION_400_PLUS", 0.3125))))
+            return max(absolute, x * retention)
+        if x >= 250.0:
+            return float(get_config_value("RUNNER_LOCK_FLOOR_250_PCT", 90.0))
+        if x >= 150.0:
+            return float(get_config_value("RUNNER_LOCK_FLOOR_150_PCT", 60.0))
+        if x >= 100.0:
+            absolute = float(get_config_value("RUNNER_LOCK_FLOOR_100_PCT", 75.0))
+            drawdown = float(get_config_value("RUNNER_LOCK_MAX_GIVEBACK_100_149_PP", 18.0))
+            return max(absolute, x - drawdown)
+        if x >= 75.0:
+            absolute = float(get_config_value("RUNNER_LOCK_FLOOR_75_PCT", 60.0))
+            drawdown = float(get_config_value("RUNNER_LOCK_MAX_GIVEBACK_75_99_PP", 10.0))
+            return max(absolute, x - drawdown)
+        drawdown = float(get_config_value("RUNNER_LOCK_MAX_GIVEBACK_20_74_PP", 9.0))
+        return max(1.0, x - drawdown)
+
+    floor = raw(p)
+    for edge in (75.0, 100.0, 150.0, 250.0, 400.0):
+        if p >= edge:
+            prior = raw(edge - 1e-6)
+            if prior is not None:
+                floor = max(float(floor), float(prior))
+    return float(floor)
 
 def _runner_profit_lock_columns(conn) -> None:
     """Best-effort telemetry columns for exit-quality learning."""
@@ -4354,6 +5483,13 @@ def _runner_profit_lock_columns(conn) -> None:
             "runner_lock_price": "REAL",
             "exit_gap_from_peak_pct": "REAL",
             "exit_quality_tag": "TEXT",
+            "runner_exit_fill_model": "TEXT",
+            "runner_peak_trust_source": "TEXT",
+            "runner_confirmed": "INTEGER DEFAULT 0",
+            "runner_integrity_status": "TEXT",
+            "runner_confirmation_source": "TEXT",
+            "runner_confirmed_at": "REAL",
+            "runner_confirmation_evidence": "TEXT",
         }
         for col, typ in wanted.items():
             if col not in have:
@@ -4362,7 +5498,9 @@ def _runner_profit_lock_columns(conn) -> None:
         pass
 
 
-def _runner_profit_lock_decision(position_id: int, entry_price: float, current_price: float, position: dict) -> dict | None:
+def _runner_profit_lock_decision(position_id: int, entry_price: float, current_price: float,
+                                 position: dict, trusted_peak_snapshot=None,
+                                 current_price_executable: bool = False) -> dict | None:
     """
     Return a protective close decision for PAPER mode if a runner has already
     proven a high-water mark but has fallen back to/through the configured
@@ -4382,20 +5520,160 @@ def _runner_profit_lock_decision(position_id: int, entry_price: float, current_p
     if entry_price <= 0 or current_price <= 0:
         return None
 
-    # Prefer the persisted high-water mark. Fallback to current mark.
+    # Prefer a source-qualified mark-tape high-water mark. Never fall back to
+    # highest_price_seen: that field is an unfiltered MAX and allowed a single
+    # suspect intel-mtm spike to establish an extreme protection state.
+    _pl_src = ""
     try:
-        # TRUSTED PEAK: highest_price_seen is an unfiltered MAX(observed_price).
-        # Prefer the peak the exit manager actually observed (mark_tape).
-        _pl_px, _pl_pct, _pl_src, _pl_ts = _trusted_peak_from_tape(
-            int(position.get("id") or 0), float(position.get("entry_price") or 0.0))
-        peak_price = float(_pl_px) if _pl_px and _pl_px > 0 else \
-            float(position.get("highest_price_seen") or 0.0)
+        if trusted_peak_snapshot is not None:
+            _pl_px, _pl_pct, _pl_src, _pl_ts = trusted_peak_snapshot
+        else:
+            _pl_px, _pl_pct, _pl_src, _pl_ts = _trusted_peak_from_tape(
+                int(position.get("id") or 0), float(position.get("entry_price") or 0.0))
+        peak_price = float(_pl_px) if _pl_px and _pl_px > 0 else 0.0
+        if peak_price <= 0:
+            persisted_px = float(position.get("trusted_peak_price") or 0.0)
+            persisted_src = str(position.get("trusted_peak_source") or "")
+            # PEAK_AUTHORITY_P4: a persisted peak with no explicit confirmation
+            # is LEGACY_PEAK_WITHOUT_CONFIRMATION and carries no runner
+            # authority. Without this gate a legacy +450% row with source
+            # 'intel-mtm' produced a live RUNNER_PROFIT_LOCK on a position with
+            # zero marks and zero confirmations.
+            _pl_authorised = False
+            try:
+                from services import peak_authority as _pa4
+                with get_connection() as _ac:
+                    _pl_authorised, _pl_why = _pa4.runner_exit_authorised(
+                        _ac, int(position.get("id") or position_id))
+            except Exception:
+                _pl_authorised, _pl_why = False, "authority_unavailable"
+            if (persisted_px > 0 and _pl_authorised
+                    and not _runner_peak_source_is_suspect(persisted_src)):
+                peak_price = persisted_px
+                _pl_src = persisted_src
+            elif persisted_px > 0:
+                try:
+                    log.debug(
+                        "[LEGACY_PEAK_WITHOUT_CONFIRMATION] pos=%s peak=%.10f "
+                        "src=%s reason=%s -- diagnostic only, no runner authority",
+                        position_id, persisted_px, persisted_src, _pl_why)
+                except Exception:
+                    pass
     except Exception:
         peak_price = 0.0
     if peak_price <= 0:
-        peak_price = current_price
-    if peak_price < current_price:
-        peak_price = current_price
+        # ORACLE_CONTINUITY_SIGNOFF_20260808: report WHY no trusted peak was
+        # available. Previously this branch was completely silent, so a mark
+        # tape carrying only degraded sources made runner harvesting inoperable
+        # for 12 hours with no symptom other than every position expiring on
+        # MAX_HOLD. Throttled to one report per 5 minutes per process.
+        try:
+            _tq_last = getattr(_runner_profit_lock_decision, "_tape_report_ts", 0.0)
+            if time.time() - _tq_last > 300.0:
+                # Global tape-quality became misleading once executable truth
+                # was canonical: carried unknown rows dominated the denominator
+                # and router_executable was not a legacy self-confirming family.
+                # Diagnose THIS position and recognise Layer-C as evidence,
+                # without changing the confirmation policy itself.
+                with get_connection() as _tq_conn:
+                    _pr = _tq_conn.execute(
+                        "SELECT COUNT(*), "
+                        "SUM(CASE WHEN COALESCE(pct,-1e9)>=20.0 THEN 1 ELSE 0 END), "
+                        "SUM(CASE WHEN COALESCE(pct,-1e9)>=20.0 "
+                        " AND COALESCE(source_subtype,'unknown') IN "
+                        " ('curve_reserve','pool_quote','router_executable','pool_executable') "
+                        " AND COALESCE(integrity_state,'') NOT LIKE 'QUARANTINED_%' "
+                        " THEN 1 ELSE 0 END), MAX(pct), "
+                        "SUM(CASE WHEN COALESCE(source_subtype,'unknown') IN "
+                        " ('router_executable','pool_executable') THEN 1 ELSE 0 END) "
+                        "FROM mark_tape WHERE position_id=?",
+                        (int(position_id),),
+                    ).fetchone()
+                setattr(_runner_profit_lock_decision, "_tape_report_ts", time.time())
+                _pos_total = int((_pr[0] if _pr else 0) or 0)
+                _pos_above = int((_pr[1] if _pr else 0) or 0)
+                _pos_corr_above = int((_pr[2] if _pr else 0) or 0)
+                _pos_max_pct = float(_pr[3]) if _pr and _pr[3] is not None else None
+                _pos_exec = int((_pr[4] if _pr else 0) or 0)
+                if _pos_above > 0 and _pos_corr_above == 0:
+                    log.error(
+                        "[RUNNER_EVIDENCE_STARVED] pos=%s marks=%d above20=%d "
+                        "eligible_above20=0 exec_marks=%d max_pct=%s -- runner "
+                        "threshold observed but no admissible corroboration",
+                        position_id, _pos_total, _pos_above, _pos_exec,
+                        ("n/a" if _pos_max_pct is None else f"{_pos_max_pct:.2f}%"),
+                    )
+                else:
+                    log.warning(
+                        "[RUNNER_PEAK_UNAVAILABLE] pos=%s marks=%d above20=%d "
+                        "eligible_above20=%d exec_marks=%d max_pct=%s",
+                        position_id, _pos_total, _pos_above, _pos_corr_above,
+                        _pos_exec,
+                        ("n/a" if _pos_max_pct is None else f"{_pos_max_pct:.2f}%"),
+                    )
+        except Exception:
+            pass
+        # PRICE_TRUTH_SIGNOFF_20260806: never manufacture a runner floor from
+        # the falling evaluator mark. Record refusal and leave ordinary hard
+        # stop / liquidation logic available.
+        try:
+            with get_connection() as _conn:
+                _runner_profit_lock_columns(_conn)
+                _cols = {r[1] for r in _conn.execute("PRAGMA table_info(paper_positions)")}
+                if "runner_floor_state" in _cols:
+                    # MODE3_FINAL_SIGNOFF_20260806 (invariants B + C)
+                    # DEFECT: this branch unconditionally overwrote an already
+                    # ARMED_TRUSTED floor with RUNNER_FLOOR_UNAVAILABLE the
+                    # moment the peak-establishing source disappeared, with no
+                    # grace window. The position then fell through to
+                    # MAX_HOLD_TIME. Every close in the 2026-08-06 19:07-21:07
+                    # window closed on MAX_HOLD_TIME (900s-1038s); no runner
+                    # floor exit occurred at all.
+                    #
+                    # A qualified peak that already passed source-quality and
+                    # anti-outlier validation is now retained for a bounded
+                    # grace window. Stickiness only RETAINS protection: it never
+                    # manufactures a peak and never arms a floor for the first
+                    # time off a stale mark.
+                    _m3_state = "RUNNER_FLOOR_UNAVAILABLE"
+                    _m3_reason = str(_pl_src or "no_trusted_peak")
+                    try:
+                        from services import mode3_peak_continuity as _m3
+                        _m3_res = _m3.resolve_floor_state(
+                            int(position_id),
+                            tape_peak_price=float(locals().get("_pl_px") or 0.0),
+                            tape_peak_source=str(locals().get("_pl_src") or ""),
+                            exec_source=str(locals().get("_exec_src") or ""),
+                            exec_quote_age_sec=locals().get("_exec_quote_age"),
+                            exec_slippage_pct=locals().get("_exec_slippage_pct"),
+                        )
+                        _m3_state = _m3_res["floor_state"]
+                        _m3_reason = _m3_res["reason"]
+                        if _m3_res["floor_is_protective"]:
+                            log.warning(
+                                "[RUNNER_FLOOR_STICKY] pos=%s state=%s peak=%.10f "
+                                "peak_src=%s peak_age=%.0fs grace=%.0fs exec_src=%s",
+                                position_id, _m3_state, _m3_res["peak_price"],
+                                _m3_res["peak_source"], _m3_res["peak_age_sec"] or 0.0,
+                                _m3_res["grace_sec"], _m3_res["exec_source"] or "n/a")
+                    except Exception as _m3_err:
+                        log.debug("mode3 peak continuity unavailable pos=%s: %s",
+                                  position_id, _m3_err)
+                    _conn.execute(
+                        "UPDATE paper_positions SET runner_floor_state=?, "
+                        "runner_peak_trust_source=? WHERE id=?",
+                        (_m3_state, _m3_reason[:200], position_id),
+                    )
+                    _conn.commit()
+                    # A protective sticky result must continue through the same
+                    # floor calculation/exit path as a live tape peak.
+                    if _m3_res.get("floor_is_protective") and float(_m3_res.get("peak_price") or 0.0) > 0:
+                        peak_price = float(_m3_res["peak_price"])
+                        _pl_src = str(_m3_res.get("peak_source") or "mode3_sticky_peak")
+        except Exception:
+            pass
+        if peak_price <= 0:
+            return None
 
     peak_pct = ((peak_price - entry_price) / entry_price) * 100.0
     floor_pct = _runner_profit_lock_floor_pct(peak_pct)
@@ -4405,18 +5683,55 @@ def _runner_profit_lock_decision(position_id: int, entry_price: float, current_p
     floor_price = entry_price * (1.0 + floor_pct / 100.0)
     current_pct = ((current_price - entry_price) / entry_price) * 100.0
 
-    # Store telemetry as soon as runner protection becomes active.
+    # Persist the continuity floor state whenever a qualified peak arms.
     try:
-        with get_connection() as _conn:
+        from services import mode3_peak_continuity as _m3_arm
+        _m3_arm.arm_floor(int(position_id), float(floor_pct), float(floor_price))
+    except Exception as _m3_arm_err:
+        try:
+            log.warning("mode3 floor arm unavailable pos=%s: %s", position_id, _m3_arm_err)
+        except Exception:
+            pass
+
+    # DB_CONTENTION_SIGNOFF_20260808: arming the protected floor is
+    # execution-critical state, not telemetry. It previously used
+    # get_connection() (LOCK_RETRY_MAX_SEC = 30s) alongside 95 other call sites
+    # in this module, so an analytics, Council or archival writer holding the
+    # matrix DB could stall floor arming for up to half a minute -- during
+    # which the position is unprotected and ordinary stop/max-hold logic owns
+    # it. With 6,274 DB_LOCK events in the log scan this is not hypothetical.
+    #
+    # Bounded to CRITICAL_LOCK_RETRY_MAX_SEC (2s) and, critically, a failure is
+    # now SURFACED rather than swallowed: a floor that silently failed to arm
+    # is indistinguishable from a floor that was never qualified, which is the
+    # exact ambiguity that made the 2026-08-07/08 runner failure so hard to
+    # localise.
+    try:
+        from core.schema import get_critical_connection, record_critical_write_failure
+        with get_critical_connection() as _conn:
             _runner_profit_lock_columns(_conn)
             _conn.execute(
                 "UPDATE paper_positions SET runner_protected=1, runner_peak_pct=?, "
-                "runner_lock_floor_pct=?, runner_lock_price=? WHERE id=?",
-                (peak_pct, floor_pct, floor_price, position_id),
+                "runner_lock_floor_pct=?, runner_lock_price=?, runner_peak_trust_source=?, "
+                "runner_floor_state=CASE WHEN ? THEN 'ARMED_TRUSTED' ELSE runner_floor_state END WHERE id=?",
+                (peak_pct, floor_pct, floor_price, str(_pl_src or ""), 1, position_id),
             )
             _conn.commit()
-    except Exception:
-        pass
+        log.info(
+            "[RUNNER_FLOOR_ARMED] pos=%s peak=%.1f%% floor=%.1f%% src=%s",
+            position_id, peak_pct, floor_pct, _pl_src or "unknown",
+        )
+    except Exception as _floor_exc:
+        log.error(
+            "[RUNNER_FLOOR_ARM_FAILED] pos=%s peak=%.1f%% floor=%.1f%% err=%s: %s "
+            "-- position is UNPROTECTED this cycle",
+            position_id, peak_pct, floor_pct, type(_floor_exc).__name__, _floor_exc,
+        )
+        try:
+            from core.schema import record_critical_write_failure as _rcwf
+            _rcwf(f"runner_floor_arm_pos_{position_id}", _floor_exc)
+        except Exception:
+            pass
 
     if current_pct > floor_pct:
         return None
@@ -4424,8 +5739,14 @@ def _runner_profit_lock_decision(position_id: int, entry_price: float, current_p
     # If the engine only wakes after the floor was crossed, fill at the floor
     # in PAPER research mode. This models a protective stop that should have
     # fired instead of waiting for max-hold. Real-live remains not signed off.
-    assume_stop_fill = str(get_config_value("PAPER_RUNNER_LOCK_ASSUME_STOP_FILL", "1")).strip().lower() not in ("0", "false", "off", "no")
+    # Default to the mark actually observed by the evaluator. A modelled floor
+    # fill can still be enabled for research, but is explicitly tagged.
+    assume_stop_fill = str(get_config_value("PAPER_RUNNER_LOCK_ASSUME_STOP_FILL", "0")).strip().lower() not in ("0", "false", "off", "no")
     exit_price = max(current_price, floor_price) if assume_stop_fill else current_price
+    fill_model = (
+        "MODELLED_FLOOR" if assume_stop_fill and floor_price > current_price
+        else ("EXECUTABLE_MARK" if current_price_executable else "OBSERVED_MARK")
+    )
     exit_pct = ((exit_price - entry_price) / entry_price) * 100.0
     gap_pct = max(0.0, peak_pct - exit_pct)
     return {
@@ -4434,7 +5755,9 @@ def _runner_profit_lock_decision(position_id: int, entry_price: float, current_p
         "floor_pct": floor_pct,
         "exit_pct": exit_pct,
         "gap_pct": gap_pct,
-        "reason": f"RUNNER_PROFIT_LOCK_peak_{peak_pct:.1f}pct_floor_{floor_pct:.1f}pct_exit_{exit_pct:.1f}pct",
+        "fill_model": fill_model,
+        "peak_source": str(_pl_src or ""),
+        "reason": f"RUNNER_PROFIT_LOCK_peak_{peak_pct:.1f}pct_floor_{floor_pct:.1f}pct_exit_{exit_pct:.1f}pct_fill_{fill_model}",
     }
 
 
@@ -4444,12 +5767,15 @@ def _runner_profit_lock_apply_exit_quality(position_id: int, decision: dict) -> 
             _runner_profit_lock_columns(_conn)
             _conn.execute(
                 "UPDATE paper_positions SET runner_protected=1, runner_peak_pct=?, "
-                "runner_lock_floor_pct=?, exit_gap_from_peak_pct=?, exit_quality_tag=? WHERE id=?",
+                "runner_lock_floor_pct=?, exit_gap_from_peak_pct=?, exit_quality_tag=?, "
+                "runner_exit_fill_model=?, runner_peak_trust_source=? WHERE id=?",
                 (
                     float(decision.get("peak_pct") or 0.0),
                     float(decision.get("floor_pct") or 0.0),
                     float(decision.get("gap_pct") or 0.0),
                     "RUNNER_PROFIT_LOCK",
+                    str(decision.get("fill_model") or "UNKNOWN"),
+                    str(decision.get("peak_source") or ""),
                     position_id,
                 ),
             )
@@ -4468,27 +5794,599 @@ def _runner_profit_lock_apply_exit_quality(position_id: int, decision: dict) -> 
 # ACTUALLY acted on, with its source. That is the only defensible basis for a
 # trailing stop: you cannot trail from a price you never saw.
 
-def _trusted_peak_from_tape(position_id, entry_price):
-    """(price, pct, source, ts) of the highest mark the evaluator observed."""
+def _runner_peak_source_is_suspect(source: str) -> bool:
+    """Fail closed for sources that cannot independently establish an extreme peak."""
+    # EDGE_RESTORE_20260727: July 27 applied NO source exclusion. Defaulting this
+    # list to a populated value silently deleted the entire runner peak authority
+    # whenever marks arrived via intel-mtm / mtm-snapshot (the common case for a
+    # fresh pump.fun mint), collapsing every runner to current_evaluator_mark.
+    # Empty default restores July 27. Operators may still opt in via system_config.
+    raw = str(get_config_value("TRUSTED_PEAK_EXCLUDE_SOURCES", "") or "")
+    tokens = tuple(x.strip().lower() for x in raw.split(",") if x.strip())
+    src = str(source or "").strip().lower()
+    return bool(src and any(tok in src for tok in tokens))
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXECUTABLE QUOTE READER — PRICE_TRUTH_SIGNOFF_20260809 (blockers 1, 4, 6)
+#
+# peak_executable_quotes is OWNED by the price-truth database and written by
+# services/price_truth_mesh.py through peak_truth.record_executable_quote(),
+# which is the only path that validates raw_amount / quote_out_raw /
+# min_out_raw / context_slot / route and assigns integrity_status. This reader
+# consumes that contract instead of rebuilding a weaker duplicate of it.
+#
+# The table is NOT duplicated into the matrix database. Two copies of the same
+# evidence in two databases is how the original defect stayed invisible.
+# ─────────────────────────────────────────────────────────────────────────────
+_EXEC_QUOTE_DIAG_LOCK = threading.Lock()
+_EXEC_QUOTE_DIAG_AT: dict = {}
+_EXEC_QUOTE_DIAG_INTERVAL_SEC = 60.0
+
+
+def _exec_quote_diag(key: str, msg: str, *args) -> None:
+    """Rate-limited explicit failure telemetry.
+
+    A missing table, wrong database, corrupt query or schema mismatch must be
+    visible. It must never again degrade silently to `_exec_obs = None`.
+    """
     try:
-        excl = str(get_config_value("TRUSTED_PEAK_EXCLUDE_SOURCES", "") or "")
-        bad = tuple(s.strip() for s in excl.split(",") if s.strip())
+        now = time.time()
+        with _EXEC_QUOTE_DIAG_LOCK:
+            last = float(_EXEC_QUOTE_DIAG_AT.get(key) or 0.0)
+            if now - last < _EXEC_QUOTE_DIAG_INTERVAL_SEC:
+                return
+            _EXEC_QUOTE_DIAG_AT[key] = now
+        log.error("[EXEC_QUOTE_UNAVAILABLE] " + msg, *args)
+    except Exception:
+        pass
+
+
+def _price_truth_connection():
+    """Connection to the database that OWNS peak_executable_quotes."""
+    from services.price_truth_schema import connect as _pt_connect
+    return _pt_connect()
+
+
+def _read_executable_quotes(position_id, mint_address=None) -> list:
+    """Return every currently-valid executable observation for a position.
+
+    Returns a LIST, not a single row: the adjudicator selects by freshness and
+    evidence quality (blocker 6), never by query order. Router and direct-pool
+    witnesses are both returned so they can cross-confirm each other.
+
+    Only integrity_status='VALID' rows are returned. A row that
+    peak_truth.record_executable_quote() marked DIAGNOSTIC_ONLY represents a
+    quote it deliberately refused, and must never arm a live floor (blocker 4).
+    """
+    out = []
+    try:
+        _conn = _price_truth_connection()
+    except Exception as exc:
+        _exec_quote_diag("connect", "price-truth DB unreachable: %s: %s",
+                         type(exc).__name__, exc)
+        return out
+    try:
+        try:
+            rows = _conn.execute(
+                "SELECT effective_price_usd, sellable, quote_ts, integrity_status, "
+                "       raw_amount, quote_out_raw, min_out_raw, context_slot, "
+                "       route, price_impact_pct, provider_identity, mint_address "
+                "FROM peak_executable_quotes "
+                "WHERE position_id=? AND integrity_status='VALID' "
+                "ORDER BY quote_ts DESC LIMIT 12",
+                (int(position_id),)).fetchall()
+        except Exception as exc:
+            _exec_quote_diag(
+                "query",
+                "peak_executable_quotes read failed pos=%s %s: %s "
+                "(check price-truth DB migration)",
+                position_id, type(exc).__name__, exc)
+            return out
+
+        _now = time.time()
+        for r in rows or []:
+            try:
+                _price = float(r[0] or 0.0)
+                if _price <= 0:
+                    continue
+                # A quote for a different mint is never evidence about this one.
+                if mint_address and r[11] and str(r[11]) != str(mint_address):
+                    continue
+                _provider = str(r[10] or "") or str(r[8] or "") or "jupiter_executable"
+                out.append({
+                    "source": _provider,
+                    "price": _price,
+                    "sellable": bool(r[1]),
+                    "age_sec": max(0.0, _now - float(r[2] or 0.0)),
+                    "integrity_status": str(r[3] or ""),
+                    "raw_amount": r[4],
+                    "quote_out_raw": r[5],
+                    "min_out_raw": r[6],
+                    "context_slot": r[7],
+                    "route": r[8],
+                    "price_impact_pct": r[9],
+                })
+            except Exception:
+                continue
+        if not out and rows:
+            _exec_quote_diag("empty",
+                             "pos=%s had %d quote rows but none usable",
+                             position_id, len(rows))
+        return out
+    finally:
+        try:
+            _conn.close()
+        except Exception:
+            pass
+
+def _persist_mode3_qualified_peak(position_id, mint_address, entry_price,
+                                  peak_price, peak_source, peak_ts=None,
+                                  authority_class=None, evidence_family=None):
+    """Persist only a peak already confirmed by mark-tape authority.
+
+    PRICE_TRUTH_SIGNOFF_20260809 (blocker 2): the return value used to be
+    discarded at every call site. record_qualified_peak() refuses silently when
+    the source is unqualified, so a rejected peak looked identical to a stored
+    one and no floor ever armed. Every refusal is now logged with its reason.
+    """
+    try:
+        from services import mode3_peak_continuity as _m3
+        _res = _m3.record_qualified_peak(
+            int(position_id), str(mint_address or ""), float(entry_price or 0.0),
+            float(peak_price or 0.0), str(peak_source or ""),
+            now=float(peak_ts or time.time()), anti_outlier_ok=True,
+            authority_class=authority_class, evidence_family=evidence_family,
+        )
+        if not bool((_res or {}).get("accepted")):
+            log.warning(
+                "[MODE3_PEAK_NOT_ACCEPTED] pos=%s source=%s class=%s family=%s "
+                "peak=%.10g reason=%s",
+                position_id, str(peak_source)[:40], str(authority_class or "")[:40],
+                str(evidence_family or "")[:40], float(peak_price or 0.0),
+                str((_res or {}).get("reason"))[:120])
+        return _res
+    except Exception as exc:
+        try:
+            log.warning("[MODE3_PEAK_PERSIST_FAIL] pos=%s source=%s error=%s",
+                        position_id, peak_source, exc)
+        except Exception:
+            pass
+        return {"accepted": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+
+def _EXTERNAL_CORROBORATION_ENABLED() -> bool:
+    """Enable external price corroboration without making it execution-critical."""
+    try:
+        return str(get_config_value("EXTERNAL_PEAK_CORROBORATION_ENABLED", "1")
+                   ).strip().lower() in ("1", "true", "on", "yes")
+    except Exception:
+        return True
+
+
+def _trusted_peak_from_tape(position_id, entry_price):
+    """Return only a trusted sub-runner peak or a corroborated runner peak.
+
+    Legacy flattened rows remain diagnostic and cannot establish runner
+    authority. If no qualifying row exists, callers must not fall back to an
+    unfiltered maximum.
+
+    The durable answer is memoised only while this process has seen no new
+    unique mark_tape observation for the position. A new Layer-C quote bumps
+    _MARK_TAPE_VERSION and invalidates immediately; the short TTL also catches
+    marks written by another process.
+    """
+    try:
+        _pid = int(position_id)
+        _version = int(_MARK_TAPE_VERSION.get(_pid, 0))
+        _cached = _TRUSTED_PEAK_CACHE.get(_pid)
+        if _cached is not None:
+            _cv, _cts, _cres = _cached
+            if _cv == _version and (time.time() - float(_cts)) <= _TRUSTED_PEAK_CACHE_MAX_AGE_SEC:
+                return _cres
+        _position_mint = ""
+        _position_mode = "paper"
         with get_connection() as _c:
-            if bad:
-                q = ("SELECT price, pct, source, ts FROM mark_tape WHERE position_id=? "
-                     "AND source NOT IN (%s) ORDER BY price DESC LIMIT 1"
-                     % ",".join("?" * len(bad)))
-                r = _c.execute(q, (position_id, *bad)).fetchone()
+            try:
+                _pr = _c.execute(
+                    "SELECT COALESCE(mint_address,''), COALESCE(mode,'paper') "
+                    "FROM paper_positions WHERE id=?",
+                    (int(position_id),),
+                ).fetchone()
+                if _pr:
+                    _position_mint = str(_pr[0] or "")
+                    _position_mode = str(_pr[1] or "paper").strip().lower()
+            except Exception:
+                pass
+            _cols = {r[1] for r in _c.execute("PRAGMA table_info(mark_tape)").fetchall()}
+            _has_truth = all(x in _cols for x in (
+                "raw_source", "integrity_state", "qualified_source"))
+            if not _has_truth:
+                return None, None, None, None
+            rows = _c.execute(
+                "SELECT price,pct,qualified_source,ts,raw_source,integrity_state,"
+                "COALESCE(quarantine_reason,''),source_subtype,precision_class,"
+                "COALESCE(upstream_ts_ms,0),COALESCE(upstream_tick_id,'') FROM mark_tape "
+                "WHERE position_id=? AND COALESCE(price,0)>0 ORDER BY ts ASC LIMIT 512",
+                (position_id,),
+            ).fetchall()
+        if not rows:
+            _res = (None, None, None, None)
+            _TRUSTED_PEAK_CACHE[_pid] = (_version, time.time(), _res)
+            return _res
+
+        _marks = []
+        _trusted_below = []
+        for r in rows:
+            px = float(r[0])
+            pct = float(r[1]) if r[1] is not None else (
+                ((px - entry_price) / entry_price * 100.0) if entry_price > 0 else 0.0)
+            src = str(r[2] or "")
+            ts = float(r[3] or 0.0)
+            raw = str(r[4] or "")
+            state = str(r[5] or "LEGACY_PROVENANCE_UNAVAILABLE")
+            quarantined = state.startswith("QUARANTINED_")
+            _marks.append({"price": px, "pct": pct, "ts": ts,
+                           "raw_source": raw, "quarantined": quarantined,
+                           "integrity_state": state, "source": src,
+                           "qualified_source": src,
+                           "source_subtype": str(r[7] or "unknown"),
+                           "precision_class": str(r[8] or "unknown"),
+                           "upstream_ts_ms": int(r[9] or 0),
+                           "upstream_tick_id": str(r[10] or "")})
+            if state == "TRUSTED" and pct < 20.0:
+                _trusted_below.append((px, pct, src, ts))
+
+        # PEAK_AUTHORITY_P3: confirm_runner() drops every mark failing
+        # is_trusted_subtype(), which excludes dexscreener/jupiter/birdeye and
+        # made pool quotes permanently unable to confirm a runner. The pool-aware
+        # contract accepts two COMPATIBLE same-family observations, and still
+        # rejects single spikes, precision/subtype transitions and
+        # fallback/unknown/market-cap families.
+        _pa = None
+        _confirmed = {"confirmed": False}
+        try:
+            from services import peak_authority as _pa
+            _pa_marks = []
+            for _m in _marks:
+                _mm = dict(_m)
+                _mm["position_id"] = position_id
+                _pa_marks.append(_mm)
+            # PEAK_TRUTH_PHASE2: use three-layer authority only after explicit
+            # paper-validation enablement. With the flag off, preserve the
+            # existing all-mode path byte-for-byte in behaviour.
+            _three_layer = None
+            try:
+                with get_connection() as _tc:
+                    _three_layer = _pa.confirm_runner_three_layer(
+                        _tc,
+                        position_id=int(position_id),
+                        mint_address=_position_mint,
+                        entry_price=float(entry_price or 0.0),
+                        threshold_pct=20.0,
+                    )
+            except Exception:
+                _three_layer = None
+
+            if _three_layer and _three_layer.get("reason") != "three_layer_authority_disabled":
+                _conf_v2 = _three_layer
             else:
-                r = _c.execute("SELECT price, pct, source, ts FROM mark_tape "
-                               "WHERE position_id=? ORDER BY price DESC LIMIT 1",
-                               (position_id,)).fetchone()
-        if not r or not r[0]:
-            return None, None, None, None
-        px = float(r[0])
-        pct = float(r[1]) if r[1] is not None else (
-            ((px - entry_price) / entry_price * 100.0) if entry_price > 0 else 0.0)
-        return px, pct, str(r[2] or ""), float(r[3] or 0.0)
+                _conf_v2 = _pa.confirm_runner_pool_aware(
+                    marks=_pa_marks, entry_price=float(entry_price or 0.0),
+                    threshold_pct=20.0, min_interval_sec=5.0,
+                    agreement_tolerance=0.12,
+                )
+            # PRICE_TRUTH_SIGNOFF_20260808: independent corroboration lane.
+            # Hot path is CACHE-ONLY: network refresh is scheduled asynchronously.
+            # External evidence never launders the original native provenance.
+            if not bool(_conf_v2.get("confirmed")) and _EXTERNAL_CORROBORATION_ENABLED():
+                try:
+                    # Never relabel the newest router_executable row as
+                    # `native_curve`: that would let Jupiter anchor itself.
+                    # Select only genuinely non-router native/pool evidence.
+                    _latest_mark = {}
+                    for _cand_mark in reversed(_marks):
+                        _st = str(_cand_mark.get("source_subtype") or "").lower()
+                        _raw = str(_cand_mark.get("raw_source") or "").lower()
+                        if (_st in ("curve_reserve", "pool_quote")
+                                and not _cand_mark.get("quarantined")
+                                and "jupiter" not in _raw
+                                and "metis" not in _raw):
+                            _latest_mark = _cand_mark
+                            break
+                    _ext_obs = []
+                    try:
+                        from services.market_source_adapters import (
+                            cached_external_observations as _cached_ext,
+                            schedule_external_refresh as _schedule_ext,
+                        )
+                        _ext_obs = _cached_ext(_position_mint)
+                        _schedule_ext(_position_mint)
+                    except Exception:
+                        _ext_obs = []
+
+                    # PRICE_TRUTH_SIGNOFF_20260809 (blocker 1):
+                    # peak_executable_quotes lives in the PRICE-TRUTH database,
+                    # written by services/price_truth_mesh.py. This read used
+                    # get_connection() (the MATRIX database), where the table
+                    # does not exist and is never created, so every read raised
+                    # OperationalError into a bare `except` and _exec_obs was
+                    # permanently None. Executable authority could therefore
+                    # never arm a live floor. Read from the owning database.
+                    _exec_obs = _read_executable_quotes(position_id, _position_mint)
+
+                    if _ext_obs or _exec_obs:
+                        _ext = _pa.confirm_runner_externally_corroborated(
+                            mint_address=_position_mint,
+                            entry_price=float(entry_price or 0.0),
+                            native_mark={
+                                "price": _latest_mark.get("price"),
+                                "age_sec": max(0.0, time.time() - float(
+                                    _latest_mark.get("ts") or time.time())),
+                                "degraded": str(
+                                    _latest_mark.get("source_subtype") or ""
+                                ) not in ("curve_reserve", "pool_quote"),
+                            } if _latest_mark else None,
+                            external_observations=_ext_obs,
+                            executable_quote=_exec_obs,
+                            is_live=(_position_mode in {"live", "real", "funded"}),
+                            threshold_pct=20.0,
+                        )
+                        if bool(_ext.get("confirmed")):
+                            log.warning(
+                                "[EXTERNAL_CORROBORATED_PEAK] pos=%s class=%s "
+                                "peak=%.10g pct=%.1f%% families=%s reason=%s",
+                                position_id, _ext.get("authority_class"),
+                                _ext.get("confirmed_peak_price") or 0.0,
+                                _ext.get("confirmed_peak_pct") or 0.0,
+                                (_ext.get("evidence") or {}).get("corroborating_families"),
+                                str(_ext.get("reason"))[:120])
+                            _conf_v2 = _ext
+                        elif (_ext.get("evidence") or {}).get("native_is_outlier"):
+                            log.warning(
+                                "[NATIVE_PEAK_OUTLIER_REJECTED] pos=%s %s",
+                                position_id, str(_ext.get("reason"))[:160])
+                except Exception as _ext_exc:
+                    log.debug("external corroboration unavailable pos=%s: %s",
+                              position_id, _ext_exc)
+
+            # PRICE_FAMILY_ADJUDICATION_GATE: no runner authority may be persisted
+            # until a minimum-size real fill has established the executable price
+            # family and the operator has explicitly pinned it. Static agreement
+            # between two representations is not enough. Paper diagnostics continue.
+            _family_proven = str(get_config_value("PRICE_FAMILY_EXECUTABLE_CONFIRMED", "0")).strip() == "1"
+            _exec_family = str(get_config_value("EXECUTABLE_PRICE_FAMILY", "")).strip().lower()
+            # The three-layer authority emits quote_family/witness_family,
+            # whereas the legacy pair path emits subtype. Normalise both
+            # contracts before the family adjudication gate; otherwise every
+            # valid three-layer confirmation arrives with an empty family and
+            # is vetoed on receipt.
+            _ev = dict(_conf_v2.get("evidence") or {})
+            # PRICE_TRUTH_SIGNOFF_20260809 (blocker 2): the external lane used
+            # to hardcode subtype="rpc_direct" purely to satisfy this gate. It
+            # now declares its true family, so the gate must recognise the real
+            # executable families rather than a laundered native label.
+            _evidence_family = str(
+                _ev.get("evidence_family")
+                or _ev.get("subtype")
+                or _ev.get("quote_family")
+                or _ev.get("witness_family")
+                or ""
+            ).strip().lower()
+            _approved_families = {"pool_quote", "curve_reserve", "rpc_direct",
+                                  "router_executable", "pool_executable"}
+            _live_position = _position_mode in {"live", "real", "funded"}
+            # An executable family is interchangeable with the pinned family
+            # when both are executable-grade; requiring exact string equality
+            # would veto a valid direct-pool witness merely because the pin
+            # names the router.
+            _executable_equiv = {"router_executable", "pool_executable"}
+            _family_mismatch = (
+                not _family_proven
+                or _exec_family not in _approved_families
+                or (_evidence_family != _exec_family
+                    and not (_evidence_family in _executable_equiv
+                             and _exec_family in _executable_equiv))
+            )
+            # Live money remains fail-closed until a real fill adjudicates the
+            # executable family.  Paper harvesting may use a corroborated,
+            # non-quarantined approved family so runner exits can be measured
+            # instead of every genuine curve move decaying into MAX_HOLD.
+            _paper_family_ok = (
+                not _live_position
+                and _evidence_family in _approved_families
+                and bool(_conf_v2.get("confirmed"))
+            )
+            if bool(_conf_v2.get("confirmed")) and _family_mismatch and not _paper_family_ok:
+                _conf_v2 = dict(_conf_v2)
+                _conf_v2.update(
+                    confirmed=False,
+                    reason="price_family_not_adjudicated_or_mismatched",
+                    runner_integrity="UNCONFIRMED",
+                    confirmation_source=None,
+                    confirmed_peak_price=None,
+                    confirmed_peak_pct=None,
+                )
+            _confirmed = {
+                "confirmed": bool(_conf_v2.get("confirmed")),
+                "reason": _conf_v2.get("reason"),
+                "trusted_peak": _conf_v2.get("confirmed_peak_price"),
+                "confirmation_source": _conf_v2.get("confirmation_source"),
+                "runner_integrity": _conf_v2.get("runner_integrity"),
+                "evidence": _conf_v2.get("evidence"),
+                "confirmation_ts": _conf_v2.get("confirmation_ts"),
+            }
+            if not bool(_conf_v2.get("confirmed")):
+                try:
+                    _diag = dict(_conf_v2.get("evidence") or {})
+                    _diag["confirmation_reason"] = str(_conf_v2.get("reason") or "unconfirmed")
+                    _diag["executable_family_pinned"] = bool(_family_proven)
+                    _diag["configured_executable_family"] = _exec_family
+                    _diag["evidence_family"] = _evidence_family
+                    with get_connection() as _dc:
+                        _runner_profit_lock_columns(_dc)
+                        _dc.execute(
+                            "UPDATE paper_positions SET "
+                            "runner_integrity_status=COALESCE(NULLIF(runner_integrity_status,''),'RUNNER_UNCONFIRMED'), "
+                            "runner_confirmation_evidence=? WHERE id=?",
+                            (json.dumps(_diag, sort_keys=True), position_id),
+                        )
+                        _dc.commit()
+                except Exception:
+                    pass
+            # Persist EXPLICIT confirmation. No consumer may infer a confirmed
+            # runner from a percentage; this is the only record that proves it.
+            try:
+                with get_connection() as _pc:
+                    _pa.ensure_runner_confirmation_columns(_pc)
+                    _pa.persist_runner_confirmation(
+                        _pc, int(position_id),
+                        confirmed=bool(_conf_v2.get("confirmed")),
+                        integrity_status=str(_conf_v2.get("runner_integrity")
+                                             or _pa.RUNNER_UNCONFIRMED),
+                        confirmation_source=str(
+                            _conf_v2.get("confirmation_source") or ""),
+                        evidence=_conf_v2.get("evidence") or {},
+                        confirmed_at=_conf_v2.get("confirmation_ts"),
+                    )
+                    _pc.commit()
+            except Exception:
+                pass
+        except Exception:
+            _pa = None
+            try:
+                from services.mark_provenance import confirm_runner
+                _confirmed = confirm_runner(
+                    marks=_marks, threshold_pct=20.0,
+                    entry_price=float(entry_price or 0.0),
+                    min_interval_sec=5.0, agreement_tolerance=0.12,
+                )
+            except Exception:
+                _confirmed = {"confirmed": False}
+
+        # A confirmed runner peak comes from the corroborated pair, never from
+        # the highest single observation.
+        if _pa is not None and bool(_confirmed.get("confirmed")):
+            _cpx = _confirmed.get("trusted_peak")
+            try:
+                _cpx = float(_cpx or 0.0)
+            except (TypeError, ValueError):
+                _cpx = 0.0
+            if _cpx > 0:
+                _cpct = ((_cpx - entry_price) / entry_price * 100.0
+                         if entry_price > 0 else 0.0)
+                _csrc = str(_confirmed.get("confirmation_source")
+                            or "confirmed_runner")
+                _cts = float(_confirmed.get("confirmation_ts") or time.time())
+                _persist_mode3_qualified_peak(
+                    position_id, _position_mint, entry_price, _cpx, _csrc, _cts,
+                    authority_class=_confirmed.get("confirmation_source"),
+                    evidence_family=(_confirmed.get("evidence") or {}).get(
+                        "evidence_family"))
+                _res = (_cpx, _cpct, _csrc, _cts)
+                _TRUSTED_PEAK_CACHE[_pid] = (_version, time.time(), _res)
+                return _res
+
+        if bool(_confirmed.get("confirmed")):
+            # Preserve runner progression rather than freezing authority at the
+            # first confirming pair. Every high-water mark must still have a
+            # corroborating trusted neighbour within the agreement band.
+            _eligible = []
+            # Runner progression uses the same corroboration contract as
+            # initial confirmation. Pool sequences are allowed to corroborate;
+            # fallback/unknown/mcap and representation mismatches are not.
+            try:
+                from services.mark_provenance import (
+                    CORROBORATABLE_SUBTYPES, NO_SELF_CONFIRM_SUBTYPES,
+                )
+            except Exception:
+                # SIGNOFF_RUNNER_SUBTYPE_POLICY_20260812: kept identical to the canonical policy in
+                # services/mark_provenance.py. This literal is only reached if
+                # that import fails; a stale copy here would silently re-impose
+                # the runner veto the canonical fix removes.
+                CORROBORATABLE_SUBTYPES = {"pool_quote", "router_executable",
+                                           "pool_executable"}
+                NO_SELF_CONFIRM_SUBTYPES = {"fallback_quote", "market_cap_derived",
+                                            "unknown", "curve_reserve"}
+            for _i, _a in enumerate(_marks):
+                if _a.get("quarantined") or _a.get("pct", 0.0) < 20.0:
+                    continue
+                _as = str(_a.get("source_subtype") or "unknown")
+                if _as in NO_SELF_CONFIRM_SUBTYPES or _as not in CORROBORATABLE_SUBTYPES:
+                    continue
+                for _j, _b in enumerate(_marks):
+                    if _i == _j or _b.get("quarantined") or _b.get("pct", 0.0) < 20.0:
+                        continue
+                    if str(_b.get("source_subtype") or "unknown") != _as:
+                        continue
+                    if str(_b.get("precision_class") or "unknown") != str(_a.get("precision_class") or "unknown"):
+                        continue
+                    _af = str(_a.get("source") or "").split(":", 1)[0]
+                    _bf = str(_b.get("source") or "").split(":", 1)[0]
+                    if _af != _bf:
+                        continue
+                    _ai = str(_a.get("upstream_tick_id") or "")
+                    _bi = str(_b.get("upstream_tick_id") or "")
+                    if not _ai or not _bi or _ai == _bi:
+                        continue
+                    _at = int(_a.get("upstream_ts_ms") or 0)
+                    _bt = int(_b.get("upstream_ts_ms") or 0)
+                    if _at <= 0 or _bt <= 0 or abs(_bt - _at) < 5000:
+                        continue
+                    _hi = max(float(_a["price"]), float(_b["price"]))
+                    if _hi > 0 and abs(float(_a["price"]) - float(_b["price"])) / _hi <= 0.12:
+                        _eligible.append(_a)
+                        break
+            if _eligible:
+                _best = max(_eligible, key=lambda m: float(m.get("price") or 0.0))
+                _cp = float(_best.get("price") or 0.0)
+                _pct = ((_cp - entry_price) / entry_price * 100.0) if entry_price > 0 else 0.0
+                _source = str(_confirmed.get("confirmation_source") or "confirmed_runner")
+                _confirmed_at = float(_confirmed.get("confirmation_ts") or _best.get("ts") or time.time())
+                _evidence = json.dumps({
+                    "mark_1": _confirmed.get("promotion_mark_1"),
+                    "mark_2": _confirmed.get("promotion_mark_2"),
+                    "ts_1": _confirmed.get("promotion_ts_1"),
+                    "ts_2": _confirmed.get("promotion_ts_2"),
+                }, sort_keys=True)
+                try:
+                    with get_connection() as _pc:
+                        _runner_profit_lock_columns(_pc)
+                        _pc.execute(
+                            "UPDATE paper_positions SET runner_confirmed=1, "
+                            "runner_integrity_status='RUNNER_CONFIRMED', "
+                            "runner_confirmation_source=?, runner_confirmed_at=?, "
+                            "runner_confirmation_evidence=? WHERE id=?",
+                            (_source, _confirmed_at, _evidence, position_id),
+                        )
+                        # Persist explicit confirmation on the corroborating rows.
+                        _pc.execute(
+                            "UPDATE mark_tape SET integrity_state='RUNNER_CONFIRMED' "
+                            "WHERE position_id=? AND ts IN (?, ?)",
+                            (position_id, _confirmed.get("promotion_ts_1"),
+                             _confirmed.get("promotion_ts_2")),
+                        )
+                except Exception:
+                    pass
+                _best_source = str(_best.get("source") or _source)
+                _best_ts = float(_best.get("ts") or time.time())
+                _persist_mode3_qualified_peak(
+                    position_id, _position_mint, entry_price, _cp,
+                    _best_source, _best_ts,
+                    authority_class=_source,
+                    evidence_family=str(_best.get("source_subtype") or ""))
+                _res = (_cp, _pct, _best_source, _best_ts)
+                _TRUSTED_PEAK_CACHE[_pid] = (_version, time.time(), _res)
+                return _res
+
+        if _trusted_below:
+            _res = max(_trusted_below, key=lambda x: x[0])
+            _TRUSTED_PEAK_CACHE[_pid] = (_version, time.time(), _res)
+            return _res
+        _res = (None, None, None, None)
+        _TRUSTED_PEAK_CACHE[_pid] = (_version, time.time(), _res)
+        return _res
     except Exception:
         return None, None, None, None
 
@@ -4540,6 +6438,246 @@ def _resolve_latched_trail(position_id, trusted_peak_pct,
     return trail
 # ── /TRUSTED PEAK + LATCH ────────────────────────────────────────────────────
 
+def _fresh_runner_floor_state(position_id: int) -> dict:
+    """Read the durable qualified runner floor using the bounded critical DB path.
+
+    This is execution state, not analytics. It lets the evaluator preserve an
+    already-armed floor even when the peak-establishing source disappears from
+    the current cycle. It never creates or raises a floor.
+    """
+    out = {"protected": False, "floor_pct": 0.0, "floor_price": 0.0,
+           "peak_pct": 0.0, "state": ""}
+    try:
+        from core.schema import get_critical_connection
+        with get_critical_connection() as _c:
+            r = _c.execute(
+                "SELECT COALESCE(runner_protected,0), COALESCE(runner_lock_floor_pct,0), "
+                "COALESCE(runner_lock_price,0), COALESCE(runner_peak_pct,0), "
+                "COALESCE(runner_floor_state,'') FROM paper_positions WHERE id=? LIMIT 1",
+                (int(position_id),),
+            ).fetchone()
+        if r:
+            out = {
+                "protected": bool(int(r[0] or 0)) or str(r[4] or '').startswith('ARMED'),
+                "floor_pct": float(r[1] or 0.0),
+                "floor_price": float(r[2] or 0.0),
+                "peak_pct": float(r[3] or 0.0),
+                "state": str(r[4] or ''),
+            }
+    except Exception:
+        pass
+    return out
+
+
+def _maybe_adjudicate_router_executable_family(position: dict, quote_result: dict) -> None:
+    """Pin router_executable after a REAL position proves an exact-size route.
+
+    This closes the previous bootstrap dead-end: live runner authority required
+    PRICE_FAMILY_EXECUTABLE_CONFIRMED=1, but no production path ever wrote that
+    key.  A reconciled REAL position has an exact token quantity; a fresh
+    Jupiter full-position liquidation quote with complete route evidence is the
+    direct empirical proof needed to establish the router executable family.
+    """
+    try:
+        if not _position_is_real(position):
+            return
+        if float(position.get("quantity") or 0.0) <= 0:
+            return
+        q = dict(quote_result or {})
+        if not q.get("can_execute_exit") or float(q.get("price") or 0.0) <= 0:
+            return
+        if str(q.get("provider_identity") or "").strip().lower() != "jupiter":
+            return
+        if not (str(q.get("raw_amount") or "").isdigit()
+                and str(q.get("quote_out_raw") or "").isdigit()
+                and str(q.get("min_out_raw") or "").isdigit()
+                and int(q.get("context_slot") or 0) > 0
+                and str(q.get("route_plan_json") or "").strip()):
+            return
+        if (str(get_config_value("PRICE_FAMILY_EXECUTABLE_CONFIRMED", "0")).strip() == "1"
+                and str(get_config_value("EXECUTABLE_PRICE_FAMILY", "")).strip().lower() == "router_executable"):
+            return
+        with get_connection() as c:
+            c.execute(
+                "INSERT INTO system_config(key,value) VALUES('PRICE_FAMILY_EXECUTABLE_CONFIRMED','1') "
+                "ON CONFLICT(key) DO UPDATE SET value='1'"
+            )
+            c.execute(
+                "INSERT INTO system_config(key,value) VALUES('EXECUTABLE_PRICE_FAMILY','router_executable') "
+                "ON CONFLICT(key) DO UPDATE SET value='router_executable'"
+            )
+            c.commit()
+        log.warning(
+            "[PRICE_FAMILY_ADJUDICATED] pos=%s family=router_executable "
+            "provider=jupiter slot=%s exact_size_route=1",
+            position.get("id"), q.get("context_slot"))
+    except Exception as exc:
+        log.warning("[PRICE_FAMILY_ADJUDICATION_FAILED] pos=%s %s",
+                    position.get("id"), type(exc).__name__)
+
+
+def _paper_no_coverage_failsafe(position: dict, candidate_price: float, warning: str) -> bool:
+    """Keep paper risk controls alive without pretending OBS is executable truth.
+
+    A missing/stale Layer-C quote must never manufacture an EXECUTABLE exit, but
+    it also must not trap a paper position forever.  HARD_STOP and MAX_HOLD may
+    close on the best available mark with an explicit NO_COVERAGE reason so the
+    lifecycle/edge ledgers can exclude that close from executable-performance
+    claims. REAL positions never use this research fallback.
+    """
+    if _position_is_real(position):
+        return False
+    try:
+        position_id = int(position.get("id") or 0)
+        entry = float(position.get("entry_price") or 0.0)
+        opened = float(position.get("opened_at") or 0.0)
+        px = float(candidate_price or position.get("last_price") or entry or 0.0)
+        if position_id <= 0 or entry <= 0 or px <= 0:
+            return False
+        hold_s = max(0.0, time.time() - opened)
+        max_hold_s = float(__import__("core.schema", fromlist=["effective_max_hold_seconds"]).effective_max_hold_seconds(position))
+        try:
+            hard_stop = min(abs(float(get_config_value("HARD_STOP_LOSS_PCT", 4.0))), 4.0)
+        except Exception:
+            hard_stop = 4.0
+        if not math.isfinite(hard_stop) or hard_stop <= 0:
+            hard_stop = 4.0
+        pnl = ((px - entry) / entry) * 100.0
+        reason = None
+        if pnl <= -hard_stop:
+            reason = f"NO_COVERAGE_HARD_STOP_{pnl:.1f}pct"
+        elif hold_s >= max_hold_s:
+            reason = f"NO_COVERAGE_MAX_HOLD_{hold_s:.0f}s"
+        if reason is None:
+            return False
+        try:
+            with get_connection() as _nc:
+                _nc_cols = {r["name"] for r in _nc.execute("PRAGMA table_info(paper_positions)").fetchall()}
+                _sets, _vals = [], []
+                for _col, _val in (("pnl_integrity_status", "NO_COVERAGE"),
+                                   ("pnl_integrity_reason", str(warning or "NO_EXECUTABLE_ROUTE")[:400]),
+                                   ("close_price_source", "NO_COVERAGE_BEST_AVAILABLE")):
+                    if _col in _nc_cols:
+                        _sets.append(f"{_col}=?"); _vals.append(_val)
+                if _sets:
+                    _vals.append(position_id)
+                    _nc.execute("UPDATE paper_positions SET " + ", ".join(_sets) + " WHERE id=?", tuple(_vals))
+                    _nc.commit()
+        except Exception:
+            pass
+        log.warning("[PAPER_NO_COVERAGE_EXIT] pos=%d price=%.12g pnl=%.2f hold=%.0fs reason=%s warning=%s",
+                    position_id, px, pnl, hold_s, reason, warning)
+        return bool(close_position_canonical(position_id, px, reason, closure_mode="normal"))
+    except Exception as exc:
+        log.warning("paper no-coverage failsafe failed pos=%s: %s", position.get("id"), exc)
+        return False
+
+
+def _paper_stagnation_from_mark_tape(position_id: int, *, window_sec: float = 180.0,
+                                     min_span_sec: float = 45.0,
+                                     range_threshold_pct: float = 0.50) -> dict:
+    """Return paper-only, read-only movement evidence from mark_tape.
+
+    The old stagnation path treated `price_change_last_60s == 0` as *missing*
+    and therefore as *moving*. In current runtime that made the 900s failsafe
+    the median lifecycle. A literal zero move and missing data are now distinct:
+    this helper only declares STAGNANT when multiple non-quarantined marks span
+    enough wall-clock time and their full price range stays below the threshold.
+    Missing/sparse evidence remains UNKNOWN and cannot itself force an exit.
+    """
+    try:
+        now_ts = time.time()
+        with get_connection() as _c:
+            _cols = {r["name"] for r in _c.execute("PRAGMA table_info(mark_tape)").fetchall()}
+            if not {"position_id", "ts", "price"}.issubset(_cols):
+                return {"state": "UNKNOWN", "reason": "mark_tape_schema"}
+            _where = "position_id=? AND ts>=? AND price>0"
+            _params = [int(position_id), now_ts - float(window_sec)]
+            if "integrity_state" in _cols:
+                _where += " AND COALESCE(integrity_state,'') NOT IN ('QUARANTINED','REJECTED','INVALID')"
+            _rows = _c.execute(
+                f"SELECT ts,price FROM mark_tape WHERE {_where} ORDER BY ts ASC",
+                tuple(_params),
+            ).fetchall()
+        if len(_rows) < 2:
+            return {"state": "UNKNOWN", "reason": "insufficient_marks", "marks": len(_rows)}
+        _times = [float(r["ts"] or 0.0) for r in _rows]
+        _prices = [float(r["price"] or 0.0) for r in _rows if float(r["price"] or 0.0) > 0]
+        if len(_prices) < 2:
+            return {"state": "UNKNOWN", "reason": "insufficient_prices", "marks": len(_prices)}
+        _span = max(_times) - min(_times)
+        if _span < float(min_span_sec):
+            return {"state": "UNKNOWN", "reason": "insufficient_span", "marks": len(_prices), "span_sec": _span}
+        _basis = _prices[0]
+        _range_pct = ((max(_prices) - min(_prices)) / _basis * 100.0) if _basis > 0 else 999.0
+        _endpoint_pct = ((_prices[-1] - _prices[0]) / _basis * 100.0) if _basis > 0 else 999.0
+        return {
+            "state": "STAGNANT" if _range_pct < float(range_threshold_pct) else "MOVING",
+            "marks": len(_prices), "span_sec": _span,
+            "range_pct": _range_pct, "endpoint_pct": _endpoint_pct,
+        }
+    except Exception as exc:
+        return {"state": "UNKNOWN", "reason": type(exc).__name__}
+
+
+# ── T2: VOLUME EXPANSION IS THREE-STATE, NOT BOOLEAN ────────────────────────
+# PACK_T2_UNKNOWN_IS_NOT_NEGATIVE_20260815
+#
+# DEFECT (source-proven): the winner carve-out read
+#     _vol_acc = float(position.get("volume_acceleration") or 1.0)
+# and tested `_vol_acc > 1.0`. `paper_positions` carries no volume_acceleration
+# column, so the read returned None on every position, `None or 1.0` produced
+# 1.0, and `1.0 > 1.0` is False. The carve-out that exists to protect a
+# genuinely winning position from the stagnation recycler has therefore never
+# fired once. Runtime evidence: TIME_CUT_STAGNANT_184s_pnl_13.47pct — a
+# position up 13.47% recycled as "stagnant".
+#
+# The repair is not to flip the default. A missing measurement is not evidence
+# of non-expansion, and inventing 1.0001 would be fabricating bullish evidence
+# just as surely as 1.0 fabricated bearish evidence. Absence gets its own state.
+#
+# INVARIANTS (paper-only; REAL never reaches this carve-out):
+#   UNKNOWN is not EXPANDING       — it cannot satisfy the winner carve-out
+#   UNKNOWN is not NOT_EXPANDING   — it cannot supply the evidence for a cut
+#   UNKNOWN has no effect on hard stop, runner floor, trailing or MAX_HOLD
+#   measured NOT_EXPANDING still permits the existing stagnation policy
+VOL_EXPANDING     = "EXPANDING"
+VOL_NOT_EXPANDING = "NOT_EXPANDING"
+VOL_UNKNOWN       = "VOLUME_NOT_MEASURED"
+
+#: acceleration ratio above which volume counts as expanding. Unchanged from
+#: the original `> 1.0` test; this is a rename, not a threshold change.
+VOL_EXPANSION_BOUNDARY = 1.0
+
+
+def _volume_expansion_state(position: dict) -> tuple:
+    """Return (state, value) for a position's volume acceleration.
+
+    Reads only fields the producer actually writes. Any absent, non-numeric or
+    non-finite reading is UNKNOWN — never coerced to a number that would then
+    be compared against the boundary. Returns the raw value alongside the state
+    so telemetry can distinguish "measured 0.98" from "never measured".
+    """
+    raw = None
+    for _field in ("volume_acceleration", "volume_accel", "vol_acceleration"):
+        try:
+            if _field in position and position.get(_field) is not None:
+                raw = position.get(_field)
+                break
+        except Exception:
+            continue
+    if raw is None:
+        return VOL_UNKNOWN, None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return VOL_UNKNOWN, None
+    if not math.isfinite(val) or val <= 0.0:
+        return VOL_UNKNOWN, None
+    return (VOL_EXPANDING if val > VOL_EXPANSION_BOUNDARY
+            else VOL_NOT_EXPANDING), val
+
+
 def evaluate_exit_for_position(position: dict) -> None:
     """
     Canonical live exit evaluator.
@@ -4553,6 +6691,14 @@ def evaluate_exit_for_position(position: dict) -> None:
       5. STOP_LOSS
       6. MAX_HOLD_TIME
     """
+    # REGRESSION_AUDIT_20260805: stamp true wall-clock cadence for this position so
+    # runner-gap diagnostics can report MEASURED elapsed time rather than the
+    # configured poll constant. Observability only; no decision consumes this.
+    try:
+        from services.exit_hotpath import note_eval as _eh_note_eval
+        _eh_note_eval(position.get("id"))
+    except Exception:
+        pass
     position_id  = int(position["id"])
     mint         = str(position["mint_address"] or "")
     token_name   = str(position["token_name"] or mint or "UNKNOWN")[:20]
@@ -4565,19 +6711,24 @@ def evaluate_exit_for_position(position: dict) -> None:
     if not mint or entry_price <= 0:
         return
 
-    # ── PRICE TRUTH ROUTER - single authoritative price read ────────────────
-    # Uses price_router.get_execution_price() which enforces:
-    #   - ts >= opened_at (no pre-entry MTM bleed)
-    #   - Intel DB first, MTM snapshot second, unscoped fallback
-    #   - NEVER DexScreener in execution mode
-    #   - can_execute_exit=False when price is stale (>120s)
+    # ── PRICE TRUTH ROUTER - executable economic truth only ───────────────
+    # REAL: request a fresh full-position Jupiter liquidation quote directly.
+    # PAPER/SIM: consume the asynchronously refreshed, VALID + sellable,
+    # exact-position Layer-C quote from sentinuity_price_truth.db.  Native
+    # curve/MTM/indexer observations are intentionally excluded here; they
+    # remain Layer A/D context and can never trigger an economic exit.
     _is_real_eval = _position_is_real(position)
     if _PRICE_ROUTER_AVAILABLE and _is_real_eval:
         _pr = _router_live_liquidation_price(
             mint, float(position.get("quantity") or 0.0), entry_price, opened_at
         )
+    elif _PRICE_ROUTER_AVAILABLE:
+        _pr = _router_cached_position_liquidation_price(
+            position_id, mint, float(position.get("quantity") or 0.0),
+            entry_price, opened_at,
+        )
     else:
-        _pr = _router_exec_price(mint, entry_price, opened_at) if _PRICE_ROUTER_AVAILABLE else None
+        _pr = None
 
     if _pr is None or _pr["price"] <= 0:
         # Router has no valid price - update last_price for DB continuity but
@@ -4601,6 +6752,9 @@ def evaluate_exit_for_position(position: dict) -> None:
             _log_cognition(token_name,
                 f"MTM coverage lost for {token_name}. No price available. "
                 f"Hold: {hold_s:.0f}s. Awaiting oracle recovery.")
+        if not _is_real_eval:
+            if _paper_no_coverage_failsafe(position, _fallback_price, str((_pr or {}).get("warning") or "NO_EXECUTABLE_ROUTE")):
+                return
         if _is_real_eval:
             _no_price_grace = float(get_config_value("LIVE_NO_PRICE_EXIT_GRACE_SEC", 45.0))
             if (time.time() - opened_at) >= _no_price_grace:
@@ -4613,6 +6767,9 @@ def evaluate_exit_for_position(position: dict) -> None:
                     closure_mode="normal",
                 )
         return
+
+    if _is_real_eval:
+        _maybe_adjudicate_router_executable_family(position, _pr)
 
     current_price = _pr["price"]
     price_age     = _pr["age_sec"]
@@ -4647,7 +6804,7 @@ def evaluate_exit_for_position(position: dict) -> None:
 
     if current_price <= 0 or (price_age > _stale_warn_threshold and not _paper_bounded_last_mark):
         hold_s     = time.time() - opened_at
-        max_hold_s = float(float(get_config_value("EXECUTOR_MAX_HOLD_SECONDS", 900.0)))
+        max_hold_s = float(__import__("core.schema", fromlist=["effective_max_hold_seconds"]).effective_max_hold_seconds(locals().get("position")))
 
         # DexScreener removed from execution path - CDN-cached data is UI-only.
         # If current_price is 0 here, the stale_kill guard below will handle it.
@@ -4732,16 +6889,13 @@ def evaluate_exit_for_position(position: dict) -> None:
     # EXCEPTION: if position is significantly profitable (>2x take_profit_pct),
     # allow exit regardless of staleness - never hold a big winner hostage.
     if _PRICE_ROUTER_AVAILABLE and not _pr_can_exit:
-        _tp_pct = float(float(get_config_value("TAKE_PROFIT_PCT", 25.0)))
-        _cur_pnl_pct = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
-        _override_stale = _cur_pnl_pct >= (_tp_pct * 1.5)  # 1.5x TP = force exit
-        if _override_stale:
-            log.warning(
-                "[PRICE_ROUTER] %s stale but pnl=%.1f%% >= %.1f%% override threshold - allowing exit",
-                token_name, _cur_pnl_pct, _tp_pct * 1.5,
-            )
-            # Allow fall-through to TP/SL evaluation
-        else:
+        # A stale/non-sellable quote is evidence, not execution authority.
+        # Never override this merely because its displayed PnL is large.
+        # The old profitable-stale override could turn an old or observational
+        # number into an exit trigger — precisely the OBS→EXEC laundering seen
+        # in the 3-hour audit.
+        _override_stale = False
+        if not _override_stale:
             if _is_real_eval:
                 _stale_exit_grace = float(get_config_value("LIVE_STALE_EXIT_GRACE_SEC", 45.0))
                 if (time.time() - opened_at) >= _stale_exit_grace:
@@ -4757,19 +6911,20 @@ def evaluate_exit_for_position(position: dict) -> None:
                     return
             if _paper_bounded_last_mark:
                 log.warning(
-                    "[PAPER_LAST_TRUSTED_MARK] pos=%d %s age=%.1fs <= %.1fs; "
-                    "evaluating HARD_STOP/RUNNER/TRAIL/MAX_HOLD from post-entry mark",
-                    position_id, token_name, price_age, _paper_last_mark_max_age,
+                    "[PAPER_EXEC_QUOTE_HELD] pos=%d %s age=%.1fs warning=%s; "
+                    "cached quote remains visible as evidence but cannot trigger an exit",
+                    position_id, token_name, price_age, _pr_warning,
                 )
-                # Fall through.  This mark came from price_router and is scoped
-                # post-entry; it may close PAPER only.  REAL never enters here.
             else:
                 log.warning(
-                    "[PRICE_ROUTER] %s price stale (%.1fs) - skipping paper TP/SL. Warning: %s",
+                    "[PRICE_ROUTER] %s price not executable (%.1fs) - skipping paper exit. Warning: %s",
                     token_name, price_age, _pr_warning,
                 )
-                update_position_mark(position_id, current_price, 0.0, time.time(), source="router-stale")
-                return
+            update_position_mark(position_id, current_price, 0.0, time.time(), source="router-held")
+            if not _is_real_eval:
+                if _paper_no_coverage_failsafe(position, current_price, str(_pr_warning or "EXECUTABLE_HELD")):
+                    return
+            return
 
     # EXIT PRICE SANITY GUARD: reject if current_price > 1000x entry
     # Catches bad oracle data from ALL price sources before fake TP fires
@@ -4782,8 +6937,58 @@ def evaluate_exit_for_position(position: dict) -> None:
         return
 
     pnl_pct    = ((current_price - entry_price) / entry_price) * 100
+
+    # EDGE_RESTORE_SIGNOFF_20260810: stop-reference truth.  Entry accounting is
+    # an ask/mid+slippage basis while executable marks are full-size bids.  The
+    # first valid executable mark becomes the risk reference so a configured
+    # -4% stop means 4% adverse movement from an executable baseline rather than
+    # immediately spending ~spread/impact against the stop budget.
+    _exec_entry_basis = float(position.get("executable_entry_basis") or 0.0)
+    # EDGE_AUDIT_20260815 — LATE RISK RE-ZERO.
+    # Re-basing the stop onto a full-size executable bid is correct, but only
+    # while that bid still describes the entry. Past the window below, the
+    # first executable quote describes a LATER market, and adopting it silently
+    # moves the risk reference. Evidence: HARD_STOP_LOSS_6.9pct in the
+    # 2026-08-15 window -- a hard stop that fired on a position up 6.9%.
+    #
+    # Past the window we keep the accounting entry as the reference. That is
+    # strictly the more conservative of the two: the stop fires earlier, never
+    # later. This never loosens a stop and never touches live positions.
+    _eb_max_age = float(get_config_value("EXECUTABLE_BASIS_MAX_AGE_SEC", 30.0))
+    _eb_opened = float(position.get("opened_at") or 0.0)
+    _eb_age = (time.time() - _eb_opened) if _eb_opened > 0 else 0.0
+    _eb_window_open = (_eb_age <= _eb_max_age) if _eb_opened > 0 else True
+    if (_exec_entry_basis <= 0.0 and not _eb_window_open
+            and bool(_pr_can_exit) and current_price > 0.0):
+        log.warning(
+            "[LATE_EXECUTABLE_BASIS_REFUSED] pos=%s age=%.1fs>%.1fs "
+            "entry=%.12g first_executable=%.12g drift=%+.2f%% "
+            "risk_reference=accounting_entry",
+            position_id, _eb_age, _eb_max_age, entry_price, current_price,
+            (((current_price - entry_price) / entry_price) * 100.0
+             if entry_price > 0 else 0.0))
+    if (_exec_entry_basis <= 0.0 and _eb_window_open
+            and bool(_pr_can_exit) and current_price > 0.0):
+        _exec_entry_basis = float(current_price)
+        try:
+            with get_connection() as _ebc:
+                _eb_cols = {r["name"] for r in _ebc.execute("PRAGMA table_info(paper_positions)").fetchall()}
+                if "executable_entry_basis" in _eb_cols:
+                    _sets = ["executable_entry_basis=?"]
+                    _vals = [_exec_entry_basis]
+                    if "executable_entry_basis_at" in _eb_cols:
+                        _sets.append("executable_entry_basis_at=?"); _vals.append(time.time())
+                    if "executable_entry_basis_source" in _eb_cols:
+                        _sets.append("executable_entry_basis_source=?"); _vals.append(str((_pr or {}).get("source") or "executable"))
+                    _vals.append(position_id)
+                    _ebc.execute("UPDATE paper_positions SET " + ",".join(_sets) + " WHERE id=? AND COALESCE(executable_entry_basis,0)<=0", tuple(_vals))
+                    _ebc.commit()
+        except Exception as _eb_err:
+            log.debug("executable entry basis persist failed pos=%d: %s", position_id, _eb_err)
+    _risk_pnl_pct = (((current_price - _exec_entry_basis) / _exec_entry_basis) * 100.0
+                     if _exec_entry_basis > 0.0 else pnl_pct)
     hold_s     = time.time() - opened_at
-    max_hold_s = float(float(get_config_value("EXECUTOR_MAX_HOLD_SECONDS", 900.0)))
+    max_hold_s = float(__import__("core.schema", fromlist=["effective_max_hold_seconds"]).effective_max_hold_seconds(locals().get("position")))
 
     trail_activate = float(float(get_config_value("TRAIL_ACTIVATE_PCT",  10.0)))
     trail_pct      = float(float(get_config_value("TRAIL_STOP_PCT",      15.0)))
@@ -4806,37 +7011,64 @@ def evaluate_exit_for_position(position: dict) -> None:
         position_id,
     )
 
-    # highest_price_seen - update every tick before exit evaluation
-    # Defaults protect against missing data never triggering false exits
+    # highest_price_seen - update every tick before exit evaluation.
+    # A plain loser with no durable runner authority does not need a 512-row
+    # tape reconstruction before its hard stop can be considered.  Runtime
+    # 18:32-20:32 showed 167 sweep overruns while 14/15 closes were losses.
+    # Preserve runner-first ownership whenever a runner has actually qualified
+    # or armed; otherwise bypass the expensive peak scan on an already-breached
+    # hard-stop mark.
     try:
-        # TRUSTED PEAK BASIS: prefer the highest mark the evaluator actually saw.
-        # get_peak_price_since_open() is MAX(observed_price) with no source filter.
-        _tp_price, _tp_pct, _tp_src, _tp_ts = _trusted_peak_from_tape(
-            position_id, entry_price)
-        if _tp_price and _tp_price > 0:
-            peak_price = _tp_price
-            try:
-                with get_connection() as _tc:
-                    _tc.execute(
-                        "UPDATE paper_positions SET trusted_peak_price=?, "
-                        "trusted_peak_pct=?, trusted_peak_at=?, trusted_peak_source=? "
-                        "WHERE id=?",
-                        (_tp_price, _tp_pct, _tp_ts, _tp_src, position_id))
-                    _tc.commit()
-            except Exception:
-                pass
-        else:
-            peak_price = get_peak_price_since_open(mint, opened_at) or current_price
+        _pre_hard_stop = min(abs(float(get_config_value("HARD_STOP_LOSS_PCT", 4.0))), 4.0)
     except Exception:
+        _pre_hard_stop = 4.0
+    _durable_runner_hint = bool(
+        int(position.get("runner_protected") or 0) == 1
+        or int(position.get("runner_confirmed") or 0) == 1
+        or float(position.get("trusted_peak_pct") or 0.0) >= 20.0
+        or float(position.get("runner_peak_pct") or 0.0) >= 20.0
+        or str(position.get("runner_floor_state") or "").upper().startswith("ARMED")
+    )
+    _plain_loss_fast_path = bool(_risk_pnl_pct <= -_pre_hard_stop and not _durable_runner_hint)
+
+    _trusted_peak_snapshot = (None, None, None, None)
+    if _plain_loss_fast_path:
         peak_price = current_price
+    else:
+        try:
+            # HARVEST_SIGNOFF_20260809: snapshot trusted authority once so all
+            # downstream runner branches consume the identical result.
+            _tp_price, _tp_pct, _tp_src, _tp_ts = _trusted_peak_from_tape(
+                position_id, entry_price)
+            _trusted_peak_snapshot = (_tp_price, _tp_pct, _tp_src, _tp_ts)
+            if _tp_price and _tp_price > 0:
+                peak_price = _tp_price
+                try:
+                    with get_connection() as _tc:
+                        _tc.execute(
+                            "UPDATE paper_positions SET trusted_peak_price=?, "
+                            "trusted_peak_pct=?, trusted_peak_at=?, trusted_peak_source=? "
+                            "WHERE id=?",
+                            (_tp_price, _tp_pct, _tp_ts, _tp_src, position_id))
+                        _tc.commit()
+                except Exception:
+                    pass
+            else:
+                # Tape exists but no trusted/confirmed peak qualifies. Never
+                # reintroduce a rejected mark through an unfiltered snapshot MAX.
+                peak_price = float(position.get("trusted_peak_price") or 0.0) or current_price
+        except Exception:
+            peak_price = current_price
     if peak_price <= 0:
         peak_price = current_price
 
-    # volume_acceleration default: 1.0 if unavailable
+    # T2: volume expansion is three-state. There is no numeric default — an
+    # unavailable reading stays UNKNOWN rather than being coerced to a value
+    # that would then be compared against the expansion boundary.
     try:
-        _vol_acc = float(position.get("volume_acceleration") or 1.0)
+        _vol_state, _vol_acc = _volume_expansion_state(position)
     except Exception:
-        _vol_acc = 1.0
+        _vol_state, _vol_acc = VOL_UNKNOWN, None
 
     # price_change_last_60s default: 0.0 if unavailable
     try:
@@ -4844,17 +7076,57 @@ def evaluate_exit_for_position(position: dict) -> None:
     except Exception:
         _p60 = 0.0
 
-    # -- 1. HARD STOP LOSS - NON-NEGOTIABLE, fires before everything -----------
+    # -- 1. QUALIFIED RUNNER FLOOR - execution priority over ordinary exits ----
+    # HARVEST_SIGNOFF_20260808:
+    # The prior ordering evaluated HARD_STOP before the qualified runner floor.
+    # If an evaluator woke after a fast retrace, a previously proven runner was
+    # classified and closed as an ordinary loser before its durable protection
+    # state was even consulted. This does NOT model a better fill: the exit still
+    # uses the obtainable evaluator/executable mark. It restores ownership and
+    # ensures lower-priority lifecycle/max-hold logic cannot erase an armed floor.
+    _runner_floor_state = {"protected": False, "floor_pct": 0.0, "floor_price": 0.0,
+                           "peak_pct": 0.0, "state": ""}
+    try:
+        _rpl_decision = _runner_profit_lock_decision(
+            position_id=position_id, entry_price=entry_price,
+            current_price=current_price, position=position,
+            trusted_peak_snapshot=_trusted_peak_snapshot,
+            current_price_executable=bool(_pr_can_exit),
+        )
+        _runner_floor_state = _fresh_runner_floor_state(position_id)
+        if _rpl_decision:
+            _runner_profit_lock_apply_exit_quality(position_id, _rpl_decision)
+            close_position_canonical(
+                position_id, float(_rpl_decision["exit_price"]),
+                str(_rpl_decision["reason"]), closure_mode="normal",
+            )
+            log.warning(
+                "[RUNNER_FLOOR_EXIT] pos=%d token=%s peak=%.2f floor=%.2f exit=%.2f state=%s",
+                position_id, token_name, float(_rpl_decision["peak_pct"]),
+                float(_rpl_decision["floor_pct"]), float(_rpl_decision["exit_pct"]),
+                _runner_floor_state.get("state") or "ARMED",
+            )
+            _log_cognition(token_name,
+                f"RUNNER PROFIT LOCK: {token_name} exited at "
+                f"{float(_rpl_decision['exit_pct']):+.1f}% after qualified peak "
+                f"+{float(_rpl_decision['peak_pct']):.1f}%. Floor "
+                f"+{float(_rpl_decision['floor_pct']):.1f}%.")
+            return
+    except Exception as _rpl_err:
+        log.warning("runner profit-lock priority evaluation failed pos=%d: %s",
+                    position_id, _rpl_err)
+        _runner_floor_state = _fresh_runner_floor_state(position_id)
+
+    # -- 2. HARD STOP LOSS - safety fallback after qualified runner authority ---
     # Config-driven hard stop. Signed-off operator intent is 4%.
     # Keep this explicit and auditable: system_config wins; 4.0 is the safe default.
     try:
-        # Operator constitution: the hard stop may be tightened below 4%, never widened above it.
         _hard_stop_pct = min(abs(float(get_config_value("HARD_STOP_LOSS_PCT", 4.0))), 4.0)
     except Exception:
         _hard_stop_pct = 4.0
     if not math.isfinite(_hard_stop_pct) or _hard_stop_pct <= 0.0:
         _hard_stop_pct = 4.0
-    if pnl_pct <= -_hard_stop_pct:
+    if _risk_pnl_pct <= -_hard_stop_pct:
         # RUNNER GAP TRUTH: a latched runner that gaps through both its trail and
         # hard stop must exit at the obtainable mark, never at an invented floor.
         # Persist the failure mode so cadence/coverage can be audited directly.
@@ -4864,8 +7136,17 @@ def evaluate_exit_for_position(position: dict) -> None:
                                         float(position.get("runner_latch_peak_pct") or 0.0),
                                         float(position.get("peak_pnl_pct") or 0.0))
             if _trusted_peak_for_gap >= 20.0:
-                log.error("[RUNNER_GAP_THROUGH_FLOOR] pos=%d mint=%s trusted_peak=%.2f current=%.2f eval_interval=%.2f",
-                          position_id,mint[:16],_trusted_peak_for_gap,pnl_pct,_runner_aware_poll_interval())
+                # REGRESSION_AUDIT_20260805: eval_interval previously logged
+                # _runner_aware_poll_interval(), a CONFIGURED constant
+                # (0.25/0.40/0.75/1.20s). It was never measured elapsed time and
+                # therefore could not evidence a cadence failure. Log both.
+                try:
+                    from services.exit_hotpath import last_measured_gap as _eh_gap
+                    _measured_gap = float(_eh_gap(position_id))
+                except Exception:
+                    _measured_gap = -1.0
+                log.error("[RUNNER_GAP_THROUGH_FLOOR] pos=%d mint=%s trusted_peak=%.2f current=%.2f measured_eval_gap_sec=%.2f configured_eval_interval=%.2f",
+                          position_id,mint[:16],_trusted_peak_for_gap,pnl_pct,_measured_gap,_runner_aware_poll_interval())
                 try:
                     with get_connection() as _gc:
                         _gc.execute("UPDATE paper_positions SET exit_quality_tag='RUNNER_GAP_THROUGH_FLOOR', exit_gap_from_peak_pct=? WHERE id=?",
@@ -4944,7 +7225,36 @@ def evaluate_exit_for_position(position: dict) -> None:
         # it, persisting a later raw mark such as -24%/-53%. Real positions never
         # receive a synthetic fill and continue to settle from chain truth.
         _hard_stop_exit_price = current_price
-        _hard_stop_exit_reason = f"HARD_STOP_LOSS_{pnl_pct:.1f}pct"
+        _hard_stop_exit_reason = f"HARD_STOP_LOSS_{_risk_pnl_pct:.1f}pct"
+
+        # STOP_REALISABILITY_PROBE_20260803_FINAL
+        # Quote-only evidence. Never signs, builds, submits, or changes the close.
+        try:
+            if not _is_real_eval:
+                # REGRESSION_AUDIT_20260805: probe_stop performs blocking network I/O
+                # (token-decimals RPC + Jupiter quote tiers). Executed inline it
+                # stalled evaluation of every OTHER open position at precisely
+                # the moment a runner was collapsing. It is quote-only evidence
+                # and never signs, submits or alters a close, so it is safe to
+                # hand to a bounded worker. Same arguments, same probe.
+                from services.exit_hotpath import submit_stop_probe as _eh_probe
+                if True:
+                    _eh_probe(
+                        position_id=position_id, mint=mint,
+                        quantity=float(position.get("quantity") or 0.0),
+                        entry_price=float(position.get("entry_price") or 0.0),
+                        trigger_mark_price=float(current_price or 0.0),
+                        intended_stop_pct=-abs(float(_hard_stop_pct)),
+                        position_size_usd=float(position.get("position_size_usd") or 0.0),
+                        credited_stop_pct=-abs(float(_hard_stop_pct)),
+                        token_name=str(position.get("token_name") or ""),
+                        mark_source=str(position.get("mark_source") or position.get("price_source") or ""),
+                        snapshot_id=position.get("snapshot_id"),
+                        trigger_mark_age_sec=((time.time()-float(position.get("last_marked_at")))
+                                              if position.get("last_marked_at") else None),
+                    )
+        except Exception as _probe_exc:
+            log.debug("[STOP_REALISABILITY_PROBE_FAIL] pos=%s %s", position_id, _probe_exc)
         if not _is_real_eval and isinstance(_stop_policy, dict):
             try:
                 _candidate_stop_price = float(_stop_policy.get("exit_price") or current_price)
@@ -4967,15 +7277,38 @@ def evaluate_exit_for_position(position: dict) -> None:
                             "PRAGMA table_info(paper_positions)"
                         ).fetchall()
                     }
+                    # PNL_TRUTH_SIGNOFF_20260808: this block previously stamped
+                    # every paper stop as CAPPED_STOP_FLOOR and wrote the -4%
+                    # doctrine value into trusted_realized_pnl_*, regardless of
+                    # what the policy actually did. With the clamp off by
+                    # default the trusted value IS the observed value, and the
+                    # status must say so -- otherwise pnl_truth.py keeps
+                    # redirecting readers to a preclamp column for rows that
+                    # were never clamped.
+                    _stop_was_capped = bool(
+                        (_stop_policy or {}).get("capped")
+                        if isinstance(_stop_policy, dict) else False
+                    )
+                    _observed_pct = float(pnl_pct)
+                    _observed_usd = float(pos_size_usd) * float(pnl_pct) / 100.0
+                    if _stop_was_capped:
+                        _trusted_pct = -float(_hard_stop_pct)
+                        _trusted_usd = -float(pos_size_usd) * float(_hard_stop_pct) / 100.0
+                        _integrity = "CAPPED_STOP_FLOOR"
+                    else:
+                        _trusted_pct = _observed_pct
+                        _trusted_usd = _observed_usd
+                        _integrity = "OBSERVED_STOP_TRUTH"
                     _raw_sets, _raw_vals = [], []
                     for _col, _val in (
-                        ("raw_pnl_pct_preclamp", float(pnl_pct)),
-                        ("raw_pnl_usd_preclamp", float(position_size_usd) * float(pnl_pct) / 100.0),
-                        ("raw_realized_pnl_pct", float(pnl_pct)),
-                        ("raw_realized_pnl_usd", float(position_size_usd) * float(pnl_pct) / 100.0),
-                        ("trusted_realized_pnl_pct", -float(_hard_stop_pct)),
-                        ("trusted_realized_pnl_usd", -float(position_size_usd) * float(_hard_stop_pct) / 100.0),
-                        ("pnl_integrity_status", "CAPPED_STOP_FLOOR"),
+                        ("raw_pnl_pct_preclamp", _observed_pct),
+                        ("raw_pnl_usd_preclamp", _observed_usd),
+                        ("raw_realized_pnl_pct", _observed_pct),
+                        ("raw_realized_pnl_usd", _observed_usd),
+                        ("modelled_floor_pnl_pct", -float(_hard_stop_pct)),
+                        ("trusted_realized_pnl_pct", _trusted_pct),
+                        ("trusted_realized_pnl_usd", _trusted_usd),
+                        ("pnl_integrity_status", _integrity),
                         ("pnl_integrity_reason", str(
                             (_stop_policy or {}).get("audit_reason")
                             if isinstance(_stop_policy, dict) else "UNIVERSAL_PAPER_STOP_FLOOR"
@@ -5021,6 +7354,21 @@ def evaluate_exit_for_position(position: dict) -> None:
         return
 
 
+    # PLI remains lower priority than qualified runner protection and HARD_STOP,
+    # but may action an EXIT request once this cycle has proven an executable
+    # exact-position price. It can no longer consume last_price directly.
+    _pli_exit_reason = str(position.get("_pli_exit_requested") or "").strip()
+    if _pli_exit_reason:
+        close_position_canonical(
+            position_id, current_price,
+            f"LIFECYCLE_EXIT_EXECUTABLE:{_pli_exit_reason[:160]}",
+            closure_mode="normal",
+        )
+        log.info("[PLI_EXIT_EXECUTABLE] pos=%d price=%.12g source=%s reason=%s",
+                 position_id, current_price, str((_pr or {}).get("source") or ""), _pli_exit_reason)
+        return
+
+
     # === 0708_NATIVE_LILYPAD_SUB100_HARVEST_INLINE ===
     # Native full-exit harvester for sub-100% poppers that stop making new highs.
     # IMPORTANT: +100% graduation bypasses this forever and hands to monster trailing.
@@ -5050,37 +7398,9 @@ def evaluate_exit_for_position(position: dict) -> None:
     # === END_0708_NATIVE_LILYPAD_SUB100_HARVEST_INLINE ===
 
 
-    # === SENTINUITY 20260709 RUNNER PROFIT LOCK ===
-    # Protect proven high-water runners before stagnation/MAX_HOLD can recycle
-    # them flat/negative. This directly addresses the 24h audit where rows with
-    # +90% to +448% peak were later closed by MAX_HOLD_TIME near flat/negative.
-    try:
-        _rpl_decision = _runner_profit_lock_decision(
-            position_id=position_id,
-            entry_price=entry_price,
-            current_price=current_price,
-            position=position,
-        )
-        if _rpl_decision:
-            _runner_profit_lock_apply_exit_quality(position_id, _rpl_decision)
-            close_position_canonical(
-                position_id,
-                float(_rpl_decision["exit_price"]),
-                str(_rpl_decision["reason"]),
-                closure_mode="normal",
-            )
-            _log_cognition(token_name,
-                f"RUNNER PROFIT LOCK: {token_name} protected at "
-                f"+{float(_rpl_decision['exit_pct']):.1f}% after peak "
-                f"+{float(_rpl_decision['peak_pct']):.1f}%. Floor "
-                f"+{float(_rpl_decision['floor_pct']):.1f}%.")
-            return
-    except Exception as _rpl_err:
-        try:
-            log.debug("runner profit lock skipped pos=%d: %s", position_id, _rpl_err)
-        except Exception:
-            pass
-    # === END SENTINUITY 20260709 RUNNER PROFIT LOCK ===
+    # Runner profit-lock is evaluated above HARD_STOP as the canonical
+    # qualified-harvest authority. Do not duplicate it here.
+
 
     # -- 2. RUNNER MODE - priority above all time-based logic -----------------
     # Activates at +20% unrealized. Switches to trailing stop only.
@@ -5090,7 +7410,13 @@ def evaluate_exit_for_position(position: dict) -> None:
     _runner_trail_pct    = 10.0
     _runner_tight_pct    = 8.0   # tightens at +50%
     _runner_tight_thresh = 50.0
-    if pnl_pct >= _runner_activate_pct:
+    _runner_authority_pct = 0.0
+    try:
+        _ra_px, _ra_pct, _ra_src, _ra_ts = _trusted_peak_snapshot
+        _runner_authority_pct = float(_ra_pct or 0.0)
+    except Exception:
+        _runner_authority_pct = 0.0
+    if _runner_authority_pct >= _runner_activate_pct:
         if position_id not in _trail_logged_positions:
             _log_cognition(token_name,
                 f"RUNNER MODE: {token_name} at +{pnl_pct:.1f}%. "
@@ -5102,59 +7428,184 @@ def evaluate_exit_for_position(position: dict) -> None:
         # falling back through +50% had its trail widened 8% -> 10% mid-collapse.
         if str(get_config_value("RUNNER_TRAIL_LATCH_ENABLED", "1")).strip().lower() \
                 not in ("0", "false", "off", "no"):
-            _tpk_pct = _tp_pct if ("_tp_pct" in dir() and _tp_pct is not None) else pnl_pct
-            try:
-                _tpk_pct = max(float(_tpk_pct or 0.0), float(pnl_pct or 0.0))
-            except Exception:
-                _tpk_pct = pnl_pct
+            _tpk_pct = _runner_authority_pct
             _active_trail = _resolve_latched_trail(
                 position_id, _tpk_pct, _runner_trail_pct,
                 _runner_tight_pct, _runner_tight_thresh)
         else:
             _active_trail = _runner_tight_pct if pnl_pct >= _runner_tight_thresh else _runner_trail_pct
-        runner_stop_price = peak_price * (1 - _active_trail / 100)
-        if current_price <= runner_stop_price:
-            _peak_pct = ((peak_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+        # EDGE_RESTORE_TRUSTED_RUNNER_TRAIL_20260727:
+        # Never let an unfiltered highest_price_seen / market-snapshot spike
+        # govern the ordinary runner trail. Reuse the same source-qualified
+        # mark-tape authority as the profit-lock ladder. This preserves the
+        # proven 60-99% behaviour while preventing a suspect +720%/+2000% mark
+        # from manufacturing a fixed TRAILING_STOP near +95%.
+        # EDGE_RESTORE_20260727: the trail must still have a peak when the tape
+        # yields nothing. Collapsing to current_price made runner_stop_price
+        # strictly below current_price on every evaluation, so TRAILING_STOP could
+        # never fire and every winner decayed into MAX_HOLD.
+        _runner_peak_price = 0.0
+        _runner_peak_source = ""
+        try:
+            _rt_px, _rt_pct, _rt_src, _rt_ts = _trusted_peak_snapshot
+            if _rt_px and float(_rt_px) > 0:
+                _runner_peak_price = float(_rt_px)
+                _runner_peak_source = str(_rt_src or "trusted_mark_tape")
+        except Exception:
+            pass
+        if _runner_peak_price <= 0:
+            # PEAK_AUTHORITY_P5: an unconfirmed persisted peak may not govern the
+            # runner trail. Falls through to current_evaluator_mark below, which
+            # is the EDGE_RESTORE_20260727 behaviour, so TRAILING_STOP still fires.
+            try:
+                _rt_authorised = False
+                try:
+                    from services import peak_authority as _pa5
+                    with get_connection() as _ac5:
+                        _rt_authorised, _ = _pa5.runner_exit_authorised(
+                            _ac5, int(position_id))
+                except Exception:
+                    _rt_authorised = False
+                if _rt_authorised:
+                    _runner_peak_price = float(position.get("trusted_peak_price") or 0.0)
+                    _runner_peak_source = str(position.get("trusted_peak_source") or "persisted_trusted_peak")
+                else:
+                    _runner_peak_price = 0.0
+                    _runner_peak_source = "legacy_peak_without_confirmation"
+            except Exception:
+                _runner_peak_price = 0.0
+        _trail_armed = _runner_peak_price > 0
+        if not _trail_armed:
+            # Do not trap the position in runner-only mode when authority has
+            # disappeared. Keep ordinary hard-stop / stagnation / max-hold and
+            # executable liquidation paths available.
+            try:
+                with get_connection() as _uc:
+                    _uc.execute(
+                        "UPDATE paper_positions SET runner_floor_state=? WHERE id=?",
+                        ("RUNNER_TRAIL_UNAVAILABLE", position_id),
+                    )
+                    _uc.commit()
+            except Exception:
+                pass
+        runner_stop_price = (_runner_peak_price * (1 - _active_trail / 100)) if _trail_armed else 0.0
+        if _trail_armed and current_price <= runner_stop_price:
+            _peak_pct = ((_runner_peak_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
             close_position_canonical(position_id, current_price,
-                f"TRAILING_STOP_{pnl_pct:.1f}pct_peak_{_peak_pct:.1f}pct",
+                f"TRAILING_STOP_{pnl_pct:.1f}pct_peak_{_peak_pct:.1f}pct_src_{_runner_peak_source}",
                 closure_mode="normal")
             _log_cognition(token_name,
                 f"RUNNER HARVESTED: {token_name} trail stop at "
                 f"{pnl_pct:.2f}%. Peak was +{_peak_pct:.1f}%. "
                 f"Trail: {_active_trail:.0f}% from peak.")
             return
-        # Runner mode: do not evaluate any other exit - let it run
-        return
-
-    # -- 3. STAGNATION EXIT - only after 180s, only on true price death --------
-    # Replaces TIME_CUT. Time alone NEVER triggers exit.
-    # SAFETY: price_change_last_60s not written by pipeline → default is 0.0
-    # When 0.0, we CANNOT confirm stagnation - treat as price moving (safe).
-    # Missing data must NEVER trigger false exits.
-    _stagnation_window = 300.0  # raised - winners run 3-5 min
-    _stagnation_move_threshold = 0.2
-    if hold_s >= _stagnation_window:
-        _p60_was_written = _p60 != 0.0  # 0.0 = default = unwritten = unknown
-        _price_moving    = (not _p60_was_written) or (abs(_p60) >= _stagnation_move_threshold)
-        _volume_expanding = _vol_acc > 1.0
-        _real_winner = pnl_pct > 0.5 and _volume_expanding
-
-        if _real_winner or _price_moving:
-            log.debug(
-                "STAGNATION_HELD pos=%d %s hold=%.0fs pnl=%.2f%% "
-                "moving=%s winner=%s vol_acc=%.2f p60=%.4f written=%s",
-                position_id, token_name, hold_s, pnl_pct,
-                _price_moving, _real_winner, _vol_acc, _p60, _p60_was_written,
-            )
-        else:
-            close_position_canonical(position_id, current_price,
-                f"TIME_CUT_STAGNANT_{hold_s:.0f}s_pnl_{pnl_pct:.2f}pct",
-                closure_mode="normal")
-            _log_cognition(token_name,
-                f"STAGNATION EXIT: {token_name} held {hold_s:.0f}s. "
-                f"Price moved {abs(_p60):.4f}% in last 60s (floor 0.2%). "
-                f"Dead trade cleared. PnL: {pnl_pct:.2f}%.")
+        # Runner-only hold is permitted only while a durable trusted peak is
+        # present. Without it, continue to ordinary exits rather than trapping
+        # the position behind a non-existent trail.
+        if _trail_armed:
             return
+
+    # -- DURABLE RUNNER HOLD -----------------------------------------------------
+    # Once a qualified floor is armed and current executable truth remains above
+    # it, ordinary lifecycle/stagnation/max-hold exits no longer own the position.
+    # The floor is re-evaluated every cycle and may ratchet upward; hard safety
+    # already ran above. This is the monotonic ownership invariant that the
+    # historical runner periods effectively relied on.
+    if bool((_runner_floor_state or {}).get("protected")):
+        _rf_floor = float((_runner_floor_state or {}).get("floor_pct") or 0.0)
+        if pnl_pct > _rf_floor:
+            try:
+                from services.exit_hotpath import last_measured_gap as _eh_gap
+                _rf_gap = float(_eh_gap(position_id))
+                _rf_target = float(_runner_aware_poll_interval())
+                # PRICE_TRUTH_SIGNOFF_20260809 (blocker 10): the old
+                # max(3.0, target*3) floor meant a 2.9s gap against a 250ms
+                # target - an 11.6x breach - passed silently, precisely where
+                # cadence matters most. The bound is now proportional with a
+                # small absolute floor to avoid jitter noise.
+                if _rf_gap > max(0.75, _rf_target * 3.0):
+                    log.error(
+                        "[RUNNER_EVAL_CADENCE_BREACH] pos=%d token=%s gap=%.2fs target=%.2fs "
+                        "peak=%.2f floor=%.2f current=%.2f",
+                        position_id, token_name, _rf_gap, _rf_target,
+                        float((_runner_floor_state or {}).get("peak_pct") or 0.0),
+                        _rf_floor, pnl_pct,
+                    )
+            except Exception:
+                pass
+            log.debug(
+                "[RUNNER_FLOOR_HOLD] pos=%d peak=%.2f floor=%.2f current=%.2f state=%s",
+                position_id, float((_runner_floor_state or {}).get("peak_pct") or 0.0),
+                _rf_floor, pnl_pct, (_runner_floor_state or {}).get("state") or "ARMED",
+            )
+            return
+
+    # -- 3. STAGNATION EXIT - evidence-backed fast recycle for PAPER only ------
+    # SIGNOFF_20260811_FAST_RECYCLE: the current runtime's median hold was ~905s
+    # and 55/98 closes reached MAX_HOLD. Historical grounded edge periods recycled
+    # dead/flat paper probes around 180s. The former implementation could not
+    # distinguish a genuinely flat 0.0% move from an unwritten p60 field, so
+    # missing telemetry meant "moving" and silently promoted 900s to the normal
+    # lifecycle. Restore the configured 180s *evaluation* window without reviving
+    # a blind fixed TIME_CUT: only mark-tape-proven stagnation may close early.
+    # REAL positions are unchanged. Sparse/missing evidence still fails open.
+    _stagnation_window = float(get_config_value("STAGNATION_WINDOW_SEC", 180.0))
+    _stagnation_range_pct = float(get_config_value("PAPER_STAGNATION_RANGE_PCT", 0.50))
+    _stagnation_min_span = float(get_config_value("PAPER_STAGNATION_MIN_SPAN_SEC", 45.0))
+    if (not _is_real_eval) and hold_s >= _stagnation_window:
+        _stag = _paper_stagnation_from_mark_tape(
+            position_id, window_sec=_stagnation_window,
+            min_span_sec=_stagnation_min_span,
+            range_threshold_pct=_stagnation_range_pct,
+        )
+        # T2: UNKNOWN is not negative evidence. A green position may only be
+        # recycled as stagnant when volume expansion was actually MEASURED and
+        # came back below the boundary. If it was never measured, the evidence
+        # that would justify cutting a winner does not exist, so the cut is
+        # withheld and the position continues to the runner floor / trailing /
+        # MAX_HOLD path exactly as before. Flat and losing positions are
+        # unaffected: they were never eligible for the carve-out.
+        _volume_expanding = (_vol_state == VOL_EXPANDING)
+        _volume_measured = (_vol_state != VOL_UNKNOWN)
+        _real_winner = pnl_pct > 0.5 and _volume_expanding
+        _winner_unproven = pnl_pct > 0.5 and not _volume_measured
+        _durable_runner = bool(
+            _runner_floor_state.get("protected")
+            or int(position.get("runner_protected") or 0) == 1
+            or int(position.get("runner_confirmed") or 0) == 1
+            or float(position.get("trusted_peak_pct") or 0.0) >= 20.0
+        )
+        if (_stag.get("state") == "STAGNANT" and not _real_winner
+                and not _winner_unproven and not _durable_runner):
+            close_position_canonical(
+                position_id, current_price,
+                f"TIME_CUT_STAGNANT_{hold_s:.0f}s_pnl_{pnl_pct:.2f}pct",
+                closure_mode="normal",
+            )
+            _log_cognition(
+                token_name,
+                f"STAGNATION EXIT: {token_name} held {hold_s:.0f}s. "
+                f"mark_tape range={float(_stag.get('range_pct') or 0.0):.3f}% "
+                f"over {float(_stag.get('span_sec') or 0.0):.0f}s / "
+                f"{int(_stag.get('marks') or 0)} marks. PnL: {pnl_pct:.2f}%.",
+            )
+            return
+        if _winner_unproven and _stag.get("state") == "STAGNANT":
+            log.info(
+                "[STAGNATION_WITHHELD_VOLUME_NOT_MEASURED] pos=%d %s hold=%.0fs "
+                "pnl=%+.2f%% marks=%s range=%s - green position not recycled "
+                "because volume expansion was never measured (no producer for "
+                "volume_acceleration); absence is not evidence of non-expansion",
+                position_id, token_name, hold_s, pnl_pct,
+                _stag.get("marks"), _stag.get("range_pct"),
+            )
+        log.debug(
+            "STAGNATION_%s pos=%d %s hold=%.0fs pnl=%.2f%% marks=%s span=%s "
+            "range=%s vol_state=%s vol_value=%s winner=%s winner_unproven=%s runner=%s",
+            _stag.get("state", "UNKNOWN"), position_id, token_name, hold_s, pnl_pct,
+            _stag.get("marks"), _stag.get("span_sec"), _stag.get("range_pct"),
+            _vol_state, _vol_acc, _real_winner, _winner_unproven, _durable_runner,
+        )
 
     # -- 4. MAX HOLD - failsafe only, never triggers for live trades -----------
     if hold_s >= max_hold_s:
@@ -5219,7 +7670,7 @@ def reconcile_position(pos: dict, gap_start: float, gap_end: float) -> str:
     if not mint or entry_price <= 0:
         return "skipped"
 
-    max_hold_s = float(float(get_config_value("EXECUTOR_MAX_HOLD_SECONDS", 900.0)))
+    max_hold_s = float(__import__("core.schema", fromlist=["effective_max_hold_seconds"]).effective_max_hold_seconds(locals().get("position")))
     now        = time.time()
     hold_s     = now - opened_at
 
@@ -5360,7 +7811,7 @@ def _tg_post(method: str, payload: dict, timeout: int = 10) -> Optional[dict]:
         resp.raise_for_status()
         return resp.json()
     except Exception as exc:
-        log.warning("Telegram API error (%s): %s", method, exc)
+        _warn_once(log, f"telegram_api_{method}", "Telegram API error (%s): %s", method, _redact_telemetry(exc))
         return None
 
 
@@ -5591,7 +8042,7 @@ def scan_and_resolve_zombies() -> int:
             # handle this position correctly. Only close here if held
             # far beyond max hold time with genuinely no price at all.
             hold_s     = time.time() - float(pos.get("opened_at") or 0)
-            max_hold_s = float(float(get_config_value("EXECUTOR_MAX_HOLD_SECONDS", 900.0)))
+            max_hold_s = float(__import__("core.schema", fromlist=["effective_max_hold_seconds"]).effective_max_hold_seconds(locals().get("position")))
             best_exit  = get_last_known_price(mint) or get_last_known_price_unscoped(mint)
 
             if hold_s > max_hold_s * 2 and not best_exit:
@@ -5654,7 +8105,7 @@ def dry_run_entry_scan(limit: int = 30) -> list:
             "price_updated_at":     row_dict.get("price_updated_at"),
             "signal_age_sec":       extra.get("signal_age_sec"),
             "price_age_sec":        extra.get("price_age_sec"),
-            "confidence":           row_dict.get("mint_confidence") or row_dict.get("confidence"),
+            "confidence":           row_dict.get("calibrated_confidence") or row_dict.get("confidence_score") or row_dict.get("confidence"),
             "decision":             decision,
             "block_reason":         block_reason,
             "compact_reason":       block_reason,
@@ -5669,7 +8120,7 @@ def dry_run_entry_scan(limit: int = 30) -> list:
     max_signal_age  = float(get_config_value("EXECUTOR_MAX_SIGNAL_AGE_SEC", 600.0))
     _oracle_gate_sec = float(get_config_value("ORACLE_LIVENESS_GATE_SEC",  300.0))
     conf_floor      = float(get_config_value("SUPERVISOR_MIN_MINT_CONFIDENCE", 0.65))
-    balance         = get_wallet_balance()
+    balance         = get_paper_cash_balance()
 
     # ── Pre-scan global gates ────────────────────────────────────────────────
     if halt == "1":
@@ -5686,7 +8137,8 @@ def dry_run_entry_scan(limit: int = 30) -> list:
         import sqlite3 as _sq3, os as _os
         _idb = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)),
                              "sentinuity_intelligence.db")
-        _ic = _sq3.connect(_idb, timeout=2)
+        from core.schema import get_critical_connection as _m3_crit
+        _ic = _m3_crit("intel")
         _latest = _ic.execute("SELECT MAX(ts_ms) FROM mtm_ticks").fetchone()[0]
         _ic.close()
         _oracle_age = (now - _latest / 1000.0) if _latest else 9999.0
@@ -5724,7 +8176,7 @@ def dry_run_entry_scan(limit: int = 30) -> list:
                 """
                 SELECT id, mint_address, token_name, observed_price, price_updated_at,
                        COALESCE(created_at, timestamp, price_updated_at, 0) AS created_at,
-                       mint_confidence, confidence, latch_claimed_until,
+                       calibrated_confidence, confidence_score, confidence, latch_claimed_until,
                        latched, execution_ready, candidate_state, quality_reason
                 FROM market_snapshots
                 WHERE latched=1 AND COALESCE(execution_ready,0) IN (1,2)
@@ -5762,7 +8214,7 @@ def dry_run_entry_scan(limit: int = 30) -> list:
         created_ts   = float(row_dict.get("created_at") or 0)
         price_age    = now - price_upd_at if price_upd_at > 0 else 9999.0
         signal_age   = now - created_ts   if created_ts   > 0 else float("inf")
-        conf         = float(row_dict.get("mint_confidence") or row_dict.get("confidence") or 0.0)
+        conf         = float(row_dict.get("calibrated_confidence") or row_dict.get("confidence_score") or row_dict.get("confidence") or 0.0)
         # entry_confidence: raw snapshot confidence, NULL if not present (observational only)
         _raw_conf    = row_dict.get("snap_confidence")
         entry_conf   = float(_raw_conf) if _raw_conf is not None else None
@@ -5887,7 +8339,14 @@ def dry_run_entry_scan(limit: int = 30) -> list:
 
         _adm_live_exec_pct = float(row_dict.get("live_exec_pct") or 0.0)
         _adm_fail = None
-        if conf < _adm_conf_floor:
+        # SIGNOFF_CALIBRATION_SHADOW_20260801:
+        # Confidence is measured and logged, but is not a capital gate until the
+        # edge ledger demonstrates that it predicts outcomes for sub-minute
+        # candidates. This restores the historical admission semantics without
+        # restoring mint_confidence=0.89 contamination. All other admission,
+        # Mode-B, freshness, execution and live-safety contracts stay active.
+        _calibration_mode = str(get_config_value("CALIBRATION_ADMISSION_MODE", "shadow")).strip().lower()
+        if _calibration_mode == "enforce" and conf < _adm_conf_floor:
             _adm_fail = f"ADMISSION_BLOCKED_LOW_CONF ({conf:.3f} < {_adm_conf_floor:.2f})"
         elif _true_signal_age > _adm_max_signal_age:
             _adm_fail = (f"ADMISSION_BLOCKED_SIGNAL_AGE "
@@ -5899,7 +8358,7 @@ def dry_run_entry_scan(limit: int = 30) -> list:
             open_count -= 1
             seen_mints.discard(mint)
             results.append(_d("BLOCKED", _adm_fail))
-            log.debug("ADMISSION_FILTER: %s %s", mint[:16], _adm_fail)
+            log.info("ADMISSION_FILTER: %s %s", mint[:16], _adm_fail)
             continue
 
         _dec = "WOULD_ENTER" + (" [DEGRADED: executor opens max 1 this cycle]" if degraded_mode else "")
@@ -5956,6 +8415,174 @@ def _runner_aware_poll_interval() -> float:
     return POLL_INTERVAL
 
 
+# OVERNIGHT_RUNTIME_SIGNOFF_20260809 — dedicated exit evaluator lane.
+# Entry discovery/enrichment can spend many seconds in network/DB work; exit
+# protection must not share that blocking cadence.  This daemon owns all
+# normal open-position evaluation.  The main loop remains entry-owned.
+_EXIT_SCHEDULER_STARTED = False
+_EXIT_SCHEDULER_START_LOCK = threading.Lock()
+EXIT_SCHEDULER_SERVICE = "execution_engine_exit"
+
+# PRICE_TRUTH_SIGNOFF_20260809 (blocker 10): exit protection needs its OWN
+# liveness signal. Previously only the entry loop wrote a heartbeat, so a hung
+# check_open_positions() left every open position unprotected while the
+# executor still reported ALIVE. Entry alive != exit protection alive.
+_EXIT_SCHEDULER_STATE = {
+    "last_cycle_start": 0.0,
+    "last_cycle_end": 0.0,
+    "cycles": 0,
+    "failures": 0,
+    "last_cycle_ms": 0.0,
+    "last_error": "",
+}
+_EXIT_SCHEDULER_STATE_LOCK = threading.Lock()
+
+
+def exit_scheduler_health() -> dict:
+    """Liveness of the dedicated exit lane. Consumed by diagnostics and the UI."""
+    with _EXIT_SCHEDULER_STATE_LOCK:
+        st = dict(_EXIT_SCHEDULER_STATE)
+    now = time.time()
+    st["started"] = bool(_EXIT_SCHEDULER_STARTED)
+    st["seconds_since_last_completion"] = (
+        (now - st["last_cycle_end"]) if st["last_cycle_end"] else None)
+    st["in_flight_seconds"] = (
+        (now - st["last_cycle_start"])
+        if st["last_cycle_start"] > st["last_cycle_end"] else 0.0)
+    try:
+        _target = float(_runner_aware_poll_interval())
+    except Exception:
+        _target = float(POLL_INTERVAL)
+    st["target_interval_sec"] = _target
+    # A cycle in flight for many multiples of its target is a hang, not slowness.
+    st["hung"] = bool(st["in_flight_seconds"] > max(30.0, _target * 40.0))
+    st["healthy"] = bool(
+        st["started"] and not st["hung"]
+        and (st["seconds_since_last_completion"] is None
+             or st["seconds_since_last_completion"] <= max(30.0, _target * 20.0)))
+    return st
+
+
+def _exit_scheduler_watchdog() -> None:
+    """Independent thread that can alarm WHILE the evaluator is wedged.
+
+    The in-evaluation cadence alarm can only report lateness after the
+    evaluation finally runs, so it cannot fire during the outage it exists to
+    detect. This watchdog runs outside the evaluation and can.
+    """
+    while True:
+        try:
+            h = exit_scheduler_health()
+            if h.get("hung"):
+                log.error(
+                    "[EXIT_SCHEDULER_HUNG] no cycle completion for %.1fs "
+                    "(target %.2fs) - OPEN POSITIONS MAY BE UNPROTECTED",
+                    h.get("in_flight_seconds") or 0.0,
+                    h.get("target_interval_sec") or 0.0)
+                update_heartbeat(EXIT_SCHEDULER_SERVICE, "ERROR",
+                                 f"HUNG in_flight={h.get('in_flight_seconds'):.1f}s")
+            elif h.get("healthy"):
+                update_heartbeat(
+                    EXIT_SCHEDULER_SERVICE, "ALIVE",
+                    f"cycles={h.get('cycles')} last_ms={h.get('last_cycle_ms'):.0f} "
+                    f"target={h.get('target_interval_sec'):.2f}s "
+                    f"failures={h.get('failures')}")
+            else:
+                update_heartbeat(EXIT_SCHEDULER_SERVICE, "DEGRADED",
+                                 str(h.get("last_error"))[:120] or "no recent cycle")
+        except Exception:
+            pass
+        time.sleep(5.0)
+
+
+def _exit_scheduler_loop() -> None:
+    log.info("EXIT_SCHEDULER_ONLINE dedicated runner/stop evaluator")
+    while True:
+        started = time.time()
+        with _EXIT_SCHEDULER_STATE_LOCK:
+            _EXIT_SCHEDULER_STATE["last_cycle_start"] = started
+        try:
+            check_open_positions("NONREAL")
+        except Exception as _exit_sched_err:
+            log.exception("EXIT_SCHEDULER_CYCLE_FAIL %s", _exit_sched_err)
+            with _EXIT_SCHEDULER_STATE_LOCK:
+                _EXIT_SCHEDULER_STATE["failures"] += 1
+                _EXIT_SCHEDULER_STATE["last_error"] = str(_exit_sched_err)[:200]
+        _ended = time.time()
+        with _EXIT_SCHEDULER_STATE_LOCK:
+            _EXIT_SCHEDULER_STATE["last_cycle_end"] = _ended
+            _EXIT_SCHEDULER_STATE["cycles"] += 1
+            _EXIT_SCHEDULER_STATE["last_cycle_ms"] = (_ended - started) * 1000.0
+        try:
+            target = max(0.20, float(_runner_aware_poll_interval()))
+        except Exception:
+            target = max(0.20, float(POLL_INTERVAL))
+        elapsed = _ended - started
+        # A sweep that already overran its target is the binding constraint on
+        # achievable cadence; surface it rather than silently spinning.
+        if elapsed > target * 2.0:
+            log.warning(
+                "[EXIT_SWEEP_OVERRUN] sweep=%.3fs target=%.3fs - achievable "
+                "cadence is bounded by sweep duration, not by the target",
+                elapsed, target)
+        time.sleep(max(0.05, target - elapsed))
+
+REAL_EXIT_SCHEDULER_SERVICE = "execution_engine_real_exit"
+
+
+def _real_exit_scheduler_loop() -> None:
+    """Dedicated funded-capital evaluator, never queued behind paper sweeps."""
+    log.info("REAL_EXIT_SCHEDULER_ONLINE dedicated funded-position evaluator")
+    while True:
+        started = time.time()
+        err = ""
+        try:
+            check_open_positions("REAL")
+        except Exception as exc:
+            err = f"{type(exc).__name__}:{exc}"
+            log.exception("REAL_EXIT_SCHEDULER_CYCLE_FAIL %s", exc)
+        elapsed = time.time() - started
+        try:
+            target = max(0.75, float(_runner_aware_poll_interval()))
+        except Exception:
+            target = max(0.75, float(POLL_INTERVAL))
+        try:
+            if err:
+                update_heartbeat(REAL_EXIT_SCHEDULER_SERVICE, "ERROR", err[:160])
+            elif elapsed > max(10.0, target * 5.0):
+                update_heartbeat(REAL_EXIT_SCHEDULER_SERVICE, "DEGRADED",
+                                 f"cycle={elapsed:.2f}s target={target:.2f}s")
+                log.warning("[REAL_EXIT_SWEEP_OVERRUN] sweep=%.3fs target=%.3fs", elapsed, target)
+            else:
+                update_heartbeat(REAL_EXIT_SCHEDULER_SERVICE, "ALIVE",
+                                 f"cycle={elapsed:.3f}s target={target:.2f}s")
+        except Exception:
+            pass
+        time.sleep(max(0.05, target - elapsed))
+
+
+def _start_exit_scheduler() -> None:
+    global _EXIT_SCHEDULER_STARTED
+    with _EXIT_SCHEDULER_START_LOCK:
+        if _EXIT_SCHEDULER_STARTED:
+            return
+        _EXIT_SCHEDULER_STARTED = True
+        threading.Thread(
+            target=_exit_scheduler_loop,
+            name="sentinuity-exit-scheduler",
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=_real_exit_scheduler_loop,
+            name="sentinuity-real-exit-scheduler",
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=_exit_scheduler_watchdog,
+            name="sentinuity-exit-watchdog",
+            daemon=True,
+        ).start()
+
 def run() -> None:
     ensure_executor_schema()
     # Start cognition writer thread before first log call - avoids lazy-init
@@ -5977,6 +8604,9 @@ def run() -> None:
     except Exception as e:
         log.warning("RECONCILER startup failed (non-fatal): %s", e)
 
+    # Exit protection is isolated from the potentially blocking entry scanner.
+    _start_exit_scheduler()
+
     cycle       = 0
     zombie_tick = 0
     _mg_stat_tick = 0
@@ -5987,9 +8617,11 @@ def run() -> None:
             zombie_tick += 1
             _mg_stat_tick += 1
 
-            # Core trading cycle
+            # OVERNIGHT_RUNTIME_SIGNOFF_20260809: the dedicated exit scheduler
+            # owns open-position evaluation.  Keeping exit checks in this entry
+            # loop would reintroduce duplicate close races and would still make
+            # protection wait behind scan_for_entries() network work.
             scan_for_entries()
-            check_open_positions()
 
             # Momentum gate periodic stats - every 20 cycles
             if _mg_stat_tick >= 20:
@@ -6047,7 +8679,9 @@ def run() -> None:
                         WHERE latched=1 AND COALESCE(execution_ready,0) IN (1,2)
                           AND candidate_state='latched'
                           AND observed_price IS NOT NULL AND observed_price > 0
-                          AND (? - COALESCE(created_at,timestamp,price_updated_at,0)) <= 1800
+                          AND (? - MAX(COALESCE(price_updated_at,0),
+                                       COALESCE(created_at,0),
+                                       COALESCE(timestamp,0))) <= 180
                     """, (_now_d,)).fetchone()[0]
                     # Count per-block-reason for the exec_ready rows that DON'T pass
                     wrong_state = conn.execute(
@@ -6074,7 +8708,12 @@ def run() -> None:
             log.exception("Execution engine loop error: %s", e)
             update_heartbeat(SERVICE_NAME, "ERROR", str(e)[:120])
 
-        time.sleep(max(0.20, _runner_aware_poll_interval()))
+        # PRICE_TRUTH_SIGNOFF_20260809 (blocker 10): the entry loop used to
+        # sleep on _runner_aware_poll_interval(), so an open 150% runner made
+        # scan_for_entries() run 4x/sec and contend with the exit scheduler for
+        # the same SQLite file. Rapid runner cadence belongs to the exit lane
+        # only; entry discovery keeps its own steady interval.
+        time.sleep(max(0.20, float(POLL_INTERVAL)))
 
 
 

@@ -108,6 +108,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+_GUARDIAN_STARTED_AT = time.time()  # process-local startup grace fallback
 if str(BASE_DIR) not in sys.path:
     sys.path.append(str(BASE_DIR))
 
@@ -161,8 +162,7 @@ CRITICAL_SERVICES: Dict[str, str] = {
     "polaris":                    "services.polaris",
     "sovereign_parameter_engine": "services.sovereign_parameter_engine",
     "replay_engine":              "services.replay_engine",
-    "polaris_auxiliary":           "services.polaris_auxiliary",
-    "reconnaissance_engine":       "services.reconnaissance_engine",
+    # x_scout is launcher-owned and supervised directly.
     "x_scout":                     "services.x_scout",
     # Launch-freshness replication trio
     "freshness_enforcer":          "services.freshness_enforcer",
@@ -183,6 +183,11 @@ SERVICE_LAUNCH_ARGS: Dict[str, list] = {
 # They are intentionally outside the core-10 restart contract.
 IMPORTANT_SERVICES: Dict[str, str] = {
     "code_vault":                "services.code_vault",
+    # These merged wrappers are not started by Launch_Sentinuity.bat. Their
+    # child services are launcher-owned individually, so auto-starting the
+    # wrappers would duplicate wallet/Telegram/X and Polaris side lanes.
+    "polaris_auxiliary":         "services.polaris_auxiliary",
+    "reconnaissance_engine":     "services.reconnaissance_engine",
 }
 
 # Services that should never be auto-restarted
@@ -294,23 +299,41 @@ def _log_health_event(event_type: str, service_name: str,
 # =============================================================================
 
 def _get_startup_marker_age(now: float) -> float:
+    """Age of this launch for startup-grace decisions.
+
+    A missing .startup_marker used to return the absolute epoch (`now`), making
+    the 120s startup grace permanently appear expired.  The launcher does not
+    create that marker in the current tree, so use this Guardian process's own
+    start time as the conservative fallback.
+    """
     marker = BASE_DIR / ".startup_marker"
     if marker.exists():
         try:
-            return now - marker.stat().st_mtime
+            age = now - marker.stat().st_mtime
+            if age >= 0:
+                return age
         except Exception:
             pass
-    return now
+    return max(0.0, now - _GUARDIAN_STARTED_AT)
 
 
 def _get_running_python_modules() -> set:
+    """Return lowercase tokens from real Python command lines.
+
+    Get-Process does not expose CommandLine on standard Windows PowerShell, so
+    the previous probe returned no module names and Guardian restarted services
+    that were already alive. CIM is the canonical process-command-line source.
+    """
     try:
         result = subprocess.run(
-            ["powershell", "-Command",
-             "Get-Process python* | Select-Object CommandLine | Format-List"],
-            capture_output=True, text=True, timeout=5,
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process | "
+             "Where-Object { $_.Name -match '^python(w)?(\\.exe)?$' } | "
+             "ForEach-Object { $_.CommandLine }"],
+            capture_output=True, text=True, timeout=8,
         )
-        return set(result.stdout.lower().split())
+        text = (result.stdout or "").lower()
+        return set(text.replace('\\', '/').split())
     except Exception:
         return set()
 
@@ -359,6 +382,13 @@ def detect_dead_services() -> List[Dict[str, Any]]:
 
     for service_name, module in CRITICAL_SERVICES.items():
         if service_name in SKIP_RESTART:
+            continue
+
+        # SIGNOFF_GUARDIAN_STARTUP_20260731: stale rows from the previous run
+        # must not trigger restarts while the canonical launcher is still
+        # starting services. The former guard covered only missing rows, not
+        # existing-but-stale rows, which caused duplicate processes at boot.
+        if startup_age < STARTUP_GRACE_SECONDS:
             continue
 
         hb = hb_map.get(service_name)
@@ -659,13 +689,31 @@ def _is_restart_allowed(service_name: str, now: float) -> bool:
     except Exception:
         pass
 
-    # Also check legacy JSON cooldown file
+    # Also enforce bounded restart history.  _record_restart() already stores
+    # one hour of timestamps; the former check filtered that list down to the
+    # 120s cooldown and therefore allowed a dead service (for example x_scout)
+    # to be respawned indefinitely every few minutes.
     try:
         if RESTART_STATE_FILE.exists():
             state = json.loads(RESTART_STATE_FILE.read_text())
-            times = [t for t in state.get(service_name, [])
-                     if now - t < RESTART_COOLDOWN_SECONDS]
-            if len(times) >= 3:
+            times_hour = [
+                float(t) for t in state.get(service_name, [])
+                if 0 <= now - float(t) < 3600.0
+            ]
+            max_per_hour = max(1, int(float(get_config_value(
+                "GUARDIAN_MAX_RESTARTS_PER_SERVICE_HOUR", 3
+            ))))
+            if len(times_hour) >= max_per_hour:
+                log.warning(
+                    "Restart suppressed for %s -- hourly ceiling %d reached",
+                    service_name, max_per_hour,
+                )
+                return False
+            if times_hour and now - max(times_hour) < RESTART_COOLDOWN_SECONDS:
+                log.debug(
+                    "Restart suppressed for %s -- cooldown %.0fs",
+                    service_name, RESTART_COOLDOWN_SECONDS - (now - max(times_hour)),
+                )
                 return False
     except Exception:
         pass
@@ -759,14 +807,18 @@ def decide_recovery_actions(
 
 def _claim_restart(service_name: str, now: float) -> bool:
     """
-    Atomic restart claim. Returns True only if this call successfully
-    claimed the restart slot (rowcount==1). Prevents double-restart.
+    Atomic restart claim.
+
+    Returns True only when THIS caller actually acquires the restart lease.
+    An existing unexpired lease is a hard False. This restores the mutual-
+    exclusion contract documented by the Guardian and prevents a second
+    recovery actor from spawning another process for the same service.
     """
     lease_until = now + RESTART_LEASE_SECONDS
     try:
         with get_connection() as conn:
-            # Only claim if lease has expired (no active claim)
-            rowcount = conn.execute(
+            # Existing row: claim only when its lease is absent/expired.
+            updated = conn.execute(
                 """
                 UPDATE service_heartbeats
                 SET restart_claimed_until=?
@@ -775,21 +827,24 @@ def _claim_restart(service_name: str, now: float) -> bool:
                 """,
                 (lease_until, service_name, now),
             ).rowcount
-            conn.commit()
-        if rowcount == 1:
-            return True
-        # No row to update -- insert a sentinel claim (without is_alive which may not exist)
-        with get_connection() as conn:
-            conn.execute(
+
+            if updated == 1:
+                conn.commit()
+                return True
+
+            # No existing row may legitimately need a sentinel. INSERT OR
+            # IGNORE tells us whether this caller actually created that claim.
+            inserted = conn.execute(
                 """
                 INSERT OR IGNORE INTO service_heartbeats
                     (service_name, status, note, last_heartbeat, restart_claimed_until)
                 VALUES (?, 'RESTARTING', 'guardian_restart_claim', ?, ?)
                 """,
                 (service_name, now, lease_until),
-            )
+            ).rowcount
             conn.commit()
-        return True
+            return inserted == 1
+
     except Exception as e:
         log.warning("_claim_restart failed for %s: %s", service_name, e)
         return False
@@ -819,6 +874,15 @@ def restart_service(service_name: str, module: str, reason: str = "") -> bool:
     Acquires atomic DB claim first. If claim fails, does not restart.
     """
     now = time.time()
+
+    # Final liveness precondition at the side-effect boundary.  The policy layer
+    # also checks this, but recovery paths such as feed/oracle autoheal can call
+    # restart_service() directly.  Never spawn a second module that is already
+    # present in the real Windows Python command lines.
+    if module.lower() in _get_running_python_modules():
+        log.info("Process already running for %s (%s) -- restart suppressed",
+                 service_name, module)
+        return False
 
     if not _claim_restart(service_name, now):
         log.info("Restart claim failed for %s -- another actor holds lease", service_name)
@@ -1453,6 +1517,15 @@ def check_oracle_liveness() -> dict:
 
 _last_oracle_heal: float = 0.0
 _last_feed_restart_at: float = 0.0
+
+# SIGNOFF_GUARDIAN_FEED_TRUTH_20260814
+# Feed starvation must persist across two Guardian observations before a
+# process restart can occur. These are deliberately process-local: a fresh
+# Guardian boot must earn a new starvation diagnosis after startup grace.
+_feed_starvation_candidate_key: str = ""
+_feed_starvation_candidate_since: float = 0.0
+_feed_starvation_candidate_count: int = 0
+
 _oracle_restart_pending_since: float = 0.0
 _oracle_restart_baseline_tick_ms: float = 0.0
 _oracle_restart_attempts: int = 0
@@ -1768,65 +1841,411 @@ def check_pipeline_zero_latch() -> dict:
 
 def check_feed_starvation() -> dict:
     """
-    Detect when pump_monitor/ingest has stopped feeding new rows.
-    Uses MAX(updated_at, created_at, timestamp) - not first_seen_at first.
-    Also purges null-timestamp MTM rows that corrupt the pipeline.
-    Rate-limited to once per 300s.
+    Detect a genuinely starved discovery/resolution/snapshot feed.
+
+    Historical comparison:
+      - This function's former implementation is byte-identical in the
+        current tree, the 2026-07-26 exceptional tree and the 2026-07-08
+        golden winning tree.
+      - The old query converted absent timestamp evidence into epoch zero and
+        then evaluated `now - 0`, producing a fictitious ~56-year outage.
+      - It then restarted BOTH pump_monitor and ingest_pipeline even when
+        producer-written rows proved one of those lanes was still working.
+
+    Constitutional recovery contract:
+      UNKNOWN  = no trustworthy freshness can be established. Never restart.
+      HEALTHY  = snapshot activity is younger than FEED_STARVATION_SEC.
+      DEGRADED = stale snapshot/feed evidence exists but has not yet persisted
+                 for two independent observations >=60s apart.
+      STARVED  = stale evidence is corroborated by the producer lanes and has
+                 persisted across two observations. Recovery is lane-targeted.
+
+    The existing 600s starvation threshold and 300s feed restart cooldown are
+    intentionally preserved. This change fixes truth/restart semantics rather
+    than retuning thresholds.
     """
     global _last_feed_restart_at
+    global _feed_starvation_candidate_key
+    global _feed_starvation_candidate_since
+    global _feed_starvation_candidate_count
+
     now = time.time()
     FEED_STARVATION_SEC = 600
     FEED_RESTART_RATE   = 300
+    CONFIRM_MIN_SEC     = 60
+
+    def _normalise_epoch(value):
+        """Return validated epoch seconds or None. No zero/NULL coercion."""
+        if value is None:
+            return None
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return None
+
+        # Reject NaN/inf without adding another module dependency.
+        if v != v or v in (float("inf"), float("-inf")):
+            return None
+
+        # Normalise common millisecond/microsecond epochs.
+        if v > 1.0e14:
+            v /= 1.0e6
+        elif v > 1.0e11:
+            v /= 1.0e3
+
+        # 2001-09-09 is deliberately permissive for this project's history,
+        # while still making epoch-zero impossible to treat as feed truth.
+        if v <= 1_000_000_000:
+            return None
+        if v > now + 300:
+            return None
+        return v
+
+    def _latest_table_activity(conn, table_name, candidate_columns):
+        """
+        Read producer-written timestamps independently.
+
+        MAX(col) naturally ignores NULL and returns NULL for all-NULL/empty
+        inputs. We never place COALESCE(...,0) inside the aggregate.
+        """
+        try:
+            table_cols = {
+                str(r["name"]) if hasattr(r, "keys") else str(r[1])
+                for r in conn.execute(
+                    f'PRAGMA table_info("{table_name}")'
+                ).fetchall()
+            }
+        except Exception:
+            return None, None
+
+        newest = None
+        newest_source = None
+
+        for col in candidate_columns:
+            if col not in table_cols:
+                continue
+            try:
+                row = conn.execute(
+                    f'SELECT MAX("{col}") AS newest FROM "{table_name}"'
+                ).fetchone()
+                raw = row["newest"] if row is not None and hasattr(row, "keys") else (
+                    row[0] if row else None
+                )
+            except Exception:
+                continue
+
+            ts = _normalise_epoch(raw)
+            if ts is not None and (newest is None or ts > newest):
+                newest = ts
+                newest_source = col
+
+        return newest, newest_source
+
+    def _age(ts):
+        return None if ts is None else max(0.0, now - ts)
+
+    def _reset_candidate():
+        global _feed_starvation_candidate_key
+        global _feed_starvation_candidate_since
+        global _feed_starvation_candidate_count
+        _feed_starvation_candidate_key = ""
+        _feed_starvation_candidate_since = 0.0
+        _feed_starvation_candidate_count = 0
+
     try:
+        # Match the startup protection already used by dead-service recovery.
+        startup_age = _get_startup_marker_age(now)
+        if startup_age < STARTUP_GRACE_SECONDS:
+            _reset_candidate()
+            msg = (
+                f"FEED_FRESHNESS_UNKNOWN startup_grace "
+                f"age={startup_age:.0f}s<{STARTUP_GRACE_SECONDS}s"
+            )
+            log.info(msg)
+            return {
+                "ok": False,
+                "critical": False,
+                "state": "UNKNOWN",
+                "message": msg,
+            }
+
         with get_connection() as conn:
-            # Purge null-timestamp MTM rows every cycle - safe, always correct
-            purged = conn.execute("""
-                DELETE FROM market_snapshots
-                WHERE candidate_state = 'mtm'
-                  AND created_at IS NULL
-                  AND updated_at IS NULL
-                  AND first_seen_at IS NULL
-            """).rowcount
-            if purged > 0:
-                conn.commit()
-                log.info("MTM_NULL_PURGE: deleted %d null-timestamp mtm rows", purged)
+            # Preserve the existing bounded MTM cleanup behaviour. It is not
+            # used as evidence for freshness.
+            purged = 0
+            try:
+                ms_cols = {
+                    str(r["name"]) if hasattr(r, "keys") else str(r[1])
+                    for r in conn.execute(
+                        'PRAGMA table_info("market_snapshots")'
+                    ).fetchall()
+                }
+                required = {
+                    "candidate_state", "created_at",
+                    "updated_at", "first_seen_at"
+                }
+                if required.issubset(ms_cols):
+                    purged = conn.execute("""
+                        DELETE FROM market_snapshots
+                        WHERE candidate_state = 'mtm'
+                          AND created_at IS NULL
+                          AND updated_at IS NULL
+                          AND first_seen_at IS NULL
+                    """).rowcount
+                    if purged > 0:
+                        conn.commit()
+                        log.info(
+                            "MTM_NULL_PURGE: deleted %d null-timestamp mtm rows",
+                            purged,
+                        )
+            except Exception as purge_exc:
+                log.debug("MTM null purge skipped: %s", purge_exc)
 
-            newest = conn.execute("""
-                SELECT MAX(
-                    MAX(COALESCE(updated_at,0),
-                        COALESCE(created_at,0),
-                        COALESCE(timestamp,0))
-                ) FROM market_snapshots
-            """).fetchone()[0] or 0
+            # Arrival truth first; pricing refresh truth second.
+            snapshot_ts, snapshot_src = _latest_table_activity(
+                conn,
+                "market_snapshots",
+                (
+                    "first_seen_at",
+                    "price_updated_at",
+                    "created_at",
+                    "timestamp",
+                    "updated_at",
+                ),
+            )
 
-        newest_age = now - float(newest)
-        if newest_age < FEED_STARVATION_SEC:
-            msg = f"Feed active - newest row {newest_age:.0f}s ago"
+            # Pump writes first_seen_at/timestamp with the row itself. This is a
+            # stronger work corroborator than heartbeat under DB contention.
+            raw_ts, raw_src = _latest_table_activity(
+                conn,
+                "raw_dna",
+                ("first_seen_at", "timestamp", "created_at", "processed_at"),
+            )
+
+            # Resolver writes created_at on every canonical resolution.
+            resolved_ts, resolved_src = _latest_table_activity(
+                conn,
+                "resolved_transactions",
+                ("created_at", "resolved_at", "block_time"),
+            )
+
+        snapshot_age = _age(snapshot_ts)
+        raw_age      = _age(raw_ts)
+        resolved_age = _age(resolved_ts)
+
+        # No trustworthy snapshot timestamp is UNKNOWN, never "56 years stale".
+        if snapshot_age is None:
+            _reset_candidate()
+            msg = (
+                "FEED_FRESHNESS_UNKNOWN "
+                f"snapshot_timestamp_unavailable "
+                f"raw_age={raw_age if raw_age is not None else 'unknown'} "
+                f"resolved_age={resolved_age if resolved_age is not None else 'unknown'}"
+            )
+            log.warning(msg)
+            return {
+                "ok": False,
+                "critical": False,
+                "state": "UNKNOWN",
+                "message": msg,
+            }
+
+        # Snapshot feed is active. Clear any pending starvation diagnosis.
+        if snapshot_age < FEED_STARVATION_SEC:
+            _reset_candidate()
+            msg = (
+                f"Feed active - snapshot_age={snapshot_age:.0f}s "
+                f"via={snapshot_src or 'unknown'}"
+            )
             if purged > 0:
                 msg += f" | purged {purged} null-ts MTM rows"
-            return {"ok": True, "message": msg}
+            return {
+                "ok": True,
+                "critical": False,
+                "state": "HEALTHY",
+                "message": msg,
+            }
 
-        if now - _last_feed_restart_at < FEED_RESTART_RATE:
-            return {"ok": False, "critical": False,
-                    "message": f"Feed starved ({newest_age:.0f}s) - restart rate-limited"}
+        # We refuse to infer lane death when the producer evidence needed to
+        # discriminate lanes is itself unavailable.
+        if raw_age is None or resolved_age is None:
+            _reset_candidate()
+            msg = (
+                f"FEED_FRESHNESS_UNKNOWN snapshot_age={snapshot_age:.0f}s "
+                f"raw_age={raw_age if raw_age is not None else 'unknown'} "
+                f"resolved_age={resolved_age if resolved_age is not None else 'unknown'}"
+            )
+            log.warning(msg)
+            return {
+                "ok": False,
+                "critical": False,
+                "state": "UNKNOWN",
+                "message": msg,
+            }
 
-        _last_feed_restart_at = now
-        log.warning(
-            "FEED_STARVATION: no new market_snapshots for %.0fs - restarting pump_monitor + ingest_pipeline",
-            newest_age,
+        raw_fresh      = raw_age < FEED_STARVATION_SEC
+        resolved_fresh = resolved_age < FEED_STARVATION_SEC
+
+        # Lane diagnosis:
+        # - Pump is producing but resolution/weave is stale -> ingest only.
+        # - Pump + resolver are producing but snapshots are stale -> weave is
+        #   still inside ingest_pipeline -> ingest only.
+        # - Pump is stale but resolver still drains backlog -> pump only.
+        # - All three are stale -> both discovery and ingest are genuinely dead.
+        if raw_fresh:
+            recovery_key = "INGEST"
+            targets = [("ingest_pipeline", "services.ingest_pipeline")]
+            lane_reason = (
+                "WEAVE_STALE" if resolved_fresh else "RESOLVER_STALE"
+            )
+        elif resolved_fresh:
+            recovery_key = "PUMP"
+            targets = [("pump_monitor", "services.pump_monitor")]
+            lane_reason = "DISCOVERY_STALE_RESOLVER_DRAINING"
+        else:
+            recovery_key = "PUMP+INGEST"
+            targets = [
+                ("pump_monitor", "services.pump_monitor"),
+                ("ingest_pipeline", "services.ingest_pipeline"),
+            ]
+            lane_reason = "DISCOVERY_AND_RESOLVER_STALE"
+
+        candidate_key = (
+            f"{recovery_key}|{lane_reason}|"
+            f"{int(snapshot_age // 60)}"
         )
-        _log_health_event("FEED_STARVATION", SERVICE_NAME,
-                          f"No new snapshots for {newest_age:.0f}s - restarting feed services",
-                          "WARNING")
-        for svc, mod in [
-            ("pump_monitor",    "services.pump_monitor"),
-            ("ingest_pipeline", "services.ingest_pipeline"),
-        ]:
-            restart_service(svc, mod, reason=f"FEED_STARVATION_{newest_age:.0f}s")
-        return {"ok": False, "critical": False, "auto_healed": True,
-                "message": f"Feed starved {newest_age:.0f}s - restarted pump_monitor + ingest_pipeline"}
+
+        # Require the same lane diagnosis twice and at least 60 seconds apart.
+        # Minute-bucket age is intentionally not part of identity below because
+        # a persisting outage naturally ages across minute boundaries.
+        identity = f"{recovery_key}|{lane_reason}"
+
+        if _feed_starvation_candidate_key != identity:
+            _feed_starvation_candidate_key = identity
+            _feed_starvation_candidate_since = now
+            _feed_starvation_candidate_count = 1
+
+            msg = (
+                f"FEED_DEGRADED lane={recovery_key} reason={lane_reason} "
+                f"snapshot_age={snapshot_age:.0f}s "
+                f"raw_age={raw_age:.0f}s resolved_age={resolved_age:.0f}s "
+                "awaiting_confirmation"
+            )
+            log.warning(msg)
+            return {
+                "ok": False,
+                "critical": False,
+                "state": "DEGRADED",
+                "message": msg,
+            }
+
+        _feed_starvation_candidate_count += 1
+        observed_for = now - _feed_starvation_candidate_since
+
+        if (
+            _feed_starvation_candidate_count < 2
+            or observed_for < CONFIRM_MIN_SEC
+        ):
+            msg = (
+                f"FEED_DEGRADED lane={recovery_key} reason={lane_reason} "
+                f"snapshot_age={snapshot_age:.0f}s "
+                f"confirmation_age={observed_for:.0f}s"
+            )
+            return {
+                "ok": False,
+                "critical": False,
+                "state": "DEGRADED",
+                "message": msg,
+            }
+
+        # Preserve the existing feed-path cooldown.
+        if now - _last_feed_restart_at < FEED_RESTART_RATE:
+            msg = (
+                f"FEED_STARVED lane={recovery_key} "
+                f"snapshot_age={snapshot_age:.0f}s - recovery rate-limited"
+            )
+            return {
+                "ok": False,
+                "critical": False,
+                "state": "STARVED",
+                "message": msg,
+            }
+
+        restarted = []
+        suppressed = []
+
+        for svc, mod in targets:
+            # check_feed_starvation historically bypassed this policy layer.
+            # Restore the existing cooldown/lease policy before executor entry.
+            if not _is_restart_allowed(svc, now):
+                suppressed.append(svc)
+                continue
+
+            if restart_service(
+                svc,
+                mod,
+                reason=(
+                    f"FEED_STARVATION_{lane_reason}_"
+                    f"snapshot_{snapshot_age:.0f}s"
+                ),
+            ):
+                restarted.append(svc)
+            else:
+                suppressed.append(svc)
+
+        if restarted:
+            _last_feed_restart_at = now
+            _log_health_event(
+                "FEED_STARVATION",
+                SERVICE_NAME,
+                (
+                    f"Confirmed {lane_reason}; snapshot={snapshot_age:.0f}s "
+                    f"raw={raw_age:.0f}s resolved={resolved_age:.0f}s; "
+                    f"restarted={','.join(restarted)}"
+                ),
+                "WARNING",
+            )
+
+        _reset_candidate()
+
+        if restarted:
+            msg = (
+                f"FEED_STARVED lane={recovery_key} "
+                f"restarted={','.join(restarted)}"
+            )
+            log.warning(msg)
+            return {
+                "ok": False,
+                "critical": False,
+                "auto_healed": True,
+                "state": "STARVED",
+                "message": msg,
+            }
+
+        msg = (
+            f"FEED_STARVED lane={recovery_key} recovery_suppressed="
+            f"{','.join(suppressed) if suppressed else 'policy'}"
+        )
+        log.warning(msg)
+        return {
+            "ok": False,
+            "critical": False,
+            "state": "STARVED",
+            "message": msg,
+        }
+
     except Exception as e:
-        return {"ok": False, "critical": False, "message": f"Feed starvation check failed: {e}"}
+        # A broken observer is UNKNOWN. It must never turn its own exception
+        # into authority to restart production services.
+        _reset_candidate()
+        msg = f"FEED_FRESHNESS_UNKNOWN observer_error={e}"
+        log.warning(msg)
+        return {
+            "ok": False,
+            "critical": False,
+            "state": "UNKNOWN",
+            "message": msg,
+        }
 
 
 def check_drawdown_halt() -> dict:

@@ -143,6 +143,23 @@ LEGACY_COHORT_REASON = "LEGACY_NO_USD_BASIS"
 # Rows written before the repair could not compute executable_pct at all, so
 # they are excluded from readiness evidence. Legacy rows are never deleted or
 # rewritten -- only ignored by the gate.
+# STOP_TRUTH_SIGNOFF_20260808: the cohort had no time bound, so the median was
+# computed over every probe ever taken at basis_version >= 2. It mixed oracle
+# regimes, moved glacially (111 -> 127 samples across 12 hours) and could not
+# reflect a repair even after one landed. Bounded to a rolling window; the
+# window is deliberately long enough that it cannot be gamed into a tiny,
+# flattering sample, and MIN_SAMPLES_ABSOLUTE still applies inside it.
+COHORT_WINDOW_SEC = float(os.environ.get("STOP_PROBE_COHORT_WINDOW_SEC", str(72 * 3600)))
+
+
+def _cohort_where() -> str:
+    cutoff = time.time() - COHORT_WINDOW_SEC
+    return (f"WHERE COALESCE(basis_version,{LEGACY_BASIS_VERSION}) >= {BASIS_VERSION} "
+            f"AND COALESCE(trigger_ts, created_at, 0) >= {cutoff:.3f}")
+
+
+# Retained as a module-level name for any external reader; the gate itself uses
+# _cohort_where() so the window is evaluated at call time rather than import.
 COHORT_WHERE = f"WHERE COALESCE(basis_version,{LEGACY_BASIS_VERSION}) >= {BASIS_VERSION}"
 
 _ADDED_COLUMNS = (
@@ -154,6 +171,12 @@ _ADDED_COLUMNS = (
     ("quote_network_sec", "REAL"),
     ("basis_version", "INTEGER"),
     ("cohort_reason", "TEXT"),
+    # SENTINUITY_EXIT_INFRA_20260805 phase instrumentation
+    ("metadata_lookup_sec", "REAL"),
+    ("metadata_source", "TEXT"),
+    ("metadata_provider", "TEXT"),
+    ("metadata_cache_hit", "INTEGER"),
+    ("metadata_failure_type", "TEXT"),
 )
 
 
@@ -315,15 +338,37 @@ def probe_stop(
             return _insert(conn, row)
 
         # Raw amount -- the same raw/decimals boundary the live sell uses.
+        # SENTINUITY_EXIT_INFRA_20260805: metadata lookup is timed separately so
+        # trigger_to_quote_sec can be attributed. probe_error now carries the
+        # exact failure type and provider host instead of a bare class name.
+        _meta_t0 = time.time()
         try:
             from decimal import Decimal
-            decimals = int(LT._get_token_decimals(mint))
+            try:
+                from services import token_metadata as _TM
+                _meta = _TM.resolve_decimals(mint)
+            except Exception as _meta_exc:
+                _meta = {"decimals": None, "source": "resolver_unavailable",
+                         "provider": "", "cache_hit": False,
+                         "failure_type": f"{type(_meta_exc).__name__}"}
+            row["metadata_lookup_sec"] = max(0.0, time.time() - _meta_t0)
+            row["metadata_source"] = str(_meta.get("source") or "")
+            row["metadata_provider"] = str(_meta.get("provider") or "")
+            row["metadata_cache_hit"] = 1 if _meta.get("cache_hit") else 0
+            if _meta.get("decimals") is None:
+                row["metadata_failure_type"] = str(_meta.get("failure_type") or "unresolved")
+                raise RuntimeError(
+                    f"token_decimals_unresolved:{row['metadata_failure_type']}"
+                    f"@{row['metadata_provider'] or 'none'}")
+            decimals = int(_meta["decimals"])
             raw_amount = int(Decimal(str(quantity)) * (Decimal(10) ** decimals))
             row["token_decimals"] = decimals
             row["token_raw_amount"] = raw_amount
         except Exception as exc:
+            if row.get("metadata_lookup_sec") is None:
+                row["metadata_lookup_sec"] = max(0.0, time.time() - _meta_t0)
             row.update(probe_status="decimals_failed",
-                       probe_error=f"{type(exc).__name__}",
+                       probe_error=f"{type(exc).__name__}: {exc}"[:200],
                        integrity_status="NO_TOKEN_RESOLUTION")
             return _insert(conn, row)
 
@@ -351,15 +396,24 @@ def probe_stop(
                 if out_amt <= 0 or not LT.validate_jupiter_route(q):
                     continue
                 cand = {"bps": bps, "q": q, "out": out_amt}
-                if best is None or cand["out"] > best["out"]:
-                    best = cand
+                best = cand
+                # Primary route authority: the live seller uses one primary
+                # quote and at most one fallback. Once a valid primary route
+                # exists, requesting every higher-slippage tier only adds a
+                # second network round trip and makes stop readiness measure
+                # quote-shopping latency rather than executable availability.
+                break
         except Exception as exc:
             row.update(probe_status="quote_error", probe_error=f"{type(exc).__name__}:{exc}"[:200])
 
         quote_end_ts = time.time()
         row["quote_start_ts"] = quote_start_ts
         row["quote_end_ts"] = quote_end_ts
-        row["pre_quote_setup_sec"] = max(0.0, quote_start_ts - now)
+        # SENTINUITY_EXIT_INFRA_20260805: metadata lookup is reported on its own
+        # axis, so pre_quote_setup_sec now measures only non-metadata setup.
+        # trigger_to_quote_sec below is unchanged and remains the gated metric.
+        row["pre_quote_setup_sec"] = max(
+            0.0, (quote_start_ts - now) - float(row.get("metadata_lookup_sec") or 0.0))
         row["quote_network_sec"] = max(0.0, quote_end_ts - quote_start_ts)
         row["trigger_to_quote_sec"] = max(0.0, quote_end_ts - now)
 
@@ -597,6 +651,7 @@ def _insert(conn, row: Dict[str, Any]) -> Optional[int]:
 
 def coverage(conn) -> Dict[str, Any]:
     """Sign-off statistics. Read-only."""
+    COHORT_WHERE = _cohort_where()
     out = {"n": 0, "quote_coverage_pct": 0.0, "no_route_pct": 0.0,
            "median_executable_pct": None, "p75": None, "p90": None, "worst": None,
            "latency_model": latency_model(conn)["model"]}
@@ -640,6 +695,17 @@ MAX_P90_STOP_PCT = -15.0
 MAX_WORST_STOP_PCT = -25.0
 MAX_MEDIAN_TRIGGER_TO_QUOTE_SEC = 1.5
 MAX_P90_TRIGGER_TO_QUOTE_SEC = 3.0
+# STOP_TRUTH_SIGNOFF_20260808: trigger_to_quote_sec measures only probe-internal
+# latency (our own call -> Jupiter's reply) and was passing comfortably. The
+# metric that actually explains a -31% median is the age of the MARK that fired
+# the stop: the engine cannot react to a collapse it has not observed yet.
+# trigger_mark_age_sec was already recorded on every row and gated by nothing.
+# Mode-B rejections in the 2026-08-07/08 window show marks of 31s-141s. A stop
+# commanded on a 60s-old price on a token of this volatility is not a -4% stop
+# in any meaningful sense, and the executable measurement was correctly
+# reporting the consequence.
+MAX_MEDIAN_TRIGGER_MARK_AGE_SEC = 5.0
+MAX_P90_TRIGGER_MARK_AGE_SEC = 15.0
 # Concentration guard for the reduced-sample path: no single mint may supply
 # more than this share, so 50 probes of one token cannot stand in for 50 probes.
 MAX_MINT_CONCENTRATION_PCT = 25.0
@@ -664,6 +730,7 @@ def readiness(conn) -> Dict[str, Any]:
     FAIL-CLOSED: any error returns STATUS_INCOMPLETE with the error recorded.
     """
     out = {"status": STATUS_INCOMPLETE, "blocking": [], "stats": {}}
+    COHORT_WHERE = _cohort_where()
     try:
         ensure_schema(conn)
         n = int(conn.execute(
@@ -682,6 +749,9 @@ def readiness(conn) -> Dict[str, Any]:
         lats = [float(r[0]) for r in conn.execute(
             f"SELECT trigger_to_quote_sec FROM {LEDGER_TABLE} "
             f"{COHORT_WHERE} AND trigger_to_quote_sec IS NOT NULL") if r[0] is not None]
+        mark_ages = [float(r[0]) for r in conn.execute(
+            f"SELECT trigger_mark_age_sec FROM {LEDGER_TABLE} "
+            f"{COHORT_WHERE} AND trigger_mark_age_sec IS NOT NULL") if r[0] is not None]
 
         cov = (100.0 * ok_n / n) if n else 0.0
         nrp = (100.0 * nr / n) if n else 0.0
@@ -697,6 +767,9 @@ def readiness(conn) -> Dict[str, Any]:
             "worst_executable_pct": min(pcts) if pcts else None,
             "median_trigger_to_quote_sec": _pctile(lats, 0.50),
             "p90_trigger_to_quote_sec": _pctile(lats, 0.90),
+            "median_trigger_mark_age_sec": _pctile(mark_ages, 0.50),
+            "p90_trigger_mark_age_sec": _pctile(mark_ages, 0.90),
+            "mark_age_samples": len(mark_ages),
             "max_mint_concentration_pct": conc,
             "latency_model": latency_model(conn)["model"],
         }
@@ -743,6 +816,23 @@ def readiness(conn) -> Dict[str, Any]:
                 B.append(f"p90 trigger->quote "
                          f"{st['p90_trigger_to_quote_sec']:.2f}s > "
                          f"{MAX_P90_TRIGGER_TO_QUOTE_SEC}s")
+
+        # STOP_TRUTH_SIGNOFF_20260808: stale marks are a hard failure, not an
+        # incomplete sample. Firing live money on a price this old is the
+        # specific danger the governor exists to prevent, and naming it
+        # explicitly tells the operator WHICH repair unblocks live.
+        if st["median_trigger_mark_age_sec"] is None:
+            B.append("trigger_mark_age_sec not measured on any probe")
+        else:
+            if st["median_trigger_mark_age_sec"] > MAX_MEDIAN_TRIGGER_MARK_AGE_SEC:
+                B.append(f"median trigger mark age "
+                         f"{st['median_trigger_mark_age_sec']:.1f}s > "
+                         f"{MAX_MEDIAN_TRIGGER_MARK_AGE_SEC}s -- stops fire on "
+                         f"prices too old to be actionable"); failed = True
+            if st["p90_trigger_mark_age_sec"] > MAX_P90_TRIGGER_MARK_AGE_SEC:
+                B.append(f"p90 trigger mark age "
+                         f"{st['p90_trigger_mark_age_sec']:.1f}s > "
+                         f"{MAX_P90_TRIGGER_MARK_AGE_SEC}s"); failed = True
 
         if B:
             out["status"] = STATUS_FAILED if failed else STATUS_INCOMPLETE

@@ -179,7 +179,8 @@ except Exception:
 def _db_connect() -> sqlite3.Connection:
     if _USE_SCHEMA:
         return get_connection()
-    conn = sqlite3.connect(str(DB_PATH), timeout=15, check_same_thread=False)
+    from core.schema import get_critical_connection
+    conn = get_critical_connection("matrix")
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=15000")
@@ -643,18 +644,48 @@ def _remove_mint_event_ts(mint: str) -> None:
 
 
 # ── BONDING CURVE LOOKUP (FIXED) ──────────────────────────────────────────────
-import base58 as _b58_mod
+# `base58` is optional.  The oracle must remain importable when that third-party
+# package is absent because solders may still provide PDA derivation and the
+# internal codec below is sufficient for the pure-Python fallback.
+try:
+    import base58 as _b58_mod
+except ImportError:
+    _b58_mod = None
+
+_B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_B58_INDEX = {ch: i for i, ch in enumerate(_B58_ALPHABET)}
 
 _bc_cache: Dict[str, str] = {}
 _bc_cache_lock = threading.Lock()
 
 
-def _b58decode(s: str) -> bytes:
-    return _b58_mod.b58decode(s)
+def _b58decode(value: str) -> bytes:
+    if _b58_mod is not None:
+        return _b58_mod.b58decode(value)
+    raw = str(value or "").encode("ascii")
+    number = 0
+    for ch in raw:
+        if ch not in _B58_INDEX:
+            raise ValueError(f"invalid base58 character: {chr(ch)!r}")
+        number = number * 58 + _B58_INDEX[ch]
+    body = number.to_bytes((number.bit_length() + 7) // 8, "big") if number else b""
+    leading_zeroes = len(raw) - len(raw.lstrip(b"1"))
+    return (b"\x00" * leading_zeroes) + body
 
 
-def _b58encode(b: bytes) -> str:
-    return _b58_mod.b58encode(b).decode()
+def _b58encode(value: bytes) -> str:
+    if _b58_mod is not None:
+        return _b58_mod.b58encode(value).decode("ascii")
+    raw = bytes(value)
+    number = int.from_bytes(raw, "big")
+    encoded = bytearray()
+    while number:
+        number, remainder = divmod(number, 58)
+        encoded.append(_B58_ALPHABET[remainder])
+    leading_zeroes = len(raw) - len(raw.lstrip(b"\x00"))
+    prefix = b"1" * leading_zeroes
+    body = bytes(reversed(encoded)) if encoded else b""
+    return (prefix + body).decode("ascii")
 
 
 def _rpc_call(method: str, params: list) -> Optional[dict]:
@@ -1195,30 +1226,60 @@ def _write_mtm(mint: str, price_usd: float, source: str = "helius") -> None:
     try:
         import sqlite3 as _sq3
         _idb_path = str(Path(__file__).resolve().parent.parent / "sentinuity_intelligence.db")
-        _ic = _sq3.connect(_idb_path, timeout=5.0)
-        _ic.execute("PRAGMA journal_mode=WAL")
-        _ic.execute("""
-            CREATE TABLE IF NOT EXISTS mtm_ticks (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                mint_address TEXT NOT NULL,
-                price_usd    REAL NOT NULL,
-                ts_ms        INTEGER NOT NULL,
-                source       TEXT DEFAULT 'ws'
-            )
-        """)
-        _ic.execute(
-            "INSERT INTO mtm_ticks (mint_address, price_usd, ts_ms, source) "
-            "VALUES (?, ?, ?, ?)",
-            (mint, price_usd, int(now * 1000), source),
-        )
-        _ic.commit()
+        # MODE3_FINAL_SIGNOFF_20260806 (invariant D)
+        # DEFECT: the canonical mark write used a bare sqlite3.connect() and
+        # bypassed core.schema entirely -- no ResilientCursor, no WAL check, no
+        # shared retry policy. 157 of 157 captured ws_price_oracle.log lines are
+        # [MTM_INTEL_WRITE_FAIL] ... database is locked, and the failure was
+        # swallowed with log.warning. Route through the hardened intel factory.
+        # Canonical MTM is execution-critical truth. Do not route it through
+        # get_intel_connection(), whose resilient cursor can retry for 30s;
+        # bounded failure is safer than freezing oracle coverage behind a writer.
+        from core.schema import get_critical_connection as _m3_crit
+        _ic = _m3_crit("intel")
+        # Schema is created during service initialisation. Avoid per-tick DDL and
+        # journal-mode negotiation, both of which request stronger SQLite locks.
+        _base_ts_ms = int(now * 1000)
+        _inserted = False
+        for _attempt in range(4):
+            try:
+                # Preserve observed time while avoiding same-millisecond local
+                # writer collisions. The retry ordinal is local identity only;
+                # upstream slot remains separate telemetry where available.
+                _ts_ms = _base_ts_ms + _attempt
+                _ic.execute(
+                    "INSERT INTO mtm_ticks (mint_address, price_usd, ts_ms, source) "
+                    "VALUES (?, ?, ?, ?)",
+                    (mint, price_usd, _ts_ms, source),
+                )
+                _ic.commit()
+                _inserted = True
+                break
+            except _sq3.IntegrityError as _ce:
+                if "UNIQUE constraint" not in str(_ce) or _attempt >= 3:
+                    raise
+            except _sq3.OperationalError as _oe:
+                if "locked" not in str(_oe).lower() or _attempt >= 3:
+                    raise
+                time.sleep(0.025 * (2 ** _attempt))
+        if not _inserted:
+            raise RuntimeError("mtm_tick_write_not_committed")
         _ic.close()
         log.info(
             "[MTM_INTEL_WRITE_OK] mint=%s price=%.10f source=%s",
             mint[:16], price_usd, source,
         )
     except Exception as _ie:
-        log.warning("[MTM_INTEL_WRITE_FAIL] mint=%s error=%s", mint[:16], _ie)
+        # MODE3_FINAL_SIGNOFF_20260806 (invariant D): a lost canonical mark is
+        # an execution-critical write failure, not a warning. Raise a blocker so
+        # no NEW live entry is opened while marks are being dropped. Existing
+        # positions keep evaluating; exits are never suppressed by this.
+        log.error("[MTM_INTEL_WRITE_FAIL] mint=%s error=%s", mint[:16], _ie)
+        try:
+            from core.schema import record_critical_write_failure as _m3_fail
+            _m3_fail(f"mtm_tick_write mint={str(mint)[:16]}", _ie)
+        except Exception:
+            pass
     # ─────────────────────────────────────────────────────────────────────────
 
     try:
@@ -1297,26 +1358,30 @@ def _write_mtm(mint: str, price_usd: float, source: str = "helius") -> None:
         _sent0707_peak_ok = 1 if _sent0707_peak_trusted_source(source) else 0
         _pp_cols = {r[1] for r in conn.execute("PRAGMA table_info(paper_positions)").fetchall()}
 
+        # PRICE_TRUTH_SIGNOFF_20260806: the oracle is an observation producer,
+        # not the authoritative peak writer. It may refresh last/display state,
+        # but cannot advance `highest_price_seen` without exact-size executable
+        # evidence evaluated by execution_engine.update_position_mark().
+        _parts = ["last_price=?", "last_marked_at=?"]
+        _vals = [price_usd, now]
         if "mark_source" in _pp_cols:
-            conn.execute(
-                """
-                UPDATE paper_positions SET
-                    last_price = ?, last_marked_at = ?, mark_source = ?,
-                    highest_price_seen = CASE WHEN ? = 1 AND COALESCE(highest_price_seen, 0) <= ? THEN ? ELSE COALESCE(highest_price_seen, 0) END
-                WHERE mint_address = ? AND status = 'OPEN'
-                """,
-                (price_usd, now, source, _sent0707_peak_ok, price_usd, price_usd, mint),
+            _parts.append("mark_source=?")
+            _vals.append(source)
+        if "display_high_price" in _pp_cols:
+            _parts.append(
+                "display_high_price=CASE WHEN COALESCE(display_high_price,0)>? "
+                "THEN display_high_price ELSE ? END"
             )
-        else:
-            conn.execute(
-                """
-                UPDATE paper_positions SET
-                    last_price = ?, last_marked_at = ?,
-                    highest_price_seen = CASE WHEN ? = 1 AND COALESCE(highest_price_seen, 0) <= ? THEN ? ELSE COALESCE(highest_price_seen, 0) END
-                WHERE mint_address = ? AND status = 'OPEN'
-                """,
-                (price_usd, now, _sent0707_peak_ok, price_usd, price_usd, mint),
-            )
+            _vals.extend([price_usd, price_usd])
+        if "display_high_source" in _pp_cols:
+            _parts.append("display_high_source=?")
+            _vals.append(source)
+        _vals.append(mint)
+        conn.execute(
+            f"UPDATE paper_positions SET {', '.join(_parts)} "
+            "WHERE mint_address=? AND status='OPEN'",
+            tuple(_vals),
+        )
         # PnL intentionally NOT written here.
         # Only update_position_mark() in execution_engine may write
         # unrealized_pnl_usd - it gates on router can_execute_exit.
@@ -1380,7 +1445,8 @@ def _is_open_position_mint(mint: str) -> bool:
     now = time.time()
     if now - _open_position_mints_last_check > _OPEN_MINTS_CACHE_TTL:
         try:
-            _c = sqlite3.connect(str(DB_PATH), timeout=2.0)
+            from core.schema import get_critical_connection as _m3_crit
+            _c = _m3_crit("matrix")
             rows = _c.execute(
                 """SELECT DISTINCT mint_address,
                     MAX(COALESCE(trusted_peak_pct,runner_peak_pct,runner_latch_peak_pct,peak_pnl_pct,0)) AS peak
@@ -1418,6 +1484,7 @@ class HeliusOracle:
         # positions without flooding logs every poll cycle.
         self._position_coverage_logged: Set[str] = set()
         self._wss_pre_throttle: Dict[str, float] = {}  # mint -> last WSS event ts
+        self._runner_coverage_repair_ts: Dict[str, float] = {}
 
     def _next_id(self) -> int:
         with self._req_lock:
@@ -1532,12 +1599,32 @@ class HeliusOracle:
             all_tasks = (message_task, manager_task, ping_task, stale_task,
                          failsafe_task, keepalive_task, watchdog_task)
             try:
-                await asyncio.gather(*all_tasks, return_exceptions=True)
+                # SIGNOFF_ORACLE_LIFECYCLE_20260801: terminate this connection
+                # generation when any lifecycle task ends.  The prior gather()
+                # waited for every infinite monitor task, leaving self._ws bound
+                # to a dead socket after the receive loop had already closed.
+                done, pending = await asyncio.wait(
+                    all_tasks, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    try:
+                        exc = task.exception()
+                    except asyncio.CancelledError:
+                        exc = None
+                    if exc is not None:
+                        log.warning("ws_oracle: lifecycle task ended: %s", exc)
             finally:
                 for t in all_tasks:
                     if not t.done():
                         t.cancel()
                 await asyncio.gather(*all_tasks, return_exceptions=True)
+                # SIGNOFF_EDGE_RESTORE_20260731 R4a: DISCARD the dead socket.
+                # Without this, self._ws held a CLOSED websocket until the next
+                # successful connect. _force_subscribe()'s "if self._ws is None"
+                # queue path was therefore unreachable, and every subscribe
+                # attempt during the dead window was sent into a closed socket
+                # and lost. Clearing the handle re-arms the existing queue.
+                self._ws = None
 
     async def _message_loop(self, ws):
         from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
@@ -1579,11 +1666,30 @@ class HeliusOracle:
             if not mint:
                 return
 
-            decoded = decode_bonding_curve(data[0])
-            if not decoded:
+            # PRICE_TRUTH_MIGRATION_HANDOFF_20260809:
+            # A completed Pump bonding curve is historical state.  Its virtual
+            # reserves remain decodable after PumpSwap handoff, but that frozen
+            # marginal price is NOT the market a holder can currently sell into.
+            # The 3-hour audit showed this stale curve price clustering around
+            # ~2x the contemporaneous Jupiter full-position route.  Never write
+            # it into MTM once complete; let the normal fallback/DEX route cover
+            # the migrated token instead.
+            decoded_state = decode_bonding_curve_state(data[0])
+            if not decoded_state:
+                return
+            if bool(decoded_state.get("complete")):
+                log.info("[CURVE_MIGRATION_HANDOFF] mint=%s completed_curve_ignored=1",
+                         mint[:16])
+                # Sentinel keeps the subscription manager from treating the
+                # frozen curve as a trustworthy event source.  The staleness
+                # monitor/keepalive will obtain post-migration market context.
+                _remove_mint_event_ts(mint)
                 return
 
-            vsol, vtok = decoded
+            vsol = float(decoded_state.get("virtual_sol_reserves") or 0.0)
+            vtok = float(decoded_state.get("virtual_token_reserves") or 0.0)
+            if vsol <= 0 or vtok <= 0:
+                return
             sol_usd = _get_sol_usd()
             price_sol = (vsol / 1e9) / (vtok / 1e6)
             price_usd = price_sol * sol_usd
@@ -1639,6 +1745,13 @@ class HeliusOracle:
         except Exception as e:
             self._pending_reqs.pop(req_id, None)
             log.warning("[ORACLE_SUBSCRIBE_FAIL] mint=%s reason=send_failed: %s", mint[:16], e)
+            # SIGNOFF_EDGE_RESTORE_20260731 R4b: requeue instead of dropping. A failed send means the
+            # socket died mid-flight; the mint had no subscription and nothing
+            # retried it, so MTM went permanently stale for that position and
+            # peak/runner tracking never received an advancing price.
+            if not hasattr(self, "_pending_force_mints"):
+                self._pending_force_mints = set()
+            self._pending_force_mints.add(mint)
             # WSS dead - fetch HTTP fallback price so qualified rows get priced.
             # RATE GUARD: max one fallback attempt per mint per 30s.
             # Without this, a reconnect storm fires Birdeye 1200x/min and burns quota.
@@ -1792,7 +1905,7 @@ class HeliusOracle:
         Drain is handled correctly by _subscription_manager() and _force_subscribe().
         """
         while True:
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(3.0)
             try:
                 loop = asyncio.get_running_loop()
 
@@ -1893,10 +2006,20 @@ class HeliusOracle:
                     # HOT set empty AND prices haven't been written in 90s = stalled
                     new_state = "STALLED"
                     _stall_consecutive += 1
-                elif _no_hot_mints or hot_age < 10.0:
+                elif _no_hot_mints and any_age <= 45.0:
+                    # Quiet market with recent global writes: healthy, not idle-stalled.
                     new_state = "HEALTHY"
                     _stall_consecutive = 0
-                elif hot_age < 30.0:
+                elif hot_age < 20.0:
+                    new_state = "HEALTHY"
+                    _stall_consecutive = 0
+                elif hot_age < 60.0 and any_age < 45.0 and wpm >= 2:
+                    # MODE3_3H_EDGE_RECOVERY_20260807: the prior 30-second hard
+                    # boundary repeatedly labelled an active 3-5 WPM one-mint
+                    # oracle STALLED, causing resubscription churn and a total
+                    # live-entry veto. Preserve visibility as DEGRADED while the
+                    # execution guard performs candidate-specific freshness and
+                    # executability checks.
                     new_state = "DEGRADED"
                     _stall_consecutive = 0
                 else:
@@ -2065,43 +2188,55 @@ class HeliusOracle:
 
     async def _coverage_failsafe(self):
         """
-        Hard failsafe: for every OPEN position with zero post-entry Intel ticks,
-        immediately fetch DexScreener and write a coverage_failsafe tick.
-        Runs every 5s independently of WSS subscription state.
-        This ensures the meter always has SOME price even when WSS/PDA fails.
+        Preserve ordinary zero-tick coverage and actively repair runner streams.
+        A runner with no post-entry Intel tick for >5s is resubscribed and gets
+        a bounded fallback write, closing the observed 25-34s coverage gap
+        without inventing a second polling engine.
         """
-        import sqlite3 as _sq3
         while True:
-            await asyncio.sleep(5.0)
+            await asyncio.sleep(2.0)
             try:
                 loop = asyncio.get_running_loop()
                 open_positions = await loop.run_in_executor(None, self._get_open_positions_with_opened_at)
                 if not open_positions:
                     continue
+                now = time.time()
                 for mint, opened_at in open_positions:
-                    # Check post-entry tick count in Intel DB
-                    tick_count = await loop.run_in_executor(
-                        None, self._count_post_entry_ticks, mint, opened_at
-                    )
-                    if tick_count == 0:
+                    tick_age = await loop.run_in_executor(None, self._latest_post_entry_tick_age, mint, opened_at)
+                    is_runner = await loop.run_in_executor(None, _is_runner_position_mint, mint)
+                    zero_ticks = tick_age is None
+                    runner_dark = bool(is_runner and (tick_age is None or tick_age > 8.0))
+                    if not (zero_ticks or runner_dark):
+                        continue
+                    if runner_dark and now - self._runner_coverage_repair_ts.get(mint, 0.0) >= 20.0:
+                        self._runner_coverage_repair_ts[mint] = now
                         log.warning(
-                            "[COVERAGE_FAILSAFE] mint=%s opened_at=%.0f ZERO post-entry ticks - waterfall fetch",
-                            mint[:16], opened_at,
+                            "[RUNNER_COVERAGE_DARK] mint=%s tick_age=%s forcing resubscribe+fallback",
+                            mint[:16], "NONE" if tick_age is None else f"{tick_age:.1f}s",
                         )
                         try:
-                            price, src = await loop.run_in_executor(None, _fetch_best_fallback_price, mint)
-                            if price and price > 0:
-                                await loop.run_in_executor(None, _write_mtm, mint, price, "coverage_failsafe_" + src)
-                                log.info(
-                                    "[COVERAGE_FAILSAFE_OK] mint=%s price=%.10f source=%s",
-                                    mint[:16], price, src,
-                                )
-                            else:
-                                log.warning("[COVERAGE_FAILSAFE_FAIL] mint=%s all sources returned no price", mint[:16])
-                        except Exception as e:
-                            log.warning("[COVERAGE_FAILSAFE_ERROR] mint=%s: %s", mint[:16], e)
-            except Exception as e:
-                log.warning("[COVERAGE_FAILSAFE_LOOP_ERROR] %s", e)
+                            if self._ws is not None:
+                                if mint in self._subscribed:
+                                    await self._unsubscribe_mint(self._ws, mint)
+                                    await asyncio.sleep(0.05)
+                                await self._subscribe_mint(self._ws, mint)
+                        except Exception as resub_error:
+                            log.warning("[RUNNER_COVERAGE_RESUB_FAIL] mint=%s error=%s", mint[:16], resub_error)
+                    try:
+                        price, src = await loop.run_in_executor(None, _fetch_best_fallback_price, mint)
+                        if price and price > 0:
+                            prefix = "coverage_failsafe_runner_" if runner_dark else "coverage_failsafe_"
+                            await loop.run_in_executor(None, _write_mtm, mint, price, prefix + src)
+                            log.info(
+                                "[COVERAGE_FAILSAFE_OK] mint=%s runner=%s age=%s price=%.10f source=%s",
+                                mint[:16], is_runner, "NONE" if tick_age is None else f"{tick_age:.1f}s", price, src,
+                            )
+                        else:
+                            log.warning("[COVERAGE_FAILSAFE_FAIL] mint=%s all sources returned no price", mint[:16])
+                    except Exception as fetch_error:
+                        log.warning("[COVERAGE_FAILSAFE_ERROR] mint=%s: %s", mint[:16], fetch_error)
+            except Exception as loop_error:
+                log.warning("[COVERAGE_FAILSAFE_LOOP_ERROR] %s", loop_error)
 
     def _get_open_positions_with_opened_at(self) -> list:
         """Returns list of (mint, opened_at) for all OPEN positions."""
@@ -2116,12 +2251,33 @@ class HeliusOracle:
         except Exception:
             return []
 
+    def _latest_post_entry_tick_age(self, mint: str, opened_at: float):
+        """Return seconds since the latest post-entry Intel tick, or None."""
+        try:
+            idb_path = str(Path(__file__).resolve().parent.parent / "sentinuity_intelligence.db")
+            from core.schema import get_critical_connection as _m3_crit
+            ic = _m3_crit("intel")
+            row = ic.execute(
+                "SELECT MAX(ts_ms) FROM mtm_ticks WHERE mint_address=? AND ts_ms>=?",
+                (mint, float(opened_at) * 1000.0),
+            ).fetchone()
+            ic.close()
+            if not row or row[0] is None:
+                return None
+            ts = float(row[0])
+            if ts > 1e11:
+                ts /= 1000.0
+            return max(0.0, time.time() - ts)
+        except Exception:
+            return None
+
     def _count_post_entry_ticks(self, mint: str, opened_at: float) -> int:
         """Count Intel DB ticks after position open time."""
         try:
             import sqlite3 as _sq3
             idb_path = str(Path(__file__).resolve().parent.parent / "sentinuity_intelligence.db")
-            ic = _sq3.connect(idb_path, timeout=2.0)
+            from core.schema import get_critical_connection as _m3_crit
+            ic = _m3_crit("intel")
             count = ic.execute(
                 "SELECT COUNT(*) FROM mtm_ticks WHERE mint_address=? AND ts_ms>=?",
                 (mint, opened_at * 1000)
@@ -2132,14 +2288,19 @@ class HeliusOracle:
             return 0
 
     async def _force_subscribe(self, mint: str):
-        if self._ws is None:
-            # WS not ready - queue mint for immediate subscription on next connect
+        # SIGNOFF_ORACLE_LIFECYCLE_20260801: a closed socket is equivalent to
+        # no socket. Queue the mint until the reconnect loop installs a live one.
+        _ws = self._ws
+        _closed = bool(getattr(_ws, "closed", False)) if _ws is not None else True
+        if _ws is None or _closed:
+            if _ws is self._ws:
+                self._ws = None
             if not hasattr(self, "_pending_force_mints"):
                 self._pending_force_mints = set()
             self._pending_force_mints.add(mint)
-            log.info("[ORACLE_QUEUE] mint=%s queued for immediate subscribe (ws not ready)", mint[:16])
+            log.info("[ORACLE_QUEUE] mint=%s queued for immediate subscribe (ws unavailable)", mint[:16])
             return
-        await self._subscribe_mint(self._ws, mint)
+        await self._subscribe_mint(_ws, mint)
         # Drain any queued mints now that WS is ready
         if hasattr(self, "_pending_force_mints") and self._pending_force_mints:
             _queued = list(self._pending_force_mints)
@@ -2277,7 +2438,8 @@ def _sentinuity_signoff_open_conn():
     import sqlite3 as _sqlite3
     from pathlib import Path as _Path
     root = _Path(__file__).resolve().parent.parent
-    return _sqlite3.connect(str(root / "sentinuity_matrix.db"), timeout=5.0)
+    from core.schema import get_critical_connection as _m3_crit
+    return _m3_crit("matrix")
 
 
 def _sentinuity_signoff_table_cols(conn, table: str) -> set[str]:

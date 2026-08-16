@@ -306,7 +306,8 @@ config_fixes = [
     # INFRASTRUCTURE ONLY — these are safe to reset on every boot.
     # DO NOT add trading strategy values here (liquidity, mcap, token age, drawdown)
     # — those are owned by Polaris and must never be overwritten on launch.
-    ("TRADING_MODE",                   "paper",   "Always launch in live mode — paused/paper from end_of_day is cleared"),
+    # SIGNOFF_EXCEPTIONAL_REBASE_20260801: TRADING_MODE is launcher-owned.
+    # Never overwrite the operator-selected paper/dual/live mode during prelaunch.
     ("DRAWDOWN_HALT_ACTIVE",           "0",      "Clear any stale halt"),
     ("DRAWDOWN_SOFT_BRAKE",            "0",      "Clear soft brake"),
     ("EXECUTOR_WRITE_LATENCY_LIMIT_MS","10000",  "10s — prevents false blocks"),
@@ -353,8 +354,8 @@ config_fixes = [
     # With supervisor stamping latched_at=now at latch, executor measures from latch (2-5s)
     # so signal_age is always ~2-5s -> freshness~0.99 -> passes all gates
     # These are safety net values in case running instance hasn't restarted yet
-    ("EXECUTOR_PHASE_A_MAX_PRICE_AGE",   "600",  "Phase A price gate — 600s matches supervisor window"),
-    ("EXECUTOR_PHASE_A_MAX_SIGNAL_AGE",  "600",  "Phase A signal gate — from latched_at not discovery"),
+    ("EXECUTOR_PHASE_A_MAX_PRICE_AGE",   "120",  "Phase A price gate — aligned with execution_engine source default"),
+    ("EXECUTOR_PHASE_A_MAX_SIGNAL_AGE",  "120",  "Phase A signal gate — aligned with execution_engine source default"),
     # FRESHNESS: exp(-signal_age/276.89). Old 0.85 = required <45s (impossible). 0.20 = up to 450s.
     # With stamp fix: signal_age~2-5s -> freshness~0.99 -> trivially passes 0.20 floor.
     ("EXECUTOR_FRESHNESS_MIN",           "0.20", "Freshness floor — 0.20 allows up to ~450s signal age"),

@@ -75,6 +75,16 @@ except Exception:
 _PRIVATE_KEY_B58  = os.getenv("SOLANA_PRIVATE_KEY", "").strip()
 _LIVE_MAX_POS_USD_ENV = os.getenv("LIVE_MAX_POSITION_USD", "").strip()
 _JUPITER_KEY      = os.getenv("JUPITER_PRICE_API_KEY", "").strip()
+
+
+def _jupiter_headers() -> dict:
+    """Authentication header for api.jup.ag.
+
+    SENTINUITY_JUPITER_AUTH_20260806. Returns an empty mapping when no key is
+    configured, preserving the previous unauthenticated behaviour. The key is
+    never logged or persisted.
+    """
+    return {"x-api-key": _JUPITER_KEY} if _JUPITER_KEY else {}
 _RPC_URL          = os.getenv("QUICKNODE_RPC") or os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 
 # PUBLIC_DUAL_STUB / FAMILY_LIVE_CANARY distribution boundary.
@@ -370,12 +380,16 @@ def get_live_wallet_balance() -> Optional[float]:
     Fetch real SOL balance from chain for the trading wallet.
     Returns balance in USD (SOL * current price) or None on failure.
     """
+    # REGRESSION_AUDIT_20260805: this guard was copied into get_live_wallet_balance()
+    # during the HIGH->AM transition but references `result`, `position_id` and
+    # `mint` — none of which exist in this scope. As written it raises
+    # NameError on every call whenever the submission contract is unmet (i.e.
+    # in all paper postures). Behaviour preserved and made explicit: the
+    # function contract is Optional[float], so an unmet contract returns None.
     _submit_ok, _submit_reason = _real_submission_contract()
     if not _submit_ok:
-        result["error"] = "live_submission_stubbed:" + _submit_reason
-        result["mode"] = "stub"
-        log.warning("[LIVE_SELL_STUBBED] pos=%s mint=%s reason=%s", position_id, str(mint)[:16], _submit_reason)
-        return result
+        log.warning("[LIVE_BALANCE_STUBBED] reason=%s", _submit_reason)
+        return None
     kp = _load_keypair()
     if not kp:
         return None
@@ -429,8 +443,11 @@ def _get_jupiter_quote(
                 "amount":      amount_lamports,
                 "slippageBps": slippage_bps,
             },
-            headers={},
-            timeout=5,
+            headers=_jupiter_headers(),
+            # SENTINUITY_JUPITER_AUTH_20260806: bound connect/read separately.
+            # This prevents a nominal five-second scalar timeout from consuming
+            # roughly ten seconds per tier on the stop critical path.
+            timeout=(2.0, 4.0),
         )
         if r.status_code != 200:
             log.error("[LIVE] Jupiter quote failed: %s %s", r.status_code, r.text[:200])
@@ -476,7 +493,7 @@ def _execute_jupiter_swap(
                 "quoteResponse": quote, "userPublicKey": wallet_pubkey,
                 "wrapAndUnwrapSol": True, "dynamicComputeUnitLimit": True,
                 "prioritizationFeeLamports": int(float(os.getenv("LIVE_PRIORITY_FEE_LAMPORTS", "50000"))),
-            }, headers={}, timeout=10,
+            }, headers=_jupiter_headers(), timeout=(2.0, 4.0),
         )
         outcome["timings"]["jupiter_swap_build_sec"] = round(time.perf_counter() - build_started, 6)
         if r.status_code != 200:
@@ -910,27 +927,60 @@ def _sync_wallet_to_system_state() -> None:
     except Exception as exc:
         log.warning("[LIVE_WALLET_SYNC_FALLBACK_FAIL] %s", exc)
 
+def _rpc_read_candidates() -> list[tuple[str, str]]:
+    """Unique HTTP RPC endpoints for fail-closed read-only provenance checks."""
+    keys = ("QUICKNODE_RPC", "CHAINSTACK_RPC", "HELIUS_RPC", "SOLANA_RPC_URL")
+    out, seen = [], set()
+    for key in keys:
+        value = str(os.getenv(key, "") or "").strip()
+        if not value or value in seen or value.lower().startswith(("ws://", "wss://")):
+            continue
+        seen.add(value)
+        out.append((key, value))
+    if not out and _RPC_URL and not str(_RPC_URL).lower().startswith(("ws://", "wss://")):
+        out.append(("PRIMARY_RPC", str(_RPC_URL)))
+    return out[:4]
+
+
 def _rpc_get_account_info(address: str, *, encoding: str = "jsonParsed") -> Optional[dict]:
-    """Read one account without mutating chain state."""
-    try:
-        import requests
-        response = requests.post(
-            _RPC_URL,
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getAccountInfo",
-                "params": [address, {"encoding": encoding, "commitment": "confirmed"}],
-            },
-            timeout=7,
-        )
-        payload = response.json()
-        if payload.get("error"):
-            return None
-        return (payload.get("result") or {}).get("value")
-    except Exception as exc:
-        log.warning("[LIVE_TOKEN_PROVENANCE_RPC_FAIL] address=%s err=%s", str(address)[:16], exc)
-        return None
+    """Read one account with bounded provider fallback; never invent success.
+
+    A transient failure of one provider previously surfaced as
+    ``mint_account_unavailable`` and blocked otherwise valid Mode-3 entries.
+    This remains fail-closed: the function returns a value only when an RPC
+    actually returns the requested account at confirmed commitment.
+    """
+    import requests
+    last_error = "no_rpc_candidates"
+    for label, endpoint in _rpc_read_candidates():
+        try:
+            response = requests.post(
+                endpoint,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getAccountInfo",
+                    "params": [address, {"encoding": encoding, "commitment": "confirmed"}],
+                },
+                timeout=(1.5, 2.5),
+            )
+            if response.status_code != 200:
+                last_error = f"{label}:http_{response.status_code}"
+                continue
+            payload = response.json()
+            if payload.get("error"):
+                last_error = f"{label}:rpc_error"
+                continue
+            value = (payload.get("result") or {}).get("value")
+            if value:
+                return value
+            last_error = f"{label}:account_missing"
+        except Exception as exc:
+            last_error = f"{label}:{type(exc).__name__}"
+            continue
+    log.warning("[LIVE_TOKEN_PROVENANCE_RPC_FAIL] address=%s err=%s",
+                str(address)[:16], last_error)
+    return None
 
 
 def _canonical_pump_curve_address(mint: str) -> Optional[str]:
@@ -1153,6 +1203,7 @@ def execute_live_buy(
         "actual_price": None, "actual_qty": None, "error": None,
         "mode": "live", "reconciliation_state": "NOT_SUBMITTED",
         "timings": {},
+        "timeline": {"live_function_entered_at": time.time()},
     }
     started = time.perf_counter()
     _submit_ok, _submit_reason = _real_submission_contract()
@@ -1200,9 +1251,11 @@ def execute_live_buy(
             return result
         lamports_in = int((Decimal(str(pos_size_usd)) / Decimal(str(sol_usd))) * Decimal(1_000_000_000))
 
+        result["timeline"]["route_requested_at"] = time.time()
         t0 = time.perf_counter()
         quote = _get_jupiter_quote(_SOL_MINT, mint, lamports_in, _BUY_SLIPPAGE_BPS)
         quote_received_mono = time.perf_counter()
+        result["timeline"]["route_received_at"] = time.time()
         result["timings"]["quote_request_sec"] = round(quote_received_mono - t0, 6)
         if not quote or not validate_jupiter_route(quote):
             result["error"] = "jupiter_quote_failed_or_invalid"
@@ -1230,12 +1283,14 @@ def execute_live_buy(
 
         t0 = time.perf_counter()
         max_quote_age = float(os.getenv("LIVE_MAX_QUOTE_AGE_SEC", "3.0"))
+        result["timeline"]["signing_started_at"] = time.time()
         swap = _execute_jupiter_swap(
             quote, wallet_pubkey, kp,
             quote_received_mono=quote_received_mono,
             max_quote_age_sec=max_quote_age,
         )
         submitted_wall = time.time()
+        result["timeline"]["submitted_at"] = submitted_wall
         result["timings"].update(swap.get("timings") or {})
         result["timings"]["compose_sign_broadcast_sec"] = round(time.perf_counter() - t0, 6)
         sig = swap.get("tx_sig")
@@ -1272,6 +1327,7 @@ def execute_live_buy(
                            state="SUBMITTED", error="local_confirmation_timeout")
             return result
         result["confirmed"] = True
+        result["timeline"]["confirmed_local_at"] = time.time()
         result["reconciliation_state"] = "BUY_CONFIRMED_UNRESOLVED"
         _ledger_upsert(sig, side="BUY", mint=mint, position_id=position_id,
                        state="CONFIRMED_UNRESOLVED", confirmed_at=time.time())
@@ -1307,6 +1363,8 @@ def execute_live_buy(
             "fill_meta": fill,
             "reconciliation_state": "OPEN_REAL",
         })
+        result["timeline"]["chain_block_time"] = result["chain_confirmed_at"]
+        result["timeline"]["reconciled_at"] = result["reconciled_at"]
         result["timings"]["total_sec"] = round(time.perf_counter() - started, 6)
         _ledger_upsert(sig, side="BUY", mint=mint, position_id=position_id,
                        state="RESOLVED",
@@ -1511,17 +1569,36 @@ def blacklist_mint(mint: str, reason: str) -> None:
 
 _TOKEN_DECIMALS_CACHE: dict[str, int] = {}
 def _get_token_decimals(mint: str) -> int:
+    """Resolve SPL mint decimals via the shared cross-process metadata cache.
+
+    SENTINUITY_EXIT_INFRA_20260805: the previous implementation used a
+    process-local dict over a single un-retried RPC call with a scalar 8s
+    timeout (applied by requests to connect AND read independently). Measured
+    result in the n=16 stop cohort: 6 probes failed outright and setup latency
+    ran 5.88-15.27s for a value that is immutable per mint and was 6 on every
+    successful row.
+
+    Behaviour preserved: still returns an int, still raises a RuntimeError
+    subclass on failure, still never guesses. TokenMetadataUnresolved derives
+    from RuntimeError and its message retains the leading
+    "token_decimals_unresolved" token, so existing handlers are unaffected.
+    """
     cached = _TOKEN_DECIMALS_CACHE.get(mint)
     if cached is not None:
         return cached
     try:
-        result = _rpc_call("getTokenSupply", [mint, {"commitment": "confirmed"}], timeout=8.0)
-        value = int(((result or {}).get("value") or {}).get("decimals") or 0)
-        _TOKEN_DECIMALS_CACHE[mint] = value
-        return value
+        from services.token_metadata import get_decimals as _tm_get_decimals
     except Exception as exc:
-        log.error("[TOKEN_DECIMALS] mint=%s error=%s", mint[:16], exc)
+        log.error("[TOKEN_DECIMALS] metadata module unavailable mint=%s error=%s",
+                  str(mint)[:16], exc)
         raise RuntimeError("token_decimals_unresolved") from exc
+    try:
+        value = int(_tm_get_decimals(mint))
+    except Exception as exc:
+        log.error("[TOKEN_DECIMALS] mint=%s error=%s", str(mint)[:16], exc)
+        raise
+    _TOKEN_DECIMALS_CACHE[mint] = value
+    return value
 
 
 def verify_token_balance(mint: str, wallet_pubkey: str) -> float:

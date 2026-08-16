@@ -1,213 +1,188 @@
 from __future__ import annotations
 
-"""
-services/substrate_opportunity_scanner.py
-===============================================================================
-SUBSTRATE OPPORTUNITY SCANNER — REAL-PRICE V3 (SUBSTRATE_REAL_PRICE_20260721)
+"""Evidence-driven Substrate opportunity scanner (paper research lane).
 
-V2 defect (review blocker 6): this file hard-coded SOL=150 / WETH=3500 /
-cbBTC=100000 and stamped price_updated_at=now on every scan — fantasy prices
-wearing perpetually fresh timestamps, labelled COUNCIL_RESEARCH.
-
-V3 behaviour:
-  * Seed templates carry NO price. Every inserted opportunity's price comes
-    from services/substrate_price_feed.get_prices() — a real provider with a
-    real provider timestamp. price_updated_at is the provider's source_ts,
-    never now.
-  * A guarded price_status column records FRESH/DEGRADED per row.
-  * When no actionable price exists the opportunity is NOT inserted; the
-    heartbeat reports exactly how many assets were price-blocked and why.
-  * SEED_MOCK insertion exists only behind SUBSTRATE_ALLOW_SEED_MOCK
-    (default off): price_status='SEED_MOCK', price_updated_at=0,
-    route_provider='seed_mock'. The paper ledger refuses to open positions
-    from such rows, so mock data can never become fake PnL or promotion
-    evidence.
-  * A guarded strategy_id column attributes every opportunity to a strategy
-    so closes can update substrate_strategy_scores.
+This scanner replaces the former hard-coded three-row basket. It collects real,
+provider-timestamped marks from the canonical price feed and only emits an
+opportunity after sufficient price history exists to calculate a reproducible
+signal. No literal confidence or expected-edge values are used.
 """
 
 import argparse
 import json
+import math
 import os
+import statistics
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List
 
-from wallets.substrate_wallet_schema import (
-    connect, ensure_schema, heartbeat, cfg_bool, _ensure_col,
-)
-from wallets.substrate_allocation_engine import propose_allocation
-from services.substrate_price_feed import (
-    ACTIONABLE_STATUSES, STATUS_SEED_MOCK, get_prices, seed_mock_contract,
-)
+from wallets.substrate_wallet_schema import connect, ensure_schema, heartbeat, cfg_float, cfg_int, _ensure_col
+from services.substrate_price_feed import ASSETS, ACTIONABLE_STATUSES, get_prices
 
-# ── SEED TEMPLATE HONESTY (SUBSTRATE_SEED_LABELLING_20260728) ───────────────
-# _seed_templates() below is a HARDCODED three-asset list with LITERAL
-# confidence and expected_edge values typed into source. It is NOT a scanner,
-# NOT a signal, and NOT a strategy. It must never be presented as evidence of
-# channel-strategy PnL, council-derived edge, strategy validation, or
-# profitable autonomous trading.
-#
-# The classification below travels with every row so downstream consumers
-# (strategy scores, UI panels, audit reports) cannot mistake a static basket
-# for a validated strategy.
-SEED_TEMPLATE_CLASSIFICATION = ("SEED_TEMPLATE", "NON_SIGNAL", "RESEARCH_ONLY")
-SEED_TEMPLATE_STRATEGY_ID = "SUBSTRATE_SEED_TEMPLATE_NON_SIGNAL"
-SEED_TEMPLATE_NOTE = (
-    "Hardcoded research basket. Literal confidence/expected_edge values; no "
-    "price-action signal was computed. NOT a profitable strategy claim."
-)
-
-DEFAULT_STRATEGY_ID = SEED_TEMPLATE_STRATEGY_ID
+STRATEGY_ID = "SUBSTRATE_EVIDENCE_MOMENTUM_V1"
 
 
-def _seed_templates() -> List[Dict]:
-    """Approved spot universe. NO prices here — prices come from the feed."""
-    return [
-        {
-            "source": "COUNCIL_RESEARCH", "chain": "solana",
-            "asset_symbol": "SOL", "asset_address": "native",
-            "asset_type": "spot", "native_or_wrapped": "native",
-            "confidence": 0.72, "expected_edge": 0.06,
-            "liquidity_usd": 100000000, "volume_5m_usd": 1000000,
-            "risk_score": 0.28, "strategy_id": DEFAULT_STRATEGY_ID,
-            "raw_json": {"phase": "council_fetch",
-                         "note": "core low-fee Solana exposure",
-                         "classification": SEED_TEMPLATE_CLASSIFICATION,
-                         "not_a_strategy": SEED_TEMPLATE_NOTE},
-        },
-        {
-            "source": "COUNCIL_RESEARCH", "chain": "base",
-            "asset_symbol": "WETH", "asset_address": "wrapped",
-            "asset_type": "spot", "native_or_wrapped": "wrapped",
-            "confidence": 0.66, "expected_edge": 0.035,
-            "liquidity_usd": 50000000, "volume_5m_usd": 500000,
-            "risk_score": 0.42, "strategy_id": DEFAULT_STRATEGY_ID,
-            "raw_json": {"phase": "wrapped_exposure",
-                         "note": "ETH exposure on cheaper chain, not native ETH",
-                         "classification": SEED_TEMPLATE_CLASSIFICATION,
-                         "not_a_strategy": SEED_TEMPLATE_NOTE},
-        },
-        {
-            "source": "COUNCIL_RESEARCH", "chain": "base",
-            "asset_symbol": "cbBTC", "asset_address": "wrapped",
-            "asset_type": "spot", "native_or_wrapped": "wrapped",
-            "confidence": 0.64, "expected_edge": 0.025,
-            "liquidity_usd": 35000000, "volume_5m_usd": 250000,
-            "risk_score": 0.48, "strategy_id": DEFAULT_STRATEGY_ID,
-            "raw_json": {"phase": "wrapped_exposure",
-                         "note": "BTC exposure via tokenized asset; small allocation only",
-                         "classification": SEED_TEMPLATE_CLASSIFICATION,
-                         "not_a_strategy": SEED_TEMPLATE_NOTE},
-        },
-    ]
+def _ensure_cols(con) -> None:
+    for name, ddl in (
+        ("price_status", "TEXT"), ("strategy_id", "TEXT"),
+        ("score_json", "TEXT"), ("discovery_at", "REAL"),
+        ("timeframe_or_regime", "TEXT"),
+        # Evidence-presence flags. MISSING is a first-class value: it must
+        # never be collapsed into 0 by a reader (audit finding A3).
+        ("liquidity_status", "TEXT"), ("volume_status", "TEXT"),
+    ):
+        _ensure_col(con, "substrate_opportunities", name, ddl)
 
 
-def _ensure_scanner_cols(con) -> None:
-    _ensure_col(con, "substrate_opportunities", "price_status", "TEXT")
-    _ensure_col(con, "substrate_opportunities", "strategy_id", "TEXT")
+def _history(con, symbol: str, limit: int) -> List[dict]:
+    rows = con.execute(
+        "SELECT price,source_ts,observed_ts,status,confidence,source "
+        "FROM substrate_price_marks WHERE asset=? AND price>0 "
+        "AND status IN ('FRESH','DEGRADED') ORDER BY observed_ts DESC LIMIT ?",
+        (symbol, int(limit)),
+    ).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
+def _signal_from_history(rows: List[dict], round_trip_cost_pct: float) -> Dict:
+    prices = [float(r["price"]) for r in rows if float(r.get("price") or 0) > 0]
+    if len(prices) < 4:
+        return {"actionable": False, "reason": "insufficient_history", "samples": len(prices)}
+    rets = [(prices[i] / prices[i - 1] - 1.0) * 100.0 for i in range(1, len(prices))]
+    short_n = min(3, len(rets))
+    short_mom = sum(rets[-short_n:])
+    long_mom = (prices[-1] / prices[0] - 1.0) * 100.0
+    volatility = statistics.pstdev(rets) if len(rets) > 1 else 0.0
+    positive_ratio = sum(1 for r in rets if r > 0) / len(rets)
+    trend_consistency = abs(positive_ratio - 0.5) * 2.0
+    drawdown = (prices[-1] / max(prices) - 1.0) * 100.0
+
+    if long_mom > 0 and short_mom > 0:
+        regime = "TREND_UP"
+    elif long_mom < 0 and short_mom < 0:
+        regime = "TREND_DOWN"
+    else:
+        regime = "MIXED"
+
+    gross_edge = max(0.0, 0.55 * short_mom + 0.25 * long_mom)
+    risk_penalty = 0.65 * volatility + max(0.0, -drawdown) * 0.12
+    net_edge_pct = gross_edge - risk_penalty - round_trip_cost_pct
+    sample_factor = min(1.0, len(prices) / 12.0)
+    confidence = max(0.0, min(0.95,
+        0.35 + 0.25 * sample_factor + 0.25 * trend_consistency
+        + 0.10 * min(1.0, max(0.0, net_edge_pct) / 3.0)
+        - 0.08 * min(1.0, volatility / 4.0)
+    ))
+    return {
+        "actionable": regime == "TREND_UP" and net_edge_pct > 0,
+        "samples": len(prices), "regime": regime,
+        "short_momentum_pct": round(short_mom, 6),
+        "long_momentum_pct": round(long_mom, 6),
+        "volatility_pct": round(volatility, 6),
+        "trend_consistency": round(trend_consistency, 6),
+        "drawdown_from_peak_pct": round(drawdown, 6),
+        "estimated_round_trip_cost_pct": round(round_trip_cost_pct, 6),
+        "net_expected_edge_pct": round(net_edge_pct, 6),
+        "confidence": round(confidence, 6),
+    }
 
 
 def scan_once(fetch_json=None) -> int:
     ensure_schema()
-    propose_allocation()
-    templates = _seed_templates()
-    now = int(time.time())
+    now = time.time()
     con = connect()
     inserted = 0
-    price_blocked: List[str] = []
-    mock_inserted = 0
+    blocked: List[str] = []
     try:
-        _ensure_scanner_cols(con)
-        allow_mock = cfg_bool(con, "SUBSTRATE_ALLOW_SEED_MOCK", False) or (
-            str(os.getenv("SUBSTRATE_ALLOW_SEED_MOCK", "")).strip().lower()
-            in {"1", "true", "yes", "on"}
-        )
-        prices = get_prices([t["asset_symbol"] for t in templates],
-                            fetch_json=fetch_json, con=con, persist=True)
-        for row in templates:
-            symbol = row["asset_symbol"]
-            existing = con.execute(
-                """SELECT 1 FROM substrate_opportunities
-                   WHERE chain=? AND asset_symbol=? AND state IN ('NEW','OPEN')
-                     AND created_at>=? LIMIT 1""",
-                (row["chain"], symbol, now - 900),
-            ).fetchone()
-            if existing:
-                continue
+        _ensure_cols(con)
+        symbols = [s.strip() for s in os.getenv("SUBSTRATE_UNIVERSE", ",".join(ASSETS)).split(",") if s.strip() in ASSETS]
+        prices = get_prices(symbols, fetch_json=fetch_json, con=con, persist=True)
+        min_samples = cfg_int(con, "SUBSTRATE_SIGNAL_MIN_SAMPLES", 6)
+        history_n = cfg_int(con, "SUBSTRATE_SIGNAL_HISTORY_SAMPLES", 18)
+        min_conf = cfg_float(con, "SUBSTRATE_SIGNAL_MIN_CONFIDENCE", 0.62)
+        min_edge_pct = cfg_float(con, "SUBSTRATE_SIGNAL_MIN_NET_EDGE_PCT", 0.35)
+        cost_pct = cfg_float(con, "SUBSTRATE_EST_ROUND_TRIP_COST_PCT", 0.20)
+        cooldown = cfg_int(con, "SUBSTRATE_SIGNAL_COOLDOWN_SEC", 900)
 
+        for symbol in symbols:
             px = prices.get(symbol) or {}
             status = str(px.get("status") or "UNAVAILABLE")
-            if status in ACTIONABLE_STATUSES:
-                price_usd = float(px["price"])
-                price_ts = float(px["source_ts"])       # provider truth, never now
-                price_status = status
-                route_provider = str(px.get("source") or "unknown")
-                raw = dict(row["raw_json"])
-                raw["price_contract"] = {k: px.get(k) for k in
-                                         ("source", "source_ts", "age_sec",
-                                          "confidence", "status")}
-            elif allow_mock:
-                mock = seed_mock_contract(symbol)
-                if mock.get("price") is None:
-                    price_blocked.append(f"{symbol}:{status}")
-                    continue
-                price_usd = float(mock["price"])
-                price_ts = 0.0                          # explicitly not a market ts
-                price_status = STATUS_SEED_MOCK
-                route_provider = "seed_mock"
-                raw = dict(row["raw_json"])
-                raw["price_contract"] = {"status": STATUS_SEED_MOCK,
-                                         "note": mock["error"]}
-                mock_inserted += 1
-            else:
-                price_blocked.append(f"{symbol}:{status}:"
-                                     f"{str(px.get('error') or '')[:60]}")
+            if status not in ACTIONABLE_STATUSES:
+                blocked.append(f"{symbol}:{status}")
                 continue
-
+            rows = _history(con, symbol, history_n)
+            signal = _signal_from_history(rows, cost_pct)
+            if int(signal.get("samples") or 0) < min_samples:
+                blocked.append(f"{symbol}:history={signal.get('samples', 0)}/{min_samples}")
+                continue
+            conf = float(signal.get("confidence") or 0.0)
+            net_edge_pct = float(signal.get("net_expected_edge_pct") or 0.0)
+            if not signal.get("actionable") or conf < min_conf or net_edge_pct < min_edge_pct:
+                blocked.append(f"{symbol}:{signal.get('regime')} edge={net_edge_pct:.2f}% conf={conf:.2f}")
+                continue
+            recent = con.execute(
+                # SUBSTRATE_EXPOSURE_REPAIR_20260802 (audit A1/A2): the ledger
+                # writes 'PAPER_OPENED', never 'PAPER_OPEN'. The cooldown
+                # therefore stopped matching the moment a position opened, so a
+                # fresh duplicate opportunity was minted every scan interval and
+                # immediately refused on exposure. BLOCKED_* states are included
+                # so a suppressed candidate is not replaced by a clone.
+                "SELECT 1 FROM substrate_opportunities WHERE asset_symbol=? "
+                "AND strategy_id=? AND state IN "
+                "('NEW','OPEN','READY','PROMOTED','PAPER_OPENED','BLOCKED_CONFIG') "
+                "AND created_at>=? LIMIT 1",
+                (symbol, STRATEGY_ID, now - cooldown),
+            ).fetchone()
+            if recent:
+                continue
+            spec = ASSETS[symbol]
+            score_json = json.dumps(signal, sort_keys=True)
             con.execute(
-                """
-                INSERT INTO substrate_opportunities
-                (source, chain, asset_symbol, asset_address, asset_type,
-                 native_or_wrapped, quote_asset, confidence, expected_edge,
-                 liquidity_usd, volume_5m_usd, price_usd, price_updated_at,
-                 risk_score, route_provider, raw_json, state, created_at,
-                 updated_at, price_status, strategy_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (row["source"], row["chain"], symbol, row["asset_address"],
-                 row["asset_type"], row["native_or_wrapped"], "USDC",
-                 row["confidence"], row["expected_edge"], row["liquidity_usd"],
-                 row["volume_5m_usd"], price_usd, price_ts, row["risk_score"],
-                 route_provider, json.dumps(raw, sort_keys=True), "NEW",
-                 now, now, price_status, row["strategy_id"]),
+                """INSERT INTO substrate_opportunities
+                (source,chain,asset_symbol,asset_address,asset_type,native_or_wrapped,
+                 quote_asset,confidence,expected_edge,liquidity_usd,volume_5m_usd,
+                 price_usd,price_updated_at,risk_score,route_provider,raw_json,state,
+                 created_at,updated_at,price_status,strategy_id,score_json,
+                 discovery_at,timeframe_or_regime,liquidity_status,volume_status)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ("PRICE_EVIDENCE", spec.get("chain", ""), symbol,
+                 spec.get("jupiter_mint") or spec.get("coingecko_id") or symbol,
+                 "spot", "native" if symbol == "SOL" else "wrapped", "USDC",
+                 # SUBSTRATE_EXPOSURE_REPAIR_20260802 (audit A2/A3): these were
+                 # literal 0.0. A false zero is indistinguishable from a real
+                 # zero, so every downstream liquidity/volume gate silently
+                 # passed on absent evidence. NULL means MISSING; the companion
+                 # liquidity_status column names it so no gate can misread it.
+                 None, None, float(px["price"]),
+                 float(px["source_ts"]), min(1.0, float(signal["volatility_pct"]) / 10.0),
+                 str(px.get("source") or "unknown"), score_json, "NEW", now, now,
+                 status, STRATEGY_ID, score_json, now, str(signal["regime"]),
+                 "MISSING", "MISSING"),
             )
             inserted += 1
         con.commit()
-        note = f"inserted={inserted}"
-        if mock_inserted:
-            note += f" seed_mock={mock_inserted}"
-        if price_blocked:
-            note += " price_blocked=" + ";".join(price_blocked[:3])
-        heartbeat("substrate_opportunity_scanner",
-                  "OK" if not price_blocked else "DEGRADED", note, inserted)
+        note = f"inserted={inserted} universe={len(symbols)}"
+        if blocked:
+            note += " blocked=" + ";".join(blocked[:4])
+        heartbeat("substrate_opportunity_scanner", "OK" if inserted or not blocked else "DEGRADED", note, inserted)
         return inserted
     finally:
         con.close()
 
 
 def run_forever() -> None:
-    interval = int(os.getenv("SUBSTRATE_SCANNER_INTERVAL_SEC", "45"))
+    interval = int(os.getenv("SUBSTRATE_SCANNER_INTERVAL_SEC", "60"))
     while True:
         try:
             scan_once()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             heartbeat("substrate_opportunity_scanner", "ERROR", repr(exc), 0)
         time.sleep(interval)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--once", action="store_true", help="run one scan and exit")
+    parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
     if args.once or os.getenv("SUBSTRATE_RUN_FOREVER", "1") == "0":
         print(f"inserted={scan_once()}")

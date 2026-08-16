@@ -34,7 +34,7 @@ BRAVE_KEY = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
 POLARIS_MODELS = [
     ("POLARIS budget", os.getenv("POLARIS_BUDGET_MODEL", "gpt-5.4-nano")),
     ("POLARIS signoff", os.getenv("POLARIS_SIGNOFF_MODEL", "gpt-5.4-mini")),
-    ("POLARIS critical", os.getenv("POLARIS_CRITICAL_MODEL", "gpt-5.5")),
+    ("POLARIS critical", os.getenv("POLARIS_CRITICAL_MODEL", "gpt-5.4-mini")),
 ]
 try:
     from services.nvidia_model_registry import get_assignment, scan_and_align

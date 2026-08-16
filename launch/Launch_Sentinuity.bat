@@ -570,13 +570,26 @@ echo.
 
 echo   1  Paper only   (recommended - safe, always learning)
 
-echo   2  Dual mode    (paper + live Mode B gate)
+echo   2  Dual selective    (paper + strict live Mode B/pattern gate)
+echo   3  Dual calibration  (paper + tiny live mirror; strategy score/pattern advisory)
 
 echo.
 
-set /p MODE_CHOICE="  Solana lane mode [1=paper / 2=dual, enter for 1]: "
+set "LIVE_PROFILE=selective"
+set /p MODE_CHOICE="  Solana lane mode [1=paper / 2=dual selective / 3=dual calibration, enter for 1]: "
 
-if "!MODE_CHOICE!"=="2" (set "CFG_MODE=live") else (set "CFG_MODE=paper")
+if "!MODE_CHOICE!"=="3" (
+  set "CFG_MODE=live"
+  set "LIVE_PROFILE=calibration"
+  set "SENTINUITY_LIVE_MIRROR_POLICY=ALL_PAPER_ADMISSIONS"
+) else if "!MODE_CHOICE!"=="2" (
+  set "CFG_MODE=live"
+  set "LIVE_PROFILE=selective"
+  set "SENTINUITY_LIVE_MIRROR_POLICY=NORMAL"
+) else (
+  set "CFG_MODE=paper"
+  set "SENTINUITY_LIVE_MIRROR_POLICY=NORMAL"
+)
 
 
 
@@ -636,9 +649,15 @@ echo.
 
 echo  ---------------------------------------------------------
 
-echo   SOLANA LIVE MODE B ARMING
+echo   SOLANA LIVE ARMING
 
-echo   Paper stays ON. Live only fires when Mode B clears.
+if /i "!LIVE_PROFILE!"=="calibration" (
+  echo   CALIBRATION: paper admissions may mirror live when hard safety clears.
+  echo   Strategy score and pattern selectivity are advisory only.
+  echo   Oracle, route, token, sellability, caps, canary and reconciliation remain hard.
+) else (
+  echo   SELECTIVE: Paper stays ON. Live only fires when Mode B and pattern clear.
+)
 
 echo  ---------------------------------------------------------
 
@@ -692,14 +711,21 @@ echo.
 
 set "LIVE_OK=NO"
 
-set /p LIVE_OK="  Type YES to ARM Solana live Mode B at $!LIVE_SIZE! per trade [YES required]: "
-
-if /i not "!LIVE_OK!"=="YES" (
-
-  echo   Cancelled. Falling back to Solana PAPER.
-
-  set "CFG_MODE=paper"
-
+if /i "!LIVE_PROFILE!"=="calibration" (
+  set /p LIVE_OK="  Type I_ACCEPT_CALIBRATION_LOSS to arm tiny live calibration at $!LIVE_SIZE! [exact text]: "
+  if /i "!LIVE_OK!"=="I_ACCEPT_CALIBRATION_LOSS" (
+    set "SENTINUITY_PRIVATE_LIVE_ENABLE=I_ACCEPT_REAL_LOSS"
+  ) else (
+    echo   Calibration cancelled. Falling back to Solana PAPER.
+    set "CFG_MODE=paper"
+    set "SENTINUITY_LIVE_MIRROR_POLICY=NORMAL"
+  )
+) else (
+  set /p LIVE_OK="  Type YES to ARM Solana live Mode B at $!LIVE_SIZE! per trade [YES required]: "
+  if /i not "!LIVE_OK!"=="YES" (
+    echo   Cancelled. Falling back to Solana PAPER.
+    set "CFG_MODE=paper"
+  )
 )
 
 
@@ -968,11 +994,24 @@ if exist "tools\init_substrate_desk.py" (
 
 echo.
 
+if exist "launch\MIGRATE_POSITION_TIME_ADDRESSABILITY.py" (
+  "%PY%" launch\MIGRATE_POSITION_TIME_ADDRESSABILITY.py >> "%LOG_PATH%\position_time_addressability.log" 2^>^&1
+  if errorlevel 1 (
+    echo   [ERROR] Position time-addressability migration failed. Launch aborted.
+    call :SHOW_LOG_TAIL "%LOG_PATH%\position_time_addressability.log"
+    exit /b 1
+  )
+)
+
 echo  Applying validation-safe configuration...
 
 if "!CFG_MODE!"=="live" (
 
-  "%PY%" "!LAUNCH_CONFIG_PY!" dual "!LIVE_SIZE!" "%PAPER_MAX%" "%LIVE_CONF%" "%EXCEPTIONAL%" >> "%LOG_PATH%\launch_config.log" 2^>^&1
+  if /i "!LIVE_PROFILE!"=="calibration" (
+    "%PY%" "!LAUNCH_CONFIG_PY!" calibration "!LIVE_SIZE!" "%PAPER_MAX%" "%LIVE_CONF%" "%EXCEPTIONAL%" >> "%LOG_PATH%\launch_config.log" 2^>^&1
+  ) else (
+    "%PY%" "!LAUNCH_CONFIG_PY!" dual "!LIVE_SIZE!" "%PAPER_MAX%" "%LIVE_CONF%" "%EXCEPTIONAL%" >> "%LOG_PATH%\launch_config.log" 2^>^&1
+  )
 
 ) else (
 
@@ -980,6 +1019,8 @@ if "!CFG_MODE!"=="live" (
 
 )
 
+rem CALIBRATION_LAUNCH_CONFIG_REPLACED_BLOCK
+rem
 if errorlevel 1 (
 
   echo   [ERROR] launch_config.py failed.
@@ -997,11 +1038,21 @@ if not exist "tools\apply_launch_safety_pins.py" (
   echo   Launch aborted before trading services start.
   exit /b 1
 )
-"%PY%" tools\apply_launch_safety_pins.py >> "%LOG_PATH%\launch_config_safety_pins.log" 2^>^&1
+if "!CFG_MODE!"=="live" (
+  set "SENTINUITY_OPERATOR_SELECTION=DUAL"
+  "%PY%" tools\apply_launch_safety_pins.py --requested dual --size "!LIVE_SIZE!" >> "%LOG_PATH%\launch_config_safety_pins.log" 2^>^&1
+) else (
+  set "SENTINUITY_OPERATOR_SELECTION=PAPER"
+  "%PY%" tools\apply_launch_safety_pins.py --requested paper --size "!PAPER_SIZE!" >> "%LOG_PATH%\launch_config_safety_pins.log" 2^>^&1
+)
 if errorlevel 1 (
   echo   [ERROR] Canonical safety pins failed.
   call :SHOW_LOG_TAIL "%LOG_PATH%\launch_config_safety_pins.log"
   exit /b 1
+)
+if /i "!LIVE_PROFILE!"=="calibration" if "!CFG_MODE!"=="live" (
+  set "SENTINUITY_LIVE_MIRROR_POLICY=ALL_PAPER_ADMISSIONS"
+  "%PY%" -c "import sqlite3,time; c=sqlite3.connect('sentinuity_matrix.db',timeout=10); p=[('LIVE_MIRROR_POLICY','ALL_PAPER_ADMISSIONS'),('LIVE_CALIBRATION_MODE','1'),('LIVE_CALIBRATION_SESSION_STARTED_AT',str(time.time())),('LIVE_CALIBRATION_MAX_TRADES','3')]; c.executemany('INSERT INTO system_config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',p); c.commit(); c.close()" >> "%LOG_PATH%\launch_config.log" 2^>^&1
 )
 
 REM SIGNOFF_FINAL_GATE_20260611 - pin momentum gate to shadow posture before the
@@ -1012,11 +1063,9 @@ REM executor starts. DB-only keys; stale hard-mode flags must not survive relaun
 
 if errorlevel 1 echo   [WARN] momentum launch guard failed - executor will still demote unsanctioned hard mode at runtime. Check momentum_launch_guard.log.
 
-if "!CFG_MODE!"=="live" (
-
-  if exist "!SETLIVE_PY!" "%PY%" "!SETLIVE_PY!" "!LIVE_SIZE!" >> "%LOG_PATH%\set_live_mode.log" 2^>^&1
-
-)
+rem Canonical safety pins above are the FINAL posture authority.
+rem Do not run a later writer that can silently re-arm or contradict them.
+echo   [CONFIG] Final posture fixed by apply_launch_safety_pins.py.
 
 
 
@@ -1258,6 +1307,26 @@ if exist "!WALCK_PY!" "%PY%" "!WALCK_PY!" >> "%LOG_PATH%\wal_checkpoint.log" 2^>
 
 echo.
 
+REM FINAL_DUAL_LIVE_READINESS_AUTHORITY_20260804
+REM A funded DUAL launch must prove a fresh SOL/USD basis and the unchanged
+REM executable stop-readiness contract before the final arming authority runs.
+REM This gate does not lower thresholds, backfill synthetic evidence or enable
+REM live authority. It aborts before any trading service starts.
+if "!CFG_MODE!"=="live" (
+  "%PY%" launch\REFRESH_SOL_USD_BASIS.py >> "%LOG_PATH%\sol_usd_basis_refresh.log" 2^>^&1
+  if errorlevel 1 (
+    echo   [FATAL] Fresh SOL/USD basis could not be published. DUAL launch aborted.
+    call :SHOW_LOG_TAIL "%LOG_PATH%\sol_usd_basis_refresh.log"
+    exit /b 1
+  )
+  "%PY%" launch\VERIFY_STOP_REALISABILITY_BASIS.py >> "%LOG_PATH%\stop_realisability_prelaunch.log" 2^>^&1
+  if errorlevel 1 (
+    echo   [FATAL] Executable stop-readiness contract not satisfied. DUAL launch aborted.
+    call :SHOW_LOG_TAIL "%LOG_PATH%\stop_realisability_prelaunch.log"
+    exit /b 1
+  )
+)
+
 REM FINAL_DISTRIBUTION_POSTURE_AUTHORITY_20260804
 REM Runs after every configuration writer/restamp and before any trading service.
 if "!CFG_MODE!"=="live" (
@@ -1294,8 +1363,22 @@ if "%START_GATEWAY%"=="1" (
   rem immediately and leave only Sentinel Shield visible.
   where openclaw >nul 2^>^&1
   if not errorlevel 1 (
+    echo   [GATEWAY] Terminating any registered OpenClaw Gateway task before fresh startup...
+    schtasks /End /TN "OpenClaw Gateway"
+    if errorlevel 1 (
+      echo   [INFO] No running scheduled OpenClaw Gateway task was terminated.
+    ) else (
+      echo   [OK] Previous scheduled OpenClaw Gateway task terminated successfully.
+    )
+    timeout /t 2 /nobreak >nul
+    echo [GATEWAY] Stopping any existing OpenClaw gateway before fresh startup...
+    call openclaw gateway stop >nul 2>&1
+    schtasks /End /TN "OpenClaw Gateway" >nul 2>&1
+    timeout /t 3 /nobreak >nul
+    echo [GATEWAY] Starting fresh OpenClaw gateway...
     start "OpenClaw Gateway" cmd /k "cd /d ""%ROOT_PATH%"" && openclaw gateway"
-    echo   [OK] OpenClaw gateway launch dispatched in persistent console.
+    echo   [OK] Fresh OpenClaw gateway dispatched in a persistent console.
+    echo   [LAUNCH] Continuing immediately with the Sentinuity trading spine.
   ) else (
     echo   [WARN] openclaw command not found; gateway skipped.
   )
@@ -1512,7 +1595,12 @@ echo  -- SOLANA PUMP.FUN LANE --------------------------------
 
 if "!CFG_MODE!"=="live" (
 
-  echo   Mode:       DUAL MODE ^(paper + live Mode B gate^)
+  if /i "!LIVE_PROFILE!"=="calibration" (
+    echo   Mode:       DUAL CALIBRATION ^(paper + live mirror; strategy advisory, hard safety enforced^)
+    echo   Session:    max 3 live trades, max 1 real position, fixed operator size
+  ) else (
+    echo   Mode:       DUAL SELECTIVE ^(paper + live Mode B/pattern gate^)
+  )
 
   echo   Paper size: $!PAPER_SIZE! per trade
 
@@ -1708,7 +1796,7 @@ cur.execute(
 
     UPDATE system_state
 
-       SET wallet_balance=?, initial_capital=?, paper_equity=?, paper_cash=?,
+       SET paper_equity=?, paper_cash=?,
 
            paper_reserved=0, paper_realized_pnl=0, paper_unrealized_pnl=0,
 
@@ -1718,7 +1806,7 @@ cur.execute(
 
     """,
 
-    (amount, amount, amount, amount, now),
+    (amount, amount, now),
 
 )
 

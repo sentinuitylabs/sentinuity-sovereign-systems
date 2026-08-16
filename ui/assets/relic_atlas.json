@@ -1,0 +1,15 @@
+{
+  "cell": 16,
+  "rows": {
+    "unidentified": 0,
+    "inspecting": 1,
+    "promising": 2,
+    "contested": 3,
+    "dud": 4,
+    "accepted": 5,
+    "testing": 6,
+    "failed": 7,
+    "rejected": 8,
+    "absorbed": 9
+  }
+}

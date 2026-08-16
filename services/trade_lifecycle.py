@@ -109,7 +109,12 @@ CREATE INDEX IF NOT EXISTS tle_type    ON trade_lifecycle_events(event_type, ts)
 """
 
 def ensure_schema(conn) -> None:
-    """Create the table if absent. Safe to call on every startup."""
+    """Create/repair the lifecycle table. Safe to call on every startup.
+
+    CREATE TABLE IF NOT EXISTS does not evolve an older table. Runtime on
+    2026-08-09 proved legacy DBs could lack max_pct_seen while current writers
+    already emitted it. Repair additive columns before any event write.
+    """
     for stmt in CREATE_SQL.strip().split(";"):
         stmt = stmt.strip()
         if stmt:
@@ -117,6 +122,27 @@ def ensure_schema(conn) -> None:
                 conn.execute(stmt)
             except Exception:
                 pass
+    try:
+        have = {r[1] for r in conn.execute(
+            "PRAGMA table_info(trade_lifecycle_events)").fetchall()}
+        wanted = {
+            "price": "REAL", "pct_from_entry": "REAL", "age_sec": "REAL",
+            "source": "TEXT", "can_execute": "INTEGER", "tick_count": "INTEGER",
+            "coverage_score": "REAL", "first_tick_delay_sec": "REAL",
+            "max_pct_seen": "REAL", "min_pct_seen": "REAL",
+            "exit_reason": "TEXT", "exit_validity": "TEXT",
+            "realized_pnl": "REAL", "hold_seconds": "REAL",
+            "note": "TEXT", "ts": "REAL",
+        }
+        for name, typ in wanted.items():
+            if name not in have:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE trade_lifecycle_events ADD COLUMN {name} {typ}")
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 # ── WRITER ────────────────────────────────────────────────────────────────────
@@ -171,8 +197,18 @@ def _write_event(
             ),
         )
     except Exception as e:
-        log.debug("trade_lifecycle._write_event failed type=%s pos=%s: %s",
-                  event_type, position_id, e)
+        # OBSERVABILITY_SIGNOFF_20260808: previously logged at debug, so a
+        # schema mismatch or persistent lock produced a completely empty
+        # ledger with no visible symptom. The first failure and every 100th
+        # thereafter are now reported at WARNING. Still never raises: telemetry
+        # must not block execution.
+        _write_event._fail_count = getattr(_write_event, "_fail_count", 0) + 1
+        n = _write_event._fail_count
+        if n == 1 or n % 100 == 0:
+            log.warning(
+                "[LIFECYCLE_WRITE_FAIL] n=%d type=%s pos=%s err=%s: %s",
+                n, event_type, position_id, type(e).__name__, e,
+            )
 
 
 # ── COVERAGE HELPER ───────────────────────────────────────────────────────────
@@ -252,6 +288,8 @@ def classify_exit_validity(
     reason_upper = str(exit_reason or "").upper()
     if "GUARDIAN" in reason_upper:
         return "GUARDIAN"
+    if "NO_COVERAGE" in reason_upper:
+        return "NO_COVERAGE"
     if coverage.get("tick_count", 0) == 0:
         return "NO_COVERAGE"
     if router_can_execute:

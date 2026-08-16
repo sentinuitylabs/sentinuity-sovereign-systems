@@ -272,7 +272,7 @@ def main() -> int:
             if "locked" not in str(exc).lower():
                 raise
             lock_backoff = min(300.0, max(30.0, lock_backoff * 2.0 if lock_backoff else 30.0))
-            sleep_for = max(sleep_for, lock_backoff)
+            sleep_for = max(sleep_for, min(lock_backoff, 5.0))
             print(f"[signal_gate_sensor] DB_LOCK_BACKOFF sleep={lock_backoff:.0f}s: {exc}")
             if a.once:
                 return 2
@@ -280,7 +280,7 @@ def main() -> int:
             print(f"[signal_gate_sensor] ERROR {type(exc).__name__}: {exc}")
             if a.once:
                 return 2
-            sleep_for = max(sleep_for, 60.0)
+            sleep_for = max(sleep_for, 5.0)
         time.sleep(sleep_for)
 
 

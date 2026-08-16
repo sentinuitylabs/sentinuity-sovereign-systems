@@ -16,7 +16,12 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.sovereign_gate_map import collect_gate_map, final_gate_verdict_text
+# SIGNOFF_IMPORT_PATH_20260812: module lives at services/sovereign_gate_map.py,
+# not core/. This import was unguarded, so sovereign_doctor crashed on start.
+try:
+    from services.sovereign_gate_map import collect_gate_map, final_gate_verdict_text
+except Exception:
+    from sovereign_gate_map import collect_gate_map, final_gate_verdict_text  # type: ignore
 
 
 def main() -> int:

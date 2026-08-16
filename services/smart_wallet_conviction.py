@@ -315,11 +315,16 @@ def build_fingerprint_for_wallet(wallet_address: str, db_path: Path | str = None
     if len(trades) < 5:
         return None
     
-    # Quality scoring must use closed realised outcome. Maximum favourable
-    # excursion remains research telemetry and cannot qualify an elite wallet.
+    # EDGE_RESTORE_20260727 (root cause of NO_FINGERPRINT_MATCH):
+    # wallet_trades.realized_x is only populated for closed round-trips. The
+    # forward-measured max_x_after_entry column is what backfill_wallet_trade_outcomes.py
+    # actually writes. Restricting scoring to realized_x emptied `xs` for almost
+    # every wallet, returned None, and produced NO_FINGERPRINT_MATCH system-wide.
+    # July 27 preferred max_x_after_entry and fell back to realized_x.
     def _outcome_x(t):
+        mx = float(t.get('max_x_after_entry', 0) or 0)
         rx = float(t.get('realized_x', 0) or 0)
-        return rx
+        return mx if mx > 0 else rx
     xs = [_outcome_x(t) for t in trades if _outcome_x(t) > 0]
     if not xs:
         return None
@@ -450,16 +455,86 @@ def generate_signal_for_token(
         return sig
     
     # Match current token to fingerprints (simplified scoring)
+    #
+    # EDGE_AUDIT_20260815 — UNREACHABLE THRESHOLD, TRUTHFUL REPORTING.
+    # The two available components are worth 30 and 20 against a threshold of
+    # 25. The sole caller supplies volume_acceleration but NOT
+    # holder_growth_rate (copytrade_shadow_scanner.py:273-278), and nothing in
+    # the codebase populates holder counts at all -- market_intelligence.py
+    # writes "holder_count": None at :1020 and :1309. So the achievable
+    # ceiling is 20, the comparison is never true, and every candidate is
+    # vetoed with NO_FINGERPRINT_MATCH.
+    #
+    # That reason string is a lie: no wallet was ever compared to anything.
+    # We do NOT lower the threshold here. A starved score driving real entries
+    # is worse than an honest zero. We surface the true cause instead, so the
+    # missing input shows up in the influence ledger rather than only in a
+    # code review.
+    _FP_THRESHOLD = 25.0
+    _FP_COMPONENTS = (
+        ('holder_growth_rate', 0.05, 30.0),
+        ('volume_acceleration', 2.0, 20.0),
+    )
+    _fp_absent = [k for k, _thr, _pts in _FP_COMPONENTS
+                  if current_metrics.get(k) is None]
+    _fp_ceiling = sum(pts for k, _thr, pts in _FP_COMPONENTS
+                      if current_metrics.get(k) is not None)
+
+    # EDGE_AUDIT_20260815 — WALLET-SPECIFIC MATCHING.
+    # The previous loop never read `fp`. Every fingerprint scored identically,
+    # so the outcome was all-or-nothing across the whole roster. Restoring
+    # holder evidence without fixing this would have produced a constant bonus
+    # on every candidate rather than wallet-specific conviction.
+    #
+    # Each fingerprint now compares the conditions IT recorded at entry against
+    # the candidate's current conditions. A component contributes only when the
+    # candidate clears the absolute floor AND resembles what this particular
+    # wallet historically entered on. Absent fingerprint history for a
+    # component contributes nothing — it is never treated as agreement.
+    def _fp_field(_fp, *names):
+        for _n in names:
+            try:
+                _v = _fp[_n] if not hasattr(_fp, "get") else _fp.get(_n)
+            except Exception:
+                _v = None
+            if _v is not None:
+                return _safe_float(_v, 0.0)
+        return None
+
+    def _within_band(observed, reference, tolerance=2.5):
+        # Symmetric ratio band: the candidate must be the same ORDER of
+        # behaviour this wallet entered on, not merely non-zero.
+        if reference is None or reference <= 0.0 or observed <= 0.0:
+            return False
+        ratio = observed / reference
+        return (1.0 / tolerance) <= ratio <= tolerance
+
     matched = []
-    for fp in fps:
-        score = 0.0
-        # Basic matching heuristic
-        if _safe_float(current_metrics.get('holder_growth_rate'), 0.0) > 0.05:
-            score += 30
-        if _safe_float(current_metrics.get('volume_acceleration'), 0.0) > 2.0:
-            score += 20
-        if score >= 25:
-            matched.append((fp, score))
+    if _fp_ceiling >= _FP_THRESHOLD:
+        for fp in fps:
+            score = 0.0
+            for _key, _thr, _pts in _FP_COMPONENTS:
+                _observed = _safe_float(current_metrics.get(_key), 0.0)
+                if _observed <= _thr:
+                    continue
+                _reference = _fp_field(fp, _key, f"entry_{_key}", f"{_key}_at_entry")
+                if _within_band(_observed, _reference):
+                    score += _pts
+            if score >= _FP_THRESHOLD:
+                matched.append((fp, score))
+
+    if not matched and _fp_ceiling < _FP_THRESHOLD:
+        sig = EntryLikelihoodSignal(
+            token_mint=token_mint,
+            token_symbol=token_symbol,
+            signal_time=now,
+            elite_wallet_count=len(fps),
+            veto_reason=("EVIDENCE_UNAVAILABLE:absent=" + ",".join(_fp_absent)
+                         + f";ceiling={_fp_ceiling:.0f}<{_FP_THRESHOLD:.0f}"),
+            mode=mode
+        )
+        _persist_signal(sig, db_path)
+        return sig
     
     if not matched:
         sig = EntryLikelihoodSignal(

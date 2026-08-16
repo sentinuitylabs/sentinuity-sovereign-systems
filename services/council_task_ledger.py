@@ -147,11 +147,12 @@ def import_sources(db_path: Optional[Path] = None,
         return 0
     uri = f"file:{source.as_posix()}?mode=ro"
     try:
-        src = sqlite3.connect(uri, uri=True, timeout=0.2)
+        src = sqlite3.connect(uri, uri=True, timeout=5.0)
         src.row_factory = sqlite3.Row
         src.execute("PRAGMA query_only=ON")
-        src.execute("PRAGMA busy_timeout=200")
-    except sqlite3.Error:
+        src.execute("PRAGMA busy_timeout=5000")
+    except sqlite3.Error as exc:
+        print(f"[COUNCIL_IMPORT] source open skipped: {exc}")
         return 0
     dst = connect(db_path)
     n = 0
@@ -200,8 +201,9 @@ def import_sources(db_path: Optional[Path] = None,
                      owner, now, now))
                 n += max(cur.rowcount, 0)
         dst.commit()
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
         dst.rollback()
+        print(f"[COUNCIL_IMPORT] source import skipped: {exc}")
         return 0
     finally:
         src.close()

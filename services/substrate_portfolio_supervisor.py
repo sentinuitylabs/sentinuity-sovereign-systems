@@ -49,65 +49,49 @@ MAX_HOLD_SEC_DEFAULT = 259200.0  # 3 days
 
 
 def promote_copytrade_to_opportunity(fetch_json=None) -> int:
+    """Apply copytrade as capped corroboration to an independent opportunity.
+
+    A wallet signal may strengthen an existing PRICE_EVIDENCE opportunity, but
+    can never manufacture expected edge or create a standalone trade candidate.
+    """
     ensure_schema()
     now = int(time.time())
     con = connect()
-    count = 0
-    deferred = 0
+    influenced = 0
     try:
-        _ensure_col(con, "substrate_opportunities", "price_status", "TEXT")
-        _ensure_col(con, "substrate_opportunities", "strategy_id", "TEXT")
         signals = con.execute(
-            """SELECT * FROM substrate_copytrade_signals
-               WHERE state='NEW' ORDER BY created_at DESC LIMIT 5"""
+            "SELECT * FROM substrate_copytrade_signals WHERE state='NEW' "
+            "ORDER BY created_at DESC LIMIT 20"
         ).fetchall()
-        if not signals:
-            return 0
-        symbols = sorted({str(s["asset_symbol"]).upper() for s in signals})
-        prices = get_prices(symbols, fetch_json=fetch_json, con=con,
-                            persist=True)
+        cap = cfg_float(con, "SUBSTRATE_COPYTRADE_CONFIDENCE_BOOST_CAP", 0.08)
+        max_age = cfg_int(con, "SUBSTRATE_COPYTRADE_BASE_MAX_AGE_SEC", 1800)
         for s in signals:
-            symbol = str(s["asset_symbol"]).upper()
-            px = prices.get(symbol) or {}
-            if str(px.get("status")) not in ACTIONABLE_STATUSES:
-                deferred += 1
+            base = con.execute(
+                "SELECT * FROM substrate_opportunities WHERE asset_symbol=? "
+                "AND state='NEW' AND source='PRICE_EVIDENCE' AND created_at>=? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (s["asset_symbol"], now - max_age),
+            ).fetchone()
+            if not base:
                 con.execute(
-                    "UPDATE substrate_copytrade_signals SET updated_at=?, "
-                    "raw_json=COALESCE(raw_json,'') || ? WHERE id=?",
-                    (now,
-                     f"|price_deferred:{px.get('status')}:"
-                     f"{str(px.get('error') or '')[:60]}",
-                     s["id"]),
+                    "UPDATE substrate_copytrade_signals SET state='OBSERVED_NO_BASE', "
+                    "updated_at=? WHERE id=?", (now, s["id"]),
                 )
                 continue
+            boost = min(max(0.0, float(s["confidence"] or 0.0) - 0.50) * 0.20, cap)
+            new_conf = min(0.95, float(base["confidence"] or 0.0) + boost)
+            raw = str(base["raw_json"] or "") + f"|copytrade_corroboration:id={s['id']};boost={boost:.4f}"
             con.execute(
-                """
-                INSERT INTO substrate_opportunities
-                (source, chain, asset_symbol, asset_address, asset_type,
-                 native_or_wrapped, quote_asset, confidence, expected_edge,
-                 liquidity_usd, volume_5m_usd, price_usd, price_updated_at,
-                 risk_score, route_provider, raw_json, state, created_at,
-                 updated_at, price_status, strategy_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    "COPYTRADE_BRIDGE", s["chain"], s["asset_symbol"],
-                    s["asset_address"], "spot",
-                    "native" if symbol == "SOL" else "wrapped", "USDC",
-                    s["confidence"], 0.04, 25000000, 200000,
-                    float(px["price"]), float(px["source_ts"]),
-                    0.38, str(px.get("source") or "unknown"),
-                    s["raw_json"], "NEW", now, now,
-                    str(px["status"]), "SUBSTRATE_COPYTRADE_V1",
-                ),
+                "UPDATE substrate_opportunities SET confidence=?,raw_json=?,updated_at=? WHERE id=?",
+                (new_conf, raw, now, base["id"]),
             )
             con.execute(
-                "UPDATE substrate_copytrade_signals SET state='PROMOTED', "
-                "updated_at=? WHERE id=?", (now, s["id"]),
+                "UPDATE substrate_copytrade_signals SET state='CORROBORATED',updated_at=? WHERE id=?",
+                (now, s["id"]),
             )
-            count += 1
+            influenced += 1
         con.commit()
-        return count
+        return influenced
     finally:
         con.close()
 
@@ -278,8 +262,20 @@ def supervise_once(fetch_json=None) -> dict:
     con = connect()
     opened = 0
     rejected_seen = 0
+    expired_stale = 0
     try:
         max_open = cfg_int(con, "SUBSTRATE_MAX_OPEN", 3)
+        # SIGNOFF_SUBSTRATE_STALE_SWEEP_20260801: expire stale NEW rows before
+        # admission so the node advances to current evidence instead of
+        # repeatedly auditing hours-old entry prices. Provider time is truth.
+        entry_max_age = cfg_float(con, "SUBSTRATE_ENTRY_MAX_PRICE_AGE_SEC", 900.0)
+        cutoff = time.time() - entry_max_age
+        expired_stale = con.execute(
+            "UPDATE substrate_opportunities SET state='EXPIRED_STALE', updated_at=? "
+            "WHERE state='NEW' AND COALESCE(price_updated_at,0)<?",
+            (time.time(), cutoff),
+        ).rowcount
+        con.commit()
         open_count = con.execute(
             "SELECT COUNT(*) c FROM substrate_positions "
             "WHERE mode='PAPER' AND state='OPEN'"
@@ -287,8 +283,9 @@ def supervise_once(fetch_json=None) -> dict:
         slots = max(0, max_open - int(open_count))
         opps = con.execute(
             """SELECT * FROM substrate_opportunities WHERE state='NEW'
-               ORDER BY confidence DESC, created_at DESC LIMIT ?""",
-            (max(slots, 20),),
+               AND COALESCE(price_updated_at,0)>=?
+               ORDER BY created_at DESC, confidence DESC LIMIT ?""",
+            (cutoff, max(slots, 20)),
         ).fetchall()
     finally:
         con.close()
@@ -331,7 +328,7 @@ def supervise_once(fetch_json=None) -> dict:
     heartbeat(
         "substrate_portfolio_supervisor",
         "OK" if not mark_state.get("stale") else "DEGRADED",
-        (f"mode={state['mode']} marked={mark_state['marked']} "
+        (f"mode={state['mode']} expired_stale={expired_stale} marked={mark_state['marked']} "
          f"stale={mark_state['stale']} "
          f"upnl=${mark_state['unrealized_pnl']:+.2f} "
          f"closed={exit_state['closed']} "

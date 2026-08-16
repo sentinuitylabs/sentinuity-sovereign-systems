@@ -83,10 +83,29 @@ def fetch_pending_proposals() -> list[dict]:
 
 
 def fetch_trade_history(limit: int = REPLAY_WINDOW) -> list[dict]:
-    """Fetch real closed trades with full context for replay."""
+    """Fetch real closed trades with full context for replay.
+
+    SIGNOFF_10H_REPLAY_PROVENANCE_20260811: also project the canonical
+    calibrated/entry confidence when the review ledger carries it, so a
+    trading-confidence replay never has to fall back to the mint identity prior.
+    The projection is schema-safe: absent columns surface as NULL (which the
+    provenance guard then reports honestly) rather than raising.
+    """
     try:
         with get_connection() as conn:
-            rows = conn.execute("""
+            try:
+                cols = {r[1] for r in conn.execute(
+                    "PRAGMA table_info(polaris_trade_reviews)").fetchall()}
+            except Exception:
+                cols = set()
+            for cand in ("entry_calibrated_confidence", "entry_confidence",
+                         "calibrated_confidence", "confidence"):
+                if cand in cols:
+                    conf_expr = f"ptr.{cand}"
+                    break
+            else:
+                conf_expr = "NULL"
+            rows = conn.execute(f"""
                 SELECT
                     ptr.position_id,
                     ptr.win_loss,
@@ -95,6 +114,7 @@ def fetch_trade_history(limit: int = REPLAY_WINDOW) -> list[dict]:
                     ptr.entry_market_cap_usd,
                     ptr.entry_token_age_sec,
                     ptr.entry_mint_confidence,
+                    {conf_expr} AS entry_calibrated_confidence,
                     ptr.entry_quality_status,
                     ptr.exit_reason,
                     ptr.exit_category,
@@ -141,12 +161,40 @@ def simulate_parameter_change(
         return {"verdict": "INSUFFICIENT_DATA", "reason": f"Cannot parse new_value: {new_value}"}
 
     # Map parameter to the trade field it gates
+    #
+    # SIGNOFF_10H_REPLAY_PROVENANCE_20260811 (directive §4, §5):
+    # SUPERVISOR_MIN_MINT_CONFIDENCE was previously mapped to entry_mint_confidence.
+    # mint_confidence answers "is this the right mint address" (historically a
+    # near-constant ~0.89 for every *pump mint), NOT "how good is this trade".
+    # The rest of the tree is explicit that it must never qualify capital
+    # (edge_ledger: "recorded for FORENSIC purposes only and is never promoted
+    # into confidence / confidence_score / calibrated_confidence";
+    # execution_engine SIGNOFF_EDGE_RESTORE_20260731 R2a). Simulating a change to
+    # the TRADING confidence floor against that column produced verdicts with no
+    # relationship to the parameter under test, and would have silently corrupted
+    # any July 25-27 comparative replay.
+    #
+    # The trading-confidence floor is therefore replayed against the canonical
+    # calibrated/entry confidence only. If the review row does not carry it, the
+    # replay refuses rather than substituting the identity prior.
     PARAM_TO_FIELD = {
-        "MIN_LIQUIDITY_USD":          "entry_liquidity_usd",
-        "MIN_MARKET_CAP_USD":         "entry_market_cap_usd",
-        "MIN_TOKEN_AGE_SEC":          "entry_token_age_sec",
-        "SUPERVISOR_MIN_MINT_CONFIDENCE": "entry_mint_confidence",
+        "MIN_LIQUIDITY_USD":               "entry_liquidity_usd",
+        "MIN_MARKET_CAP_USD":              "entry_market_cap_usd",
+        "MIN_TOKEN_AGE_SEC":               "entry_token_age_sec",
+        "SUPERVISOR_MIN_TRADING_CONFIDENCE": "entry_calibrated_confidence",
     }
+    # Retained for forensic replay ONLY. Never a capital gate.
+    FORENSIC_ONLY_FIELDS = {"entry_mint_confidence"}
+
+    # Fields whose absence is indistinguishable from a real zero. paper_positions
+    # /polaris_trade_reviews carry 0 (not NULL) when the writer never populated
+    # them, so `float(x or 0) < threshold` silently excludes the entire cohort and
+    # reports a large favourable PnL delta for a losing sample. Refuse instead.
+    PROVENANCE_REQUIRED = {
+        "entry_liquidity_usd", "entry_market_cap_usd",
+        "entry_token_age_sec", "entry_calibrated_confidence",
+    }
+    MIN_PROVENANCE_COVERAGE = 0.80
 
     EXIT_PARAM_MAP = {
         "TAKE_PROFIT_PCT":   "pnl_pct",
@@ -164,10 +212,42 @@ def simulate_parameter_change(
         field = PARAM_TO_FIELD[target_param]
         current_val = float(current_config.get(target_param, 0) or 0)
 
+        # SIGNOFF_10H_REPLAY_PROVENANCE_20260811:
+        # Absent provenance must never be read as "value 0, therefore below the
+        # threshold, therefore excluded". On the 10-hour cohort every
+        # entry_market_cap_usd / entry_liquidity_usd was 0 because the executor
+        # never persisted them, which made a stricter filter appear to exclude
+        # 100% of trades and — since the cohort was net negative — report a large
+        # POSITIVE pnl_delta. Refuse with a specific, actionable verdict.
+        if field in PROVENANCE_REQUIRED:
+            populated = sum(
+                1 for t in trades
+                if t.get(field) is not None and float(t.get(field) or 0) > 0
+            )
+            coverage = populated / max(baseline_total, 1)
+            if coverage < MIN_PROVENANCE_COVERAGE:
+                return {
+                    "verdict": "PROVENANCE_UNAVAILABLE",
+                    "reason": (
+                        f"{field} is populated for only {populated}/{baseline_total} "
+                        f"({coverage:.0%}) of the replay cohort; minimum is "
+                        f"{MIN_PROVENANCE_COVERAGE:.0%}. Replaying {target_param} "
+                        f"against absent provenance would treat every unpopulated "
+                        f"row as below threshold and report a false improvement. "
+                        f"Restore the entry-provenance writer before replaying."
+                    ),
+                    "sample_size": baseline_total,
+                    "provenance_coverage": round(coverage, 4),
+                    "field": field,
+                }
+
         if new_val > current_val:
-            # Stricter filter — some trades would have been excluded
-            excluded = [t for t in trades if float(t.get(field) or 0) < new_val]
-            included = [t for t in trades if float(t.get(field) or 0) >= new_val]
+            # Stricter filter — some trades would have been excluded.
+            # Rows lacking provenance are held OUT of the simulation entirely
+            # rather than being counted as failures of the threshold.
+            known    = [t for t in trades if t.get(field) is not None and float(t.get(field) or 0) > 0]
+            excluded = [t for t in known if float(t.get(field) or 0) < new_val]
+            included = [t for t in known if float(t.get(field) or 0) >= new_val]
         else:
             # Looser filter — some additional trades would have been included
             # (We can't retroactively add trades we never took, so use same set)
@@ -291,6 +371,21 @@ def process_proposal(proposal: dict, trades: list[dict], config: dict) -> None:
             confidence=0.95,
         )
         _mark_vetoed(proposal_id, metrics, "REPLAY_REGRESSION")
+
+    elif verdict == "PROVENANCE_UNAVAILABLE":
+        # SIGNOFF_10H_REPLAY_PROVENANCE_20260811: the replay could not run because
+        # the gating field was never persisted for this cohort. This is NOT
+        # evidence for or against the proposal and must never be logged as proof.
+        # Treated exactly like INSUFFICIENT_DATA (open for debate, evidence
+        # caveat) -- it grants no approval authority and vetoes nothing.
+        log_cognition(
+            "RESEARCH",
+            f"REPLAY UNAVAILABLE: cannot simulate {target_param} change — "
+            f"{result.get('reason', 'entry provenance missing')} "
+            f"Opening for debate with NO replay evidence.",
+            confidence=0.4,
+        )
+        _mark_open(proposal_id, metrics, result)
 
     elif verdict == "INSUFFICIENT_DATA":
         log_cognition(

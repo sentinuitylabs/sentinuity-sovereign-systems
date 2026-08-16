@@ -27,7 +27,7 @@ import logging
 
 # ── COST BUDGET PER DEBATE ────────────────────────────────────────────────────
 # Approx cost per call:
-#   POLARIS  (gpt-4o-mini):      ~$0.0003/call
+#   POLARIS  (gpt-5.4-mini):      ~$0.0003/call
 #   IVARIS   (claude-haiku):     ~$0.0004/call
 #   NUGGET   (gemini-2.5-flash): ~$0.0002/call
 #   NIM      (free tier):        $0.00
@@ -48,7 +48,7 @@ POLARIS_IDENTITY = {
     "origin":      "Polar",
     "role":        "Autonomous Architect — The Proposer",
     "api":         "openai",
-    "model":       "gpt-4o-mini",
+    "model":       "gpt-5.4-mini",
     "cost_tier":   "low",
     "colour":      "#8EF9FF",
     "calls_when":  "Every 30min analysis cycle + INTELLIGENCE_BUILD tasks",
@@ -133,7 +133,7 @@ NIM_IDENTITY = {
 
 # ── WHO IS BEST FOR WHAT (honest assessment from 12h build session) ───────────
 AGENT_STRENGTHS = {
-    "POLARIS (gpt-4o-mini)": {
+    "POLARIS (gpt-5.4-mini)": {
         "best_at": [
             "Pattern recognition across trade history",
             "Generating concise, well-structured proposals",

@@ -1,4 +1,4 @@
-from services.active_pipeline_cleaner import clean_once
+﻿from services.active_pipeline_cleaner import clean_once
 
 def launch_nuke(cutoff_seconds=600, dry_run=False):
     return clean_once(cutoff_seconds=cutoff_seconds, dry_run=dry_run, backup=True if not dry_run else False)

@@ -195,11 +195,26 @@ _CSS = f"""
 }}
 .gbx-big {{ font-size:1.5rem; font-weight:700; font-family:'Orbitron',sans-serif; }}
 .gbx-dim {{ color:#5A7060; font-size:.68rem; font-family:'Share Tech Mono',monospace; }}
-.gbx-pulse-grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin:7px 0 4px}}
+.gbx-pulse-grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin:7px 0 4px;max-width:100%;overflow:hidden}}
 .gbx-pulse-stack{{border:1px solid rgba(142,249,255,.12);border-radius:10px;padding:7px;background:rgba(3,6,12,.58);min-width:0}}
 .gbx-pulse-stack h4{{font-family:'Orbitron',sans-serif;font-size:.58rem;letter-spacing:.18em;margin:0 0 5px;color:#6f8090}}
 .gbx-pulse-stack .svc-pill{{display:flex!important;width:100%;margin:3px 0!important;justify-content:flex-start;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-sizing:border-box}}
-@media(max-width:700px){{.gbx-pulse-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}
+@media(max-width:700px){{.gbx-pulse-grid{{grid-template-columns:1fr;width:100%;max-width:100%}}.gbx-pulse-stack{{width:100%;max-width:100%}}}}
+
+/* SIGNOFF_GLASSBOX_TRACE_20260808 */
+.gbx-trace-shell {{ border:1px solid rgba(142,249,255,.16); border-radius:14px; padding:10px 11px; background:linear-gradient(140deg,rgba(153,69,255,.045),rgba(3,7,12,.72)); overflow:hidden; }}
+.gbx-trace-head {{ display:flex; justify-content:space-between; gap:8px; align-items:center; font-family:'Share Tech Mono',monospace; font-size:.66rem; color:#8EF9FF; margin-bottom:7px; }}
+.gbx-stage-rail {{ display:grid; grid-template-columns:repeat(7,minmax(44px,1fr)); gap:4px; margin:6px 0 9px; }}
+.gbx-stage {{ font:600 .58rem 'Share Tech Mono',monospace; text-align:center; padding:4px 2px; border-top:2px solid #39424C; color:#73808A; white-space:nowrap; }}
+.gbx-stage.on {{ border-color:#14F195; color:#C9FFE8; }}
+.gbx-stage.gold {{ border-color:#FFD700; color:#FFD700; }}
+.gbx-stage.block {{ border-color:#FF5A69; color:#FF7A86; }}
+.gbx-stage.abs {{ border-color:#5E6470; color:#7E8490; border-top-style:dashed; }}
+.gbx-trace-grid {{ display:grid; grid-template-columns:78px 86px minmax(90px,1fr) 70px minmax(120px,2fr); gap:5px; align-items:baseline; font:.62rem 'Share Tech Mono',monospace; padding:3px 0; border-bottom:1px solid rgba(255,255,255,.035); min-width:620px; }}
+.gbx-trace-scroll {{ overflow-x:auto; }}
+.gbx-raw {{ font:.59rem 'Share Tech Mono',monospace; color:#8D92A0; white-space:pre; overflow-x:auto; padding:2px 0; border-bottom:1px solid rgba(255,255,255,.025); }}
+.gbx-code-op {{ color:#8EF9FF; }} .gbx-code-trust {{ color:#14F195; }} .gbx-code-gold {{ color:#FFD700; }} .gbx-code-block {{ color:#FF6B75; }} .gbx-code-abs {{ color:#747985; }}
+@media (max-width:430px) {{ .gbx-trace-shell {{ padding:8px 8px; }} .gbx-stage-rail {{ grid-template-columns:repeat(4,1fr); }} .gbx-trace-head {{ font-size:.61rem; }} }}
 </style>
 """
 
@@ -353,9 +368,9 @@ def _panel_pulse() -> dict:
         blob = (str(r.get("status") or "") + " " + str(r.get("note") or "")).lower()
         if any(x in blob for x in ("error", "failed", "broken", "traceback", "dead", "unauthorized")):
             bucket = "BROKEN"
-        elif age is None or age >= 300:
+        elif age is None or age >= 420:
             bucket = "STALE"
-        elif age >= 40 or any(x in blob for x in ("degraded", "warn", "stall", "idle")):
+        elif age >= 120 or any(x in blob for x in ("degraded", "warn", "stall", "idle")):
             bucket = "WATCH"
         else:
             bucket = "HEALTHY"
@@ -604,6 +619,86 @@ _WORLD_HEADER = f"""
 """
 
 
+
+def _gbx_float(v):
+    try:
+        if v is None or v == "": return None
+        x=float(v); return x if x==x else None
+    except Exception: return None
+
+def _gbx_pct_from_prices(entry,px):
+    e=_gbx_float(entry); p=_gbx_float(px)
+    if not e or e<=0 or p is None: return None
+    return (p/e-1.0)*100.0
+
+def _gbx_fmt_pct(v):
+    x=_gbx_float(v)
+    return "n/a" if x is None else f"{x:+.1f}%"
+
+def _gbx_fmt_age(ts):
+    x=_gbx_float(ts)
+    return "n/a" if not x else f"{max(0.0,time.time()-x):.2f}s"
+
+def _gbx_short(s,n=48):
+    s=str(s or ""); return _h.escape(s if len(s)<=n else s[:n-1]+"…")
+
+def _panel_execution_trace() -> None:
+    payload=D.active_execution_glassbox()
+    st.markdown(_hdr("⌬","Execution Glassbox · Harvest & Exit Route",C_CYAN),unsafe_allow_html=True)
+    if not payload.get("wired"):
+        st.markdown(_not_wired("execution trace")+_src(payload.get("src","")),unsafe_allow_html=True); return
+    rows=payload.get("rows") or []
+    if not rows:
+        st.markdown(_chip("NO OPEN POSITION · waiting for next admission",C_MIST)+_src(payload.get("src","")),unsafe_allow_html=True); return
+    try:
+        from services.position_truth_payload import build_position_truth_payload
+    except Exception:
+        build_position_truth_payload=None
+    for item in rows:
+        p=item.get("position") or {}; parity=item.get("parity") or {}; fire=item.get("live_fire") or {}
+        token=str(item.get("token") or "?"); pid=p.get("id")
+        canon=build_position_truth_payload(int(pid)) if (build_position_truth_payload and pid) else {}
+        A=canon.get("A_pool") or {}; B=canon.get("B_tape") or {}; Cx=canon.get("C_exec") or {}; Dobs=canon.get("D_observation") or {}
+        obs_pct=_gbx_float(canon.get("observed_pnl_pct")); a_pct=_gbx_float(A.get("pnl_pct")); c_pct=_gbx_float(canon.get("executable_pnl_pct"))
+        trust_pct=_gbx_float(canon.get("trusted_peak_pct")); floor_pct=_gbx_float(canon.get("protected_floor_pct"))
+        floor_armed=str(canon.get("protected_floor_status") or "").upper()=="FRESH" and floor_pct is not None
+        a_ok=str(A.get("status") or "").upper()=="FRESH"; b_ok=str(B.get("status") or "").upper()=="FRESH"
+        c_ok=str(canon.get("executable_status") or "").upper()=="FRESH"; trust_ok=str(canon.get("trusted_peak_status") or "").upper()=="FRESH"
+        route_ok=bool(Cx.get("route")) and c_ok
+        live_verdict=str(parity.get("live_verdict") or "")
+        live_reason=str(parity.get("terminal_reason") or parity.get("live_refusal_reason") or fire.get("reason") or "")
+        fired=bool(fire) and str(fire.get("outcome") or "").upper() in ("SUBMITTED","FILLED","RECONCILED")
+        refused=bool(live_reason) and not fired
+        stages=[("OBS",obs_pct is not None,"on"),("A",a_ok,"on"),("B",b_ok,"on"),("EXEC",c_ok,"on" if c_ok else "abs"),
+                ("TRUST",trust_ok,"gold" if trust_ok else "abs"),("ARM",floor_armed,"gold" if floor_armed else "abs"),
+                ("FIRE",fired,"on" if fired else ("block" if refused else "abs"))]
+        rail="".join(f"<div class='gbx-stage {cls if ok or cls in ('block','abs') else 'abs'}'>{label}</div>" for label,ok,cls in stages)
+        acd=_gbx_float(canon.get("a_c_divergence_pct")); oed=_gbx_float(canon.get("obs_exec_divergence_pct"))
+        ac_txt="n/a" if acd is None else f"{acd:.1f}%"; oe_txt="n/a" if oed is None else f"{oed:+.1f} pts"
+        exec_socket=str((canon.get("stage_executable") or {}).get("socket_state") or "")
+        oe_cls="gbx-code-block" if exec_socket=="REJECTED" else ("gbx-code-trust" if oed is not None else "gbx-code-abs")
+        head=f"<div class='gbx-trace-head'><span>POS {pid} · {_gbx_short(token,22)}</span><span>OBS {_gbx_fmt_pct(obs_pct)} · EXEC {_gbx_fmt_pct(c_pct)} · TRUST {_gbx_fmt_pct(trust_pct)} · FLOOR {(_gbx_fmt_pct(floor_pct) if floor_armed else 'WITHHELD')}</span></div>"
+        latency=Cx.get("latency_ms")
+        latency_txt="unknown" if latency is None else f"{_gbx_float(latency):.0f}ms"
+        traces=[
+          ("A:POOL",str(A.get("source") or "NO WITNESS"),f"slot {A.get('slot') if A.get('slot') is not None else '—'}",_gbx_fmt_pct(a_pct),f"age {'unknown' if A.get('age_sec') is None else format(A['age_sec'],'.2f')+'s'} · {A.get('status') or 'ABSENT'}","gbx-code-trust" if a_ok else "gbx-code-abs"),
+          ("B:TAPE",str(B.get("source") or "NO WITNESS"),f"slot {B.get('slot') if B.get('slot') is not None else '—'}","signature-backed" if b_ok else "—",_gbx_short(B.get("tx_signature") or "NO WITNESS",38),"gbx-code-trust" if b_ok else "gbx-code-abs"),
+          ("C:EXEC",str(Cx.get("source") or "NO QUOTE"),f"slot {Cx.get('slot') if Cx.get('slot') is not None else '—'}",_gbx_fmt_pct(c_pct),f"age {'unknown' if Cx.get('age_sec') is None else format(Cx['age_sec'],'.2f')+'s'} · lat={latency_txt} · {Cx.get('status') or 'ABSENT'} · {Cx.get('reason_code') or ''}","gbx-code-trust" if c_ok else "gbx-code-abs"),
+          ("D:OBS",str(Dobs.get("source") or "NO OBS"),"market",_gbx_fmt_pct(obs_pct),f"market age {'unknown' if Dobs.get('age_sec') is None else format(Dobs['age_sec'],'.2f')+'s'} · {Dobs.get('status') or 'ABSENT'}","gbx-code-op" if obs_pct is not None else "gbx-code-abs"),
+          ("TRUTH","A↔C","divergence",ac_txt,f"independence diagnostic · authority={canon.get('authority_stage') or 'NONE'}","gbx-code-trust" if acd is not None else "gbx-code-abs"),
+          ("TRUTH","OBS↔EXEC","divergence",oe_txt,f"reason={canon.get('reason_code') or ''}",oe_cls),
+          ("HARVEST",str(canon.get("authority_stage") or "NONE"),"peak→floor",_gbx_fmt_pct(trust_pct),f"floor={_gbx_fmt_pct(floor_pct) if floor_armed else 'WITHHELD'}","gbx-code-gold" if floor_armed else "gbx-code-abs"),
+          ("EXIT_BUILD",str(Cx.get("source") or "WAITING"),"route","READY" if route_ok else "WAITING_FOR_TRIGGER/QUOTE",_gbx_short(Cx.get("route") or Cx.get("reason_code") or "NO ROUTE EVIDENCE",80),"gbx-code-trust" if route_ok else "gbx-code-abs"),
+          ("CAPITAL",str(live_verdict or fire.get("outcome") or "NO DECISION"),"Mode 3","FIRE" if fired else ("HELD" if refused else "WAITING"),_gbx_short(live_reason or "no current blocker published",100),"gbx-code-trust" if fired else ("gbx-code-block" if refused else "gbx-code-abs"))
+        ]
+        body=["<div class='gbx-trace-grid'>"+f"<span class='{cls}'>{_gbx_short(stage,16)}</span><span>{_gbx_short(source,18)}</span><span>{_gbx_short(slot,28)}</span><span class='{cls}'>{_gbx_short(value,18)}</span><span>{_gbx_short(detail,120)}</span></div>" for stage,source,slot,value,detail,cls in traces]
+        raw_lines=[f"<div class='gbx-raw'><span class='gbx-code-op'>{_gbx_short(ev.get('source'),22)}</span>  {_gbx_short(ev.get('line'),420)}</div>" for ev in (item.get("raw_trace") or [])]
+        raw_html="".join(raw_lines) if raw_lines else "<div class='gbx-raw gbx-code-abs'>NO MATCHING INTERNAL EXIT/HARVEST STRING YET</div>"
+        st.markdown("<div class='gbx-trace-shell'>"+head+f"<div class='gbx-stage-rail'>{rail}</div><div class='gbx-trace-scroll'>"+"".join(body)+"</div><details style='margin-top:8px'><summary style='font:600 .62rem Share Tech Mono;color:#8EF9FF;cursor:pointer'>RAW INTERNAL STRINGS · LIVE ENGINE TAIL</summary>"+raw_html+"</details></div>",unsafe_allow_html=True)
+    st.markdown(_src(payload.get("src","")),unsafe_allow_html=True)
+
+
+
 # ══════════════════════════════ MOUNT POINT ══════════════════════════════════
 def render_glassbox() -> None:
     _inject_css()
@@ -643,6 +738,13 @@ def render_glassbox() -> None:
     with col_price:
         st.markdown('<div class="gbx-world">', unsafe_allow_html=True)
         _panel_price_truth()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # Full-width causal Glassbox: real evidence, route build, harvest state and
+    # capital decision. Read-only; it cannot promote authority or fire capital.
+    with st.container():
+        st.markdown('<div class="gbx-world">', unsafe_allow_html=True)
+        _panel_execution_trace()
         st.markdown('</div>', unsafe_allow_html=True)
 
     # Row 3: Dual-Lane Arena + Copytrade

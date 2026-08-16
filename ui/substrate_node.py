@@ -626,25 +626,79 @@ def _render_macro_trade_book() -> None:
     st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
     st.markdown("<div class='sn-h'>OPEN POSITIONS</div>", unsafe_allow_html=True)
     if open_pos:
+        # SIGNOFF_CANONICAL_OPEN_TRUTH_20260813
+        # Open-position display truth comes from the same canonical payload used
+        # by the main execution glassbox. No local price-ratio formula is
+        # permitted to invent a coordinate from current_price / last_price.
+        _canon_by_id = {}
+        try:
+            from services.position_truth_payload import build_open_position_truth_payloads
+            _canon_payloads = build_open_position_truth_payloads(
+                matrix_db=str(DB_PATH), limit=max(24, len(open_pos)), now=now
+            )
+            _canon_by_id = {
+                int(x.get("position_id")): x
+                for x in _canon_payloads
+                if x.get("position_id") is not None
+            }
+        except Exception:
+            _canon_by_id = {}
+
         for p in open_pos:
             sym = _row_symbol(p)
             side = str(p.get("side", "LONG")).upper()
             mode = str(p.get("mode", "PAPER")).upper()
-            entry = _num(p.get("entry_price"), _num(p.get("entry_price_usd")))
-            cur   = _num(p.get("current_price"), _num(p.get("last_price"), entry))
-            upnl  = _num(p.get("unrealized_pnl"), _num(p.get("unrealized_pnl_usd"), _num(p.get("pnl_usd"))))
+            _pid = int(_num(p.get("id"), _num(p.get("position_id"), -1)))
+            _truth = _canon_by_id.get(_pid) or {}
+
+            entry = _num(
+                _truth.get("entry_price"),
+                _num(p.get("entry_price"), _num(p.get("entry_price_usd")))
+            )
+            _hero_stage = str(_truth.get("hero_stage") or "")
+            if _hero_stage == "EXECUTABLE":
+                cur = _num(_truth.get("executable_price"))
+            elif _hero_stage == "OBSERVED":
+                cur = _num(_truth.get("observed_price"))
+            else:
+                cur = 0.0
+
+            pnl_pct = _truth.get("hero_pnl_pct")
+            if pnl_pct is not None:
+                try:
+                    pnl_pct = float(pnl_pct)
+                except Exception:
+                    pnl_pct = None
+
+            _hero_usd = _truth.get("hero_pnl_usd")
+            upnl = (
+                _num(_hero_usd)
+                if _hero_usd is not None else
+                _num(p.get("unrealized_pnl"),
+                     _num(p.get("unrealized_pnl_usd"), _num(p.get("pnl_usd"))))
+            )
             size  = _num(p.get("position_size"), _num(p.get("size_usd")))
-            src   = str(p.get("source", p.get("price_source", "")))
+            src   = str(_truth.get("hero_source") or p.get("source", p.get("price_source", "")))
             opened = _num(p.get("opened_at"))
-            pnl_pct = (cur - entry) / entry * 100 if entry > 0 else 0
+
+            # The canonical payload deliberately returns hero_pnl_pct=None when
+            # no current stage has authority. That is rendered as NO MARK.
+            _has_mark = pnl_pct is not None and cur > 0 and entry > 0
             row_cls = "sn-buy" if side == "LONG" else "sn-sell"
             mode_col = C_GOLD if mode == "LIVE" else C_CYAN
             pnl_col  = _pnl_color(upnl)
             max_hold = _num(p.get("max_hold_sec"))
             age_sec = max(0.0, now - opened) if opened else 0.0
             remaining = max_hold - age_sec if max_hold > 0 else 0.0
-            last_mark = _num(p.get("last_price_at"))
-            mark_age = max(0.0, now - last_mark) if last_mark else 999999.0
+            _canon_age = _truth.get("hero_age_sec")
+            if _canon_age is not None:
+                try:
+                    mark_age = max(0.0, float(_canon_age))
+                except Exception:
+                    mark_age = 999999.0
+            else:
+                last_mark = _num(p.get("last_price_at"))
+                mark_age = max(0.0, now - last_mark) if last_mark else 999999.0
             overdue = bool(max_hold > 0 and remaining <= 0)
             offline_risk = bool(mark_age > 300)
             horizon = (f"due in {int(remaining//60)}m" if max_hold > 0 and remaining > 0
@@ -653,14 +707,30 @@ def _render_macro_trade_book() -> None:
             tp = _num(p.get("tp_pct")); sl = _num(p.get("sl_pct"))
             exit_contract = f"TP {tp:.1f}% · SL {sl:.1f}% · {horizon}"
             freshness = f"mark {int(mark_age)}s" if mark_age < 999999 else "mark unavailable"
+            # Built as its own variable: embedding a conditional inside the
+            # implicitly-concatenated f-string block below would bind the ternary
+            # to the ENTIRE preceding concatenation, silently dropping every span
+            # before it whenever the mark was absent.
+            _mark_span = (
+                f"<span style='color:#ccc;'>→ ${cur:.6g}</span>"
+                if _has_mark else
+                f"<span style='color:{C_DIM};'>→ NO MARK</span>"
+            )
+            _pnl_span = (
+                f"<span style='color:{pnl_col};margin-left:auto;'>"
+                f"{upnl:+.2f} USD ({pnl_pct:+.1f}%)</span>"
+                if pnl_pct is not None else
+                f"<span style='color:{C_DIM};margin-left:auto;'>"
+                f"{upnl:+.2f} USD (NO MARK)</span>"
+            )
             st.markdown(
                 f"<div class='sn-trade-row {row_cls}' style='flex-wrap:wrap;'>"
                 f"<span style='color:{mode_col};min-width:44px;'>{mode}</span>"
                 f"<span style='color:{C_CYAN};min-width:36px;font-weight:800;'>{sym}</span>"
                 f"<span style='color:{C_AMBER if side == 'LONG' else C_RED};min-width:36px;'>{side}</span>"
                 f"<span style='color:#999;'>@ ${entry:.6g}</span>"
-                f"<span style='color:#ccc;'>→ ${cur:.6g}</span>"
-                f"<span style='color:{pnl_col};margin-left:auto;'>{upnl:+.2f} USD ({pnl_pct:+.1f}%)</span>"
+                f"{_mark_span}"
+                f"{_pnl_span}"
                 f"<span style='color:{C_DIM};min-width:55px;text-align:right;'>${size:.0f} pos</span>"
                 f"<span style='color:{C_DIM};min-width:40px;text-align:right;'>{_age_str(opened)}</span>"
                 f"<span style='flex-basis:100%;height:0;'></span>"

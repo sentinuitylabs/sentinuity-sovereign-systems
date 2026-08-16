@@ -101,6 +101,37 @@ def _is_forge_proposal(text: str) -> bool:
     return True
 
 # ── PROJECT & MILESTONE HELPERS ───────────────────────────────────────────────
+
+# COUNCIL_UNRESOLVED_ONTOLOGY_20260816
+# ------------------------------------
+# A proposal is "unresolved" when it exists as work and has not reached a
+# terminal outcome. The previous list contained only the ACTIVE half, so the
+# statuses written by debate_engine.defer_proposal() -- needs_specification,
+# insufficient_quorum, needs_you -- counted as *nothing at all*.
+#
+# Observed consequence: proposal #2372 was deferred to needs_specification with
+# retry_in=1800s; _equivalent_unresolved_exists() then reported no unresolved
+# work for the same project/stage; the orchestrator immediately generated an
+# equivalent proposal; the debate engine deferred that one too. #2372 -> #2431
+# in twelve minutes, ~5 new rows per minute, none of them resolvable, all of
+# them for the same under-specified project/stage.
+#
+# The deferred statuses are genuinely unresolved: debate_engine's selector
+# (get_open_proposals, COUNCIL_SPINE_20260815) already re-picks
+# needs_specification and insufficient_quorum once retry_after expires, so the
+# EXISTING row is the canonical work item and a duplicate is never required.
+# needs_you is unresolved until an operator acts, which is precisely when a
+# duplicate is least useful.
+ACTIVE_UNRESOLVED_STATUSES = (
+    "open", "debating", "critic_unavailable", "debate_retryable", "debate_error",
+)
+DEFERRED_UNRESOLVED_STATUSES = (
+    "needs_specification", "insufficient_quorum", "needs_you",
+)
+UNRESOLVED_STATUSES = ACTIVE_UNRESOLVED_STATUSES + DEFERRED_UNRESOLVED_STATUSES
+_UNRESOLVED_SQL = ",".join("'%s'" % s for s in UNRESOLVED_STATUSES)
+
+
 def _get_active_projects() -> list[dict]:
     with get_connection() as db:
         rows = db.execute("""
@@ -119,26 +150,47 @@ def _get_open_forge_count() -> int:
     empty queue and generated duplicate RESEARCH proposals roughly every poll.
     """
     with get_connection() as db:
-        return db.execute("""
+        return db.execute(f"""
             SELECT COUNT(*) FROM polaris_proposals
             WHERE proposal_domain='FORGE'
-              AND status IN ('open','debating','critic_unavailable','debate_retryable','debate_error')
+              AND status IN ({_UNRESOLVED_SQL})
         """).fetchone()[0]
 
 
 def _equivalent_unresolved_exists(project_key: str, stage: str) -> bool:
-    """True when the same project/stage already has unresolved work."""
+    """True when the same project/stage already has unresolved work.
+
+    COUNCIL_UNRESOLVED_ONTOLOGY_20260816 -- see UNRESOLVED_STATUSES above.
+    The gate remains keyed on (project_key, stage), exactly as narrow as it
+    was. It is not widened to proposal_type, so genuinely independent work on
+    a different project or a different stage is never suppressed.
+    """
     with get_connection() as db:
-        row = db.execute("""
-            SELECT id FROM polaris_proposals
+        row = db.execute(f"""
+            SELECT id, status, COALESCE(retry_after, 0) AS retry_after
+            FROM polaris_proposals
             WHERE proposal_domain='FORGE'
               AND project_key=?
               AND stage=?
-              AND status IN ('open','debating','critic_unavailable','debate_retryable','debate_error')
+              AND status IN ({_UNRESOLVED_SQL})
             ORDER BY created_at DESC
             LIMIT 1
         """, (project_key, stage)).fetchone()
-    return row is not None
+    if row is None:
+        return False
+    # Make the hold observable. A silently-held stage looks identical to a
+    # broken generator from the log, which is how the previous behaviour went
+    # unnoticed; the difference is that the existing row IS the work item and
+    # debate_engine.get_open_proposals() re-picks it once retry_after expires.
+    _status = str(row["status"] or "")
+    if _status in DEFERRED_UNRESOLVED_STATUSES:
+        _wait = max(0.0, float(row["retry_after"] or 0) - time.time())
+        log.info(
+            "Curiosity backpressure: %s/%s held by deferred proposal #%s "
+            "status=%s retry_in=%.0fs — the existing row remains the work item",
+            project_key, stage, row["id"], _status, _wait,
+        )
+    return True
 
 def _get_project_stage(project_key: str) -> str:
     with get_connection() as db:

@@ -65,7 +65,12 @@ def ensure_supervisor_schema():
         "executed": "INTEGER DEFAULT 0",
         "signal_generated_at": "REAL",
         "mint_confidence": "REAL DEFAULT 0",
+        "calibrated_confidence": "REAL DEFAULT 0",
+        "confidence_score": "REAL DEFAULT 0",
         "confidence": "REAL DEFAULT 0",
+        "signal_discovered_at": "REAL",
+        "qualified_at": "REAL",
+        "first_seen_at": "REAL",
         "updated_at": "REAL",
         "meta": "TEXT DEFAULT '{}'",
     }
@@ -79,7 +84,17 @@ def ensure_supervisor_schema():
         conn.commit()
 
 
-def latch_write(snapshot_id: int, conf: float, observed_price: float):
+def latch_write(snapshot_id: int, base_conf: float, final_conf: float, observed_price: float,
+                price_age: float, signal_age: float, discovery_age: float,
+                confidence_source: str, ct_reason: str):
+    """Promote an already-qualified snapshot without rewriting source truth.
+
+    SIGNOFF_LATCH_TRUTH_20260731:
+    - never write trading confidence into mint_confidence;
+    - never make an old signal look new by rewriting signal_generated_at;
+    - never make an old quote look new by rewriting price_updated_at;
+    - retain base/final confidence and gate provenance in meta for auditability.
+    """
     now = time.time()
     for attempt in range(4):
         try:
@@ -105,19 +120,23 @@ def latch_write(snapshot_id: int, conf: float, observed_price: float):
                     vals.append(now)
                 if set_if("execution_ready_at"):
                     vals.append(now)
-                if set_if("signal_generated_at"):
-                    vals.append(now)
                 if set_if("updated_at"):
                     vals.append(now)
-                # Stamp price fresh only if the candidate has a real nonzero price.
-                if observed_price > 0 and set_if("price_updated_at"):
-                    vals.append(now)
-                if set_if("confidence"):
-                    vals.append(conf)
-                if set_if("mint_confidence"):
-                    vals.append(conf)
-                if set_if("meta", "json_set(COALESCE(meta,'{}'),'$.may22_direct_latch_ts',?)"):
-                    vals.append(now)
+                # Source timestamps and mint identity confidence are immutable here.
+                # The copy-trade-adjusted latch confidence is audit provenance, not
+                # a replacement for calibrated model confidence.
+                _meta_expr = (
+                    "json_set(json_set(json_set(json_set(json_set(json_set(json_set(json_set("
+                    "COALESCE(meta,'{}'), '$.may22_direct_latch_ts',?), "
+                    "'$.latch_base_confidence',?), '$.latch_final_confidence',?), "
+                    "'$.latch_confidence_source',?), '$.latch_price_age_sec',?), "
+                    "'$.latch_signal_age_sec',?), '$.latch_discovery_age_sec',?), "
+                    "'$.latch_copytrade_reason',?)"
+                )
+                if set_if("meta", _meta_expr):
+                    vals.extend((now, float(base_conf), float(final_conf), str(confidence_source),
+                                 float(price_age), float(signal_age), float(discovery_age), str(ct_reason)))
+
 
                 vals.append(snapshot_id)
                 conn.execute(f"UPDATE market_snapshots SET {', '.join(sets)} WHERE id=?", tuple(vals))
@@ -133,11 +152,18 @@ def latch_write(snapshot_id: int, conf: float, observed_price: float):
 
 def supervise_once():
     now = time.time()
-    min_conf = cfg_float("SUPERVISOR_MIN_MINT_CONF", cfg_float("SUPERVISOR_MIN_MINT_CONFIDENCE", 0.65))
-    # Prefer the explicit Phase-A/current key, then legacy key.
-    max_price_age = cfg_float("SUPERVISOR_MAX_PRICE_AGE_SEC", cfg_float("SUPERVISOR_PRICE_MAX_AGE_SECONDS", 180))
-    max_signal_age = cfg_float("SUPERVISOR_PHASE_A_SIGNAL_AGE_SEC", cfg_float("SUPERVISOR_MAX_SIGNAL_AGE_SEC", 1800))
-    max_discovery_age = cfg_float("SUPERVISOR_MAX_DISCOVERY_AGE_SEC", 1800)
+    # SIGNOFF_LATCH_TRUTH_20260731: despite the legacy config name, this is a
+    # TRADING-confidence floor. mint_confidence is identity resolution only.
+    min_conf = cfg_float(
+        "SUPERVISOR_MIN_TRADING_CONFIDENCE",
+        cfg_float("SUPERVISOR_MIN_MINT_CONF", cfg_float("SUPERVISOR_MIN_MINT_CONFIDENCE", 0.65)),
+    )
+    # Latch freshness can never be looser than the active execution contract.
+    supervisor_price_age = cfg_float("SUPERVISOR_MAX_PRICE_AGE_SEC", cfg_float("SUPERVISOR_PRICE_MAX_AGE_SECONDS", 180))
+    supervisor_signal_age = cfg_float("SUPERVISOR_PHASE_A_SIGNAL_AGE_SEC", cfg_float("SUPERVISOR_MAX_SIGNAL_AGE_SEC", 600))
+    max_price_age = min(supervisor_price_age, cfg_float("EXECUTOR_MAX_PRICE_AGE_SEC", 300))
+    max_signal_age = min(supervisor_signal_age, cfg_float("EXECUTOR_MAX_SIGNAL_AGE_SEC", 600))
+    max_discovery_age = min(cfg_float("SUPERVISOR_MAX_DISCOVERY_AGE_SEC", 600), max_signal_age)
     # PAPER-FALLBACK CONTRACT 2026-07-07:
     # The May22 direct-latch supervisor is the PAPER admission spine.
     # It must run in paper mode AND dual mode. Live is an overlay, not a reason
@@ -146,6 +172,13 @@ def supervise_once():
     paper_enabled = str(get_config_value("PAPER_TRADING_ENABLED", "1")).strip() == "1"
     live_enabled = str(get_config_value("LIVE_TRADING_ENABLED", "0")).strip() == "1"
     live_armed = str(get_config_value("LIVE_ARMED", "0")).strip() == "1"
+
+    # In dual/live mode the latch queue must satisfy the live overlay's freshness
+    # ceiling too; otherwise the UI fills with latches that can never pass Mode B.
+    if trading_mode in ("dual", "live", "hybrid"):
+        max_price_age = min(max_price_age, cfg_float("LIVE_MAX_PRICE_AGE_SEC", max_price_age))
+        max_signal_age = min(max_signal_age, cfg_float("LIVE_MAX_SIGNAL_AGE_SEC", max_signal_age))
+        max_discovery_age = min(max_discovery_age, max_signal_age)
 
     paper_lane_allowed = paper_enabled and trading_mode in ("paper", "dual", "hybrid", "live")
 
@@ -189,16 +222,10 @@ def supervise_once():
               AND COALESCE(is_tradeable,0)=1
               AND COALESCE(observed_price,0)>0
               AND COALESCE(price_updated_at,0) > (? - ?)
-              AND MAX(
-                  COALESCE(mint_confidence,0),
-                  COALESCE(calibrated_confidence,0),
-                  COALESCE(confidence,0),
-                  COALESCE(confidence_score,0)
-              ) >= ?
               AND COALESCE(tx_hash,'') NOT LIKE 'mtm:%'
             ORDER BY COALESCE(price_updated_at,0) DESC
             LIMIT 25
-        """, (now, max_price_age, query_floor)).fetchall()
+        """, (now, max_price_age)).fetchall()
 
     approved = 0
     vetoed = 0
@@ -207,27 +234,32 @@ def supervise_once():
     for row in rows:
         keys = set(row.keys())
         sid = int(row["id"])
-        conf = max(
-            safe_float(row["mint_confidence"] if "mint_confidence" in keys else 0.0, 0.0),
-            safe_float(row["calibrated_confidence"] if "calibrated_confidence" in keys else 0.0, 0.0),
-            safe_float(row["confidence"] if "confidence" in keys else 0.0, 0.0),
-            safe_float(row["confidence_score"] if "confidence_score" in keys else 0.0, 0.0),
-        )
+        # Trading confidence only. mint_confidence answers whether the mint was
+        # identified correctly and must never qualify capital.
+        _confidence_candidates = [
+            ("calibrated_confidence", safe_float(row["calibrated_confidence"] if "calibrated_confidence" in keys else 0.0, 0.0)),
+            ("confidence_score", safe_float(row["confidence_score"] if "confidence_score" in keys else 0.0, 0.0)),
+            ("confidence", safe_float(row["confidence"] if "confidence" in keys else 0.0, 0.0)),
+        ]
+        confidence_source, conf = max(_confidence_candidates, key=lambda item: item[1])
+        if conf > 1.0 and conf <= 100.0:
+            conf /= 100.0
+        conf = max(0.0, min(1.0, conf))
         price = safe_float(row["observed_price"] if "observed_price" in keys else 0.0, 0.0)
         price_ts = safe_float(row["price_updated_at"] if "price_updated_at" in keys else 0.0, 0.0)
         signal_ts = max(
             safe_float(row["signal_generated_at"] if "signal_generated_at" in keys else 0.0, 0.0),
             safe_float(row["qualified_at"] if "qualified_at" in keys else 0.0, 0.0),
-            price_ts,
         )
         discovery_ts = max(
+            safe_float(row["signal_discovered_at"] if "signal_discovered_at" in keys else 0.0, 0.0),
             safe_float(row["first_seen_at"] if "first_seen_at" in keys else 0.0, 0.0),
             safe_float(row["created_at"] if "created_at" in keys else 0.0, 0.0),
             safe_float(row["timestamp"] if "timestamp" in keys else 0.0, 0.0),
         )
         price_age = now - price_ts if price_ts > 0 else 999999
-        signal_age = now - signal_ts if signal_ts > 0 else price_age
-        discovery_age = now - discovery_ts if discovery_ts > 0 else signal_age
+        signal_age = now - signal_ts if signal_ts > 0 else (now - discovery_ts if discovery_ts > 0 else 999999)
+        discovery_age = now - discovery_ts if discovery_ts > 0 else 999999
 
         if price_age > max_price_age:
             deferred += 1
@@ -256,14 +288,27 @@ def supervise_once():
             ct_reason = f"CT_ERROR:{type(_ct_exc).__name__}"
         final_conf = min(1.0, conf + max(0.0, float(ct_bonus or 0.0)))
 
-        if final_conf < min_conf:
+        # SIGNOFF_CALIBRATION_SHADOW_20260801:
+        # Historical profitable-era candidates were admitted by the qualified,
+        # priced, tradeable and freshness contracts; the confidence column was
+        # effectively a constant 0.89 and therefore carried no ranking signal.
+        # Keep truthful calibrated confidence as telemetry, but do not use an
+        # unvalidated maturity-biased score as a hard latch veto. The executor's
+        # remaining age, price, liquidity, pattern/Mode-B and live safety gates
+        # remain authoritative. Set CALIBRATION_ADMISSION_MODE=enforce only after
+        # the edge ledger proves predictive separation against outcomes.
+        calibration_mode = str(get_config_value("CALIBRATION_ADMISSION_MODE", "shadow")).strip().lower()
+        if calibration_mode == "enforce" and final_conf < min_conf:
             vetoed += 1
             continue
 
-        if latch_write(sid, final_conf, price):
+        if final_conf < min_conf:
+            ct_reason = f"{ct_reason}|CALIBRATION_SHADOW:{final_conf:.3f}<{min_conf:.3f}"
+
+        if latch_write(sid, conf, final_conf, price, price_age, signal_age, discovery_age, confidence_source, ct_reason):
             approved += 1
-            log.info("[MAY22_DIRECT_LATCH] id=%s mint=%s base=%.3f ct=+%.3f final=%.3f ct_reason=%s price_age=%.1fs signal_age=%.1fs",
-                     sid, str(row["mint_address"])[:18], conf, ct_bonus, final_conf, ct_reason, price_age, signal_age)
+            log.info("[MAY22_DIRECT_LATCH] id=%s mint=%s source=%s base=%.3f ct=+%.3f final=%.3f ct_reason=%s price_age=%.1fs signal_age=%.1fs discovery_age=%.1fs",
+                     sid, str(row["mint_address"])[:18], confidence_source, conf, ct_bonus, final_conf, ct_reason, price_age, signal_age, discovery_age)
 
     if approved or vetoed or deferred:
         update_heartbeat(SERVICE_NAME, "ALIVE", f"Approved: {approved} | Vetoed: {vetoed} | Deferred: {deferred} | Floor: {min_conf:.2f}", work_processed=approved, last_success_at=time.time() if approved else None)

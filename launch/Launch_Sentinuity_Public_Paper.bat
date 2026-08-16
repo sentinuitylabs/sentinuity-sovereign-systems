@@ -26,6 +26,5 @@ if errorlevel 1 (
 )
 
 set "SENTINUITY_PUBLIC_PAPER_RELEASE=1"
-set "SENTINUITY_LIVE_EXECUTION_STUB=1"
 call .\launch\Launch_Sentinuity.bat
 exit /b %errorlevel%

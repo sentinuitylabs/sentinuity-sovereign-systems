@@ -557,7 +557,7 @@ def _resolve_display_identity(metrics: Mapping[str, Any], mint: str) -> Tuple[st
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Post-hoc linkage (called by the shadow tracker / analysis, never by executor)
+# Canonical linkage (called by execution_engine immediately after paper open)
 # ─────────────────────────────────────────────────────────────────────────────
 def attach_paper_open(mint: str, position_id: int, entry_at: float,
                       entry_price: Optional[float]) -> bool:

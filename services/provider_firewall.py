@@ -27,10 +27,6 @@ log = logging.getLogger("provider_firewall")
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH  = BASE_DIR / "sentinuity_matrix.db"
 
-# Shared GitHub auth-state contract; import this instead of duplicating magic strings.
-GITHUB_AUTH_INVALID_ANONYMOUS = "GITHUB_AUTH_INVALID_ANONYMOUS"
-GITHUB_AUTH_REVALIDATE = "GITHUB_AUTH_REVALIDATE"
-
 # ── BUDGET LIMITS ─────────────────────────────────────────────────────────────
 LIMITS = {
     "x":    {"24h": 12,   "30d": 350,  "cooldown_402h": 24},
@@ -118,9 +114,9 @@ def check_provider(provider: str, caller: str = "unknown") -> tuple[bool, str]:
                 age = max(0.0, now - updated_at) if updated_at else 999999.0
                 if age < 300:
                     c.close()
-                    return True, GITHUB_AUTH_INVALID_ANONYMOUS
+                    return True, "GITHUB_AUTH_INVALID_ANONYMOUS"
                 c.close()
-                return True, GITHUB_AUTH_REVALIDATE
+                return True, "GITHUB_AUTH_REVALIDATE"
 
             # Check cooldown for provider-wide failures.
             cooldown = float(row["cooldown_until"] or 0)

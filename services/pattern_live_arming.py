@@ -61,13 +61,8 @@ def _cohort_key(row: Any) -> str:
         return "unknown"
 
 
-def _row_outcome(row: Any) -> str:
-    """Classify only canonical realised truth for pattern confirmation.
-
-    Peak/MFE remains useful research telemetry but cannot count as a realised
-    success or arm funded capital. Capped paper stop rows consume their raw
-    observed loss through the shared PnL truth contract.
-    """
+def _canonical_realised_pct(row: Any) -> float:
+    """Canonical realised percentage via the shared PnL truth contract."""
     realised_pct = canonical_realized_pnl_pct(row)
     if realised_pct == 0.0:
         size = abs(_f(row["position_size_usd"], 0.0))
@@ -76,7 +71,36 @@ def _row_outcome(row: Any) -> str:
         except Exception:
             pnl = 0.0
         realised_pct = (pnl / size * 100.0) if size > 1e-12 else 0.0
-    return classify_realised(realised_pct)
+    return realised_pct
+
+
+def _row_outcome(row: Any) -> str:
+    """EDGE_RESTORE_20260727 — Gold Runner pattern CONFIRMATION contract.
+
+    A pattern that demonstrably produced a runner must stay recognised even when
+    exit leakage reduced the final realised number, otherwise every genuine runner
+    pattern is reclassified as a failure/reset and the same pattern is then
+    REJECTED_MONSTER on its next appearance. This governs pattern recognition only.
+
+    Funded live sizing is NOT governed here: `_live_size_stage` remains driven by
+    canonical realised truth, so peak/MFE can never arm real capital.
+    """
+    realised_pct = _canonical_realised_pct(row)
+
+    peak_pct = None
+    try:
+        if "pattern_peak_pct" in row.keys() and row["pattern_peak_pct"] is not None:
+            peak_pct = _f(row["pattern_peak_pct"], realised_pct)
+    except Exception:
+        peak_pct = None
+
+    achieved_pct = max(realised_pct, peak_pct if peak_pct is not None else realised_pct)
+    return classify_realised(achieved_pct)
+
+
+def _row_outcome_realised_only(row: Any) -> str:
+    """Realised-only classification for funded-size decisions."""
+    return classify_realised(_canonical_realised_pct(row))
 
 
 

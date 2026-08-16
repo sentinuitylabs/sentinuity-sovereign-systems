@@ -33,7 +33,7 @@ def main():
     conf = str(float(sys.argv[4] if len(sys.argv) > 4 else ("0.80" if mode == "live" else "0.65")))
     exceptional = "1" if str(sys.argv[5] if len(sys.argv) > 5 else "1").lower() in {"1","true","yes","on"} else "0"
 
-    if mode not in {"paper","live","dual"}:
+    if mode not in {"paper","live","dual","calibration"}:
         print("[FAIL] unsupported mode:", mode)
         return 2
     if not DB.exists():
@@ -44,18 +44,20 @@ def main():
     cur = con.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS system_config (key TEXT PRIMARY KEY,value TEXT,description TEXT,updated_at REAL)")
 
-    if mode in {"live","dual"}:
+    if mode in {"live","dual","calibration"}:
+        calibration = mode == "calibration"
         settings = {
-            # Requested dual/live posture is persisted, but funded execution remains
-            # fail-closed until launch/set_live_mode.py completes canonical wallet sync.
-            "TRADING_MODE":"live","DUAL_MODE_ENABLED":"1","DUAL_MODE_ARMED":"0",
+            "OPERATOR_SELECTION":"DUAL","LIVE_MIRROR_POLICY":("ALL_PAPER_ADMISSIONS" if calibration else "NORMAL"),"TRADING_MODE":"live","DUAL_MODE_ENABLED":"1","DUAL_MODE_ARMED":"1",
             "PAPER_TRADING_ENABLED":"1","LIVE_TRADING_ENABLED":"1",
-            "LIVE_MODE_B_ENABLED":"0","LIVE_ARMED":"0","LIVE_MONEY_MODE":"0","EXECUTION_ARMED":"0",
+            "LIVE_MODE_B_ENABLED":"1","LIVE_ARMED":"1","LIVE_MONEY_MODE":"1","EXECUTION_ARMED":"1",
             "PAPER_MAX_OPEN_POSITIONS":max_pos,"LIVE_MAX_OPEN_POSITIONS":"1",
             "LIVE_POSITION_SIZE_USD":size,"LIVE_TRADE_AMOUNT_USD":size,
             "LIVE_MAX_POSITION_USD":size,"MAX_LIVE_POSITION_USD":size,
             "LIVE_MAX_TOTAL_EXPOSURE_USD":size,"LIVE_DAILY_LOSS_LIMIT_USD":size,
             "LIVE_CONSECUTIVE_LOSS_LIMIT":"1","LIVE_REENTRY_COOLDOWN_SECONDS":"900",
+            "LIVE_CALIBRATION_MODE":("1" if calibration else "0"),
+            "LIVE_CALIBRATION_SESSION_STARTED_AT":(str(time.time()) if calibration else "0"),
+            "LIVE_CALIBRATION_MAX_TRADES":"3",
             "OPERATOR_LIVE_POSITION_SIZE_USD":size,"MODE_B_CONF_FLOOR":conf,
             "LIVE_CONFIDENCE_FLOOR":conf,"LIVE_MAX_PRICE_AGE_SEC":"30",
             "MAX_ROUND_TRIP_SLIPPAGE_PCT":"8","EXCEPTIONAL_FIRE_ENABLED":exceptional,
@@ -64,10 +66,10 @@ def main():
             "PATTERN_LIVE_ARMING_MODE":"advisory",
             "PATTERN_LIVE_ARMING_REQUIRED":"0",
         }
-        desc = "dual/live requested; funded lane held fail-closed pending canonical wallet sync"
+        desc = ("operator-confirmed dual calibration: paper admissions mirrored with strategy score/pattern advisory; hard safety preserved" if calibration else "operator-confirmed dual mode: paper alongside gated live Mode B")
     else:
         settings = {
-            "TRADING_MODE":"paper","DUAL_MODE_ENABLED":"0","DUAL_MODE_ARMED":"0","PAPER_TRADING_ENABLED":"1",
+            "OPERATOR_SELECTION":"PAPER","LIVE_MIRROR_POLICY":"NORMAL","TRADING_MODE":"paper","DUAL_MODE_ENABLED":"0","DUAL_MODE_ARMED":"0","PAPER_TRADING_ENABLED":"1",
             "LIVE_TRADING_ENABLED":"0","LIVE_MODE_B_ENABLED":"0","LIVE_ARMED":"0","LIVE_MONEY_MODE":"0","EXECUTION_ARMED":"0",
             "PAPER_MAX_OPEN_POSITIONS":max_pos,"LIVE_MAX_OPEN_POSITIONS":"0",
             "PAPER_POSITION_SIZE_USD":size,"PAPER_TRADE_SIZE_USD":size,"POSITION_SIZE_USD":size,

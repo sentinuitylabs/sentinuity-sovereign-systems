@@ -16,9 +16,9 @@ Routes every Polaris LLM call to a model tier based on task type and risk:
     neural_supervisor, market_intelligence, sovereign_governor,
     prelaunch, periodic_refresh, launch_config, or live config.
 
-  CRITICAL (gpt-5.5):
-    Major code review or catastrophic contradiction only.
-    Not used continuously.
+  CRITICAL (gpt-5.4-mini by default):
+    Major code review or catastrophic contradiction. The tier remains distinct
+    for telemetry/rate limiting, but no automatic frontier-model spend occurs.
 
 This module ALSO writes every routing decision to model_router_log
 (if available) so operator can audit cost burn and tier patterns.
@@ -49,7 +49,7 @@ logger = logging.getLogger("model_router")
 # These can be overridden via system_config table (preferred) or env vars.
 DEFAULT_BUDGET_MODEL     = "gpt-5.4-nano"
 DEFAULT_SIGNOFF_MODEL    = "gpt-5.4-mini"
-DEFAULT_CRITICAL_MODEL   = "gpt-5.5"
+DEFAULT_CRITICAL_MODEL   = "gpt-5.4-mini"
 
 # Cost guardrails (per-day USD ceiling per tier — soft warn only)
 DEFAULT_DAILY_BUDGET_USD_BUDGET     = 5.0
@@ -60,6 +60,19 @@ DEFAULT_DAILY_BUDGET_USD_CRITICAL   = 10.0
 DEFAULT_PER_MIN_BUDGET_CALLS   = 30
 DEFAULT_PER_MIN_SIGNOFF_CALLS  = 6
 DEFAULT_PER_MIN_CRITICAL_CALLS = 1
+
+# Legacy high-cost model IDs that may still be persisted in system_config from
+# earlier builds. Automatic Polaris routing is intentionally capped at the
+# signed-off baseline unless the operator explicitly opts back into frontier
+# auto-escalation.
+_LEGACY_FRONTIER_MODELS = {"gpt-5.5", "gpt-5.4", "gpt-4o", "gpt-4o-mini"}
+
+def _signed_model(value: object, fallback: str) -> str:
+    model = str(value or fallback).strip() or fallback
+    allow_frontier = str(os.environ.get("POLARIS_ALLOW_FRONTIER_AUTO", "0")).strip().lower() in {"1","true","yes","on"}
+    if not allow_frontier and model.lower() in _LEGACY_FRONTIER_MODELS:
+        return DEFAULT_SIGNOFF_MODEL
+    return model
 
 # Files where touching them triggers automatic escalation
 ESCALATION_FILE_TRIGGERS = {
@@ -160,9 +173,9 @@ def choose_model(
     risk = (risk_level or "low").strip().lower()
     touch_file = (code_touch_file or "").strip().lower().replace(".py", "")
 
-    budget_model   = str(_get_cfg("POLARIS_DEFAULT_MODEL", DEFAULT_BUDGET_MODEL))
-    signoff_model  = str(_get_cfg("POLARIS_SIGNOFF_MODEL", DEFAULT_SIGNOFF_MODEL))
-    critical_model = str(_get_cfg("POLARIS_CRITICAL_MODEL", DEFAULT_CRITICAL_MODEL))
+    budget_model   = _signed_model(_get_cfg("POLARIS_DEFAULT_MODEL", DEFAULT_BUDGET_MODEL), DEFAULT_BUDGET_MODEL)
+    signoff_model  = _signed_model(_get_cfg("POLARIS_SIGNOFF_MODEL", DEFAULT_SIGNOFF_MODEL), DEFAULT_SIGNOFF_MODEL)
+    critical_model = _signed_model(_get_cfg("POLARIS_CRITICAL_MODEL", DEFAULT_CRITICAL_MODEL), DEFAULT_CRITICAL_MODEL)
 
     # ── DECISION TREE ─────────────────────────────────────────────────────────
     # 1. Budget-only tasks: never escalate, decorative
@@ -175,7 +188,7 @@ def choose_model(
             "request_id": _request_id(task, prompt_hint),
         }
 
-    # 2. Critical triggers force gpt-5.5
+    # 2. Critical triggers use the critical tier; default model remains gpt-5.4-mini
     if task in CRITICAL_TASK_TRIGGERS or risk == "critical":
         return {
             "model": critical_model,
@@ -288,8 +301,8 @@ def current_model_summary() -> dict:
     return {
         "active_default":  d["model"],
         "tier":            d["tier"],
-        "signoff_model":   str(_get_cfg("POLARIS_SIGNOFF_MODEL", DEFAULT_SIGNOFF_MODEL)),
-        "critical_model":  str(_get_cfg("POLARIS_CRITICAL_MODEL", DEFAULT_CRITICAL_MODEL)),
+        "signoff_model":   _signed_model(_get_cfg("POLARIS_SIGNOFF_MODEL", DEFAULT_SIGNOFF_MODEL), DEFAULT_SIGNOFF_MODEL),
+        "critical_model":  _signed_model(_get_cfg("POLARIS_CRITICAL_MODEL", DEFAULT_CRITICAL_MODEL), DEFAULT_CRITICAL_MODEL),
     }
 
 
