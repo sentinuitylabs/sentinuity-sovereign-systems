@@ -18,3 +18,11 @@
   .contact-row a{max-width:100%;overflow-wrap:anywhere}
 }
 .coach-photo img{image-rendering:auto}
+
+/* 2026-09-08 exact-photo + mobile CTA containment hotfix */
+.coach-photo img{filter:none !important;image-rendering:auto !important;}
+@media(max-width:760px){
+  .hero-copy{width:100% !important;max-width:100% !important;min-width:0 !important;overflow:visible !important;}
+  .hero-actions{display:grid !important;grid-template-columns:minmax(0,1fr) !important;width:100% !important;max-width:100% !important;gap:10px !important;}
+  .hero-actions .button{display:flex !important;width:100% !important;max-width:100% !important;min-width:0 !important;box-sizing:border-box !important;margin:0 !important;padding-left:14px !important;padding-right:14px !important;white-space:normal !important;text-align:center !important;}
+}

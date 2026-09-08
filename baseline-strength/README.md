@@ -67,3 +67,8 @@ The registrar can stay at Namecheap; moving nameservers to Cloudflare does **not
 - Tightened narrow-screen hero heading sizing to remove right-edge pressure.
 - Added safe wrapping for long contact links.
 - Removed duplicated `X` label from the social link.
+
+## 2026-09-08 exact-photo mobile hotfix
+- `public/assets/coach-portrait.jpg` and `dist/assets/coach-portrait.jpg` are the user's exact supplied JPG bytes, unchanged.
+- Removed CSS image filtering so the browser presents the supplied photo without visual processing.
+- Mobile hero actions are forced to one full-width column at <=760px so `See the method` cannot clip beyond the viewport.
