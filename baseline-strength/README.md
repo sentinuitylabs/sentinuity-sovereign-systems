@@ -72,3 +72,9 @@ The registrar can stay at Namecheap; moving nameservers to Cloudflare does **not
 - `public/assets/coach-portrait.jpg` and `dist/assets/coach-portrait.jpg` are the user's exact supplied JPG bytes, unchanged.
 - Removed CSS image filtering so the browser presents the supplied photo without visual processing.
 - Mobile hero actions are forced to one full-width column at <=760px so `See the method` cannot clip beyond the viewport.
+
+
+## 2026-09-08 cache-bust + mobile containment sign-off
+- Uses the exact supplied coach photo bytes under a new filename to defeat stale CDN/browser image caching.
+- Uses a versioned stylesheet filename to defeat stale CSS caching.
+- Hard mobile containment prevents either hero CTA from exceeding the viewport.
