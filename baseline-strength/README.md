@@ -1,4 +1,4 @@
-# Baseline Strength — Signed Release 2026-09-08
+# Baseline Strength — Signed Release 2026-09-09
 
 A coded rebuild of the supplied Canva website, preserving its information sequence while replacing flattened graphic text with responsive HTML/CSS and a more mature Sentinuity-derived visual hierarchy.
 
@@ -78,3 +78,13 @@ The registrar can stay at Namecheap; moving nameservers to Cloudflare does **not
 - Uses the exact supplied coach photo bytes under a new filename to defeat stale CDN/browser image caching.
 - Uses a versioned stylesheet filename to defeat stale CSS caching.
 - Hard mobile containment prevents either hero CTA from exceeding the viewport.
+
+
+## 2026-09-09 Sentinuity refinement sign-off
+- Preserves the exact signed-off coach portrait and mobile CTA containment from 2026-09-08.
+- Adds semantic Sentinuity design tokens while retaining Baseline Strength's established gold/violet/cyan identity.
+- Adds Space Grotesk display typography and JetBrains Mono for metrics/telemetry-style labels.
+- Replaces generic card depth with restrained 1px border, cyan edge response and low-intensity glow interactions.
+- Tightens reveal motion to a controlled 560ms ease with a small stagger and full reduced-motion support.
+- Selectively introduces protocol language without replacing the coach's human voice.
+- Fixes build/verify manifests so the cache-busted stylesheet and exact coach image are the files actually verified and shipped.
