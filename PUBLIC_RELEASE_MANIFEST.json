@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "generated": "2026-10-02",
-  "basis": "all Git-tracked files in the public release tree; manifest files are excluded from self-verification",
+  "basis": "all Git-tracked files in the public release tree at current HEAD; manifest files are excluded from self-verification",
   "excluded": [
     "MANIFEST_SHA256.txt",
     "PUBLIC_RELEASE_MANIFEST.json"
@@ -15,8 +15,8 @@
     },
     {
       "path": ".github/workflows/verify.yml",
-      "sha256": "bd0f0fdc4f66d6a99187191d1372395e803d0e65e05a53a856b1ff2a2175888e",
-      "bytes": 383
+      "sha256": "45243bdcff0a510a12a054fb42e7fded117428c82d1a9c7595a700e85a2d6c88",
+      "bytes": 1175
     },
     {
       "path": ".gitignore",
