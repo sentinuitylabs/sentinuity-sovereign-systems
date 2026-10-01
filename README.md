@@ -49,8 +49,7 @@ Read [`CONTRIBUTING.md`](CONTRIBUTING.md). Please open focused changes with evid
 
 ## Licence status
 
-A public open-source licence has **not yet been selected**. Until a licence is added, GitHub visitors may inspect the source but do not automatically receive open-source reuse rights. Select and add the intended licence before announcing the repository as open source.
-
+This repository is licensed under the **Apache License 2.0**. See the root `LICENSE` file for the full licence terms.
 ## Disclaimer
 
 This software is experimental and may lose money, fail, misprice assets, encounter third-party outages or contain defects. It is not financial advice. Never commit private keys, seed phrases, API secrets, databases or live logs.

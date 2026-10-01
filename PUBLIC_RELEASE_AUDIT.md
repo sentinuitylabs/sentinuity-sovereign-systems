@@ -24,4 +24,4 @@ The release retains the signed-off latest execution engine and WebSocket oracle.
 
 ## Licence gate
 
-No licence was silently selected. Add the chosen root `LICENSE` before publicly describing the project as open source.
+The repository root contains the **Apache License 2.0** in `LICENSE`. Public descriptions of the repository should identify Apache-2.0 consistently and must not claim that no licence has been selected.
