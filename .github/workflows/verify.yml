@@ -1,16 +1,50 @@
-name: verify
+﻿name: verify
+
 on:
   push:
   pull_request:
+
 permissions:
   contents: read
+
 jobs:
   compile-and-hygiene:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-      - run: python -m compileall -q core services ui wallets launch tools
-      - run: python tools/public_release_verify.py
+
+      - name: Compile Python without persistent bytecode
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python - <<'PY'
+          import pathlib
+          import sys
+
+          roots = ["core", "services", "ui", "wallets", "launch", "tools"]
+          failures = []
+
+          for root in roots:
+              for path in pathlib.Path(root).rglob("*.py"):
+                  try:
+                      source = path.read_bytes()
+                      compile(source, str(path), "exec")
+                  except Exception as exc:
+                      failures.append(f"{path}: {exc}")
+
+          if failures:
+              print("\n".join(failures))
+              sys.exit(1)
+
+          print("Python compile check: PASS")
+          PY
+
+      - name: Public release hygiene
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -B tools/public_release_verify.py
