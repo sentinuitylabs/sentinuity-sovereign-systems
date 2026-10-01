@@ -32,21 +32,21 @@ from typing import Any, Dict, List, Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 
-V, CYAN, MINT, GOLD, RED, DIM, GLASS = ("#9945FF", "#38E1FF", "#14F195",
-                                        "#FFD700", "#FF073A", "#5C6F66",
-                                        "rgba(5,7,6,.88)")
-MONO = "font-family:Share Tech Mono,monospace;"
+V, CYAN, MINT, GOLD, RED, DIM, GLASS = ("#7E9699", "#5BE0EC", "#4CC38A",
+                                        "#D6B45A", "#E5484D", "#4F6669",
+                                        "rgba(7,20,23,.88)")
+MONO = "font-family:IBM Plex Mono,monospace;"
 
 BAND_HEX = {
-    "BRIGHT_GOLD_PRIME": "#FFD700", "SOFT_GOLD_STRONG": "#E6C200",
-    "EMERALD_WARM": "#14F195", "CYAN_WATCH": "#38E1FF",
-    "DEEP_VIOLET_COLD": "#6B4FA0", "RED_VIOLET_DANGER": "#C2185B",
+    "BRIGHT_GOLD_PRIME": "#D6B45A", "SOFT_GOLD_STRONG": "#D6B45A",
+    "EMERALD_WARM": "#4CC38A", "CYAN_WATCH": "#5BE0EC",
+    "DEEP_VIOLET_COLD": "#6B4FA0", "RED_VIOLET_DANGER": "#E5484D",
     "VIOLET_GLASS_LOW_SAMPLE": "#9945FF",
 }
 MODE_HEX = {"PRIME_RUNNER_ALLOWED": GOLD, "NORMAL": MINT,
-            "HOT_POTATO": "#FF6B35", "PAPER_ONLY": V, "BLOCK": RED}
+            "HOT_POTATO": "#F2994A", "PAPER_ONLY": V, "BLOCK": RED}
 GATE_HEX = {"PASSING": MINT, "IDLE_NO_FLOW": CYAN,
-            "VETO_DOMINATED": GOLD, "SENSOR_MISMATCH": "#FF6B35",
+            "VETO_DOMINATED": GOLD, "SENSOR_MISMATCH": "#F2994A",
             "STARVED_STALE_SOURCE": RED, "STARVED_SERVICE_DOWN": RED}
 
 
@@ -80,15 +80,15 @@ def _pill(text: str, colour: str, title: str = "", pulse: bool = False) -> str:
     return (f"<span title='{html.escape(title)}' style='display:inline-flex;"
             f"align-items:center;gap:6px;border:1px solid {colour}55;"
             f"background:{GLASS};border-radius:999px;padding:2px 10px 2px 6px;"
-            f"font-size:.62rem;{MONO}color:#9DB5A8;'>"
+            f"font-size:.62rem;{MONO}color:#A9BCBE;'>"
             f"<span style='width:7px;height:7px;border-radius:50%;"
             f"background:{colour};box-shadow:0 0 6px {colour};{anim}'></span>"
-            f"<span style='color:{colour};letter-spacing:.07em;'>"
+            f"<span style='color:{colour};letter-spacing:0.07em;'>"
             f"{html.escape(text)}</span></span>")
 
 
 def _rail(parts: List[str], label: str = "") -> str:
-    head = (f"<div style='color:{DIM};font-size:.55rem;letter-spacing:.18em;"
+    head = (f"<div style='color:{DIM};font-size:.55rem;letter-spacing:0.11em;"
             f"{MONO}margin-bottom:3px;'>{html.escape(label)}</div>"
             if label else "")
     return ("<style>@keyframes gsglow{0%,100%{opacity:1}50%{opacity:.4}}"
@@ -98,7 +98,7 @@ def _rail(parts: List[str], label: str = "") -> str:
 
 
 def _missing(what: str, hint: str) -> str:
-    return _rail([_pill(f"{what} MISSING — {hint}", "#3b2d5e")])
+    return _rail([_pill(f"{what} MISSING — {hint}", "#4F6669")])
 
 
 def _age(ts) -> str:
@@ -119,11 +119,11 @@ def winrate_card_html() -> str:
     wr = r.get("win_rate_all_time")
     txt = "n/a" if (wr is None or n == 0) else f"{wr:.1f}%"
     col = V if n < 10 else (MINT if (wr or 0) >= 50 else
-                            ("#C2185B" if (wr or 0) < 40 else GOLD))
+                            ("#E5484D" if (wr or 0) < 40 else GOLD))
     parts = [
         f"<div style='border:1px solid {col}44;background:{GLASS};"
         f"border-radius:12px;padding:8px 14px;display:inline-block;'>"
-        f"<div style='color:{DIM};font-size:.55rem;letter-spacing:.2em;"
+        f"<div style='color:{DIM};font-size:.55rem;letter-spacing:0.11em;"
         f"{MONO}'>WIN RATE · paper_positions</div>"
         f"<div style='color:{col};font-size:1.3rem;font-weight:900;"
         f"{MONO}'>{txt} <span style='font-size:.65rem;color:{DIM};'>"
@@ -180,7 +180,7 @@ def hour_heatmap_html() -> str:
             f"{html.escape(str(tide)[:4])}</div></div>")
     return ("<style>@keyframes gsglow{0%,100%{opacity:1}50%{opacity:.4}}"
             "</style>"
-            f"<div style='color:{DIM};font-size:.55rem;letter-spacing:.18em;"
+            f"<div style='color:{DIM};font-size:.55rem;letter-spacing:0.11em;"
             f"{MONO}margin-bottom:3px;'>LIVING HOUR MAP (AEST) · rolling 7d · "
             f"dashed = low sample</div>"
             "<div style='display:flex;gap:3px;'>" + "".join(cells) + "</div>")
@@ -206,11 +206,11 @@ def sub100_row_html() -> str:
         cells.append(
             f"<div title='{html.escape(title)}' style='flex:1;min-width:22px;"
             f"height:8px;border-radius:3px;background:{col};{low}'></div>")
-    return (f"<div style='color:{DIM};font-size:.55rem;letter-spacing:.18em;"
+    return (f"<div style='color:{DIM};font-size:.55rem;letter-spacing:0.11em;"
             f"{MONO}margin:6px 0 3px;'>SUB-100K HOT-POTATO MODE · "
             f"<span style='color:{GOLD};'>prime</span> "
             f"<span style='color:{MINT};'>normal</span> "
-            f"<span style='color:#FF6B35;'>hot-potato</span> "
+            f"<span style='color:#F2994A;'>hot-potato</span> "
             f"<span style='color:{V};'>paper-only</span> "
             f"<span style='color:{RED};'>block</span></div>"
             "<div style='display:flex;gap:3px;'>" + "".join(cells) + "</div>")
@@ -248,7 +248,7 @@ def copytrade_status_html() -> str:
     n24 = sum(r.get("observed_trades_24h") or 0 for r in real)
     latest = max((r.get("last_seen_at") or 0 for r in real), default=0)
     src = real[0].get("source") if real else "EMPTY"
-    col = {"HOT_DB": MINT, "ARCHIVE": GOLD, "STALE": "#FF6B35",
+    col = {"HOT_DB": MINT, "ARCHIVE": GOLD, "STALE": "#F2994A",
            "EMPTY": V}.get(str(src), DIM)
     return _rail([
         _pill(f"WALLETS {len(real)}", col, title=f"dataset source: {src}"),
@@ -268,7 +268,7 @@ def standing_tasklist_html() -> str:
     if not rows:
         return _missing("TASKLIST", "run core/standing_tasklist_contract.py")
     st_col = {"PASS": MINT, "OBSERVE": CYAN, "RESEARCH": CYAN,
-              "BUILDING": GOLD, "TESTING": "#FF6B35",
+              "BUILDING": GOLD, "TESTING": "#F2994A",
               "NEEDS-YOU": RED, "BLOCKED": RED}
     parts = []
     for r in rows:
@@ -327,7 +327,7 @@ def debate_chamber_html() -> str:
         msg = next((str(r[k]) for k in ("message", "content", "argument",
                                         "text", "position") if k in keys
                     and r[k]), "")
-        col = {"POLARIS": CYAN, "IVARIS": "#FF6B35", "NUGGET": GOLD,
+        col = {"POLARIS": CYAN, "IVARIS": "#F2994A", "NUGGET": GOLD,
                "FABLE": MINT, "GUARDIAN": RED}.get(agent.upper()[:8], V)
         parts.append(_pill(f"{agent[:9]}: {msg[:52]}", col, title=msg[:300]))
     return _rail(parts, label="COUNCIL DEBATE CHAMBER · latest real rows")
@@ -343,7 +343,7 @@ def db_lights_html() -> str:
            "RED": RED, "VIOLET": V}.get(str(r.get("colour")), DIM)
     pct = r.get("pct_of_max") or 0
     bar = (f"<span style='display:inline-block;width:90px;height:7px;"
-           f"border-radius:4px;background:#111;overflow:hidden;"
+           f"border-radius:4px;background:#0C1D21;overflow:hidden;"
            f"vertical-align:middle;'><span style='display:block;height:100%;"
            f"width:{min(100, pct):.0f}%;background:{col};'></span></span>")
     return _rail([
@@ -451,6 +451,6 @@ if __name__ == "__main__":
              standing_tasklist_html(), debate_chamber_html(),
              db_lights_html(), live_test_ledger_html()]
     out = ROOT / "golden_state_panels_selftest.html"
-    out.write_text("<body style='background:#080B09;'>" +
+    out.write_text("<body style='background:#071417;'>" +
                    "".join(parts) + "</body>", encoding="utf-8")
     print(f"[selftest] wrote {out} ({sum(len(p) for p in parts)} bytes)")

@@ -23,13 +23,13 @@ from pathlib import Path
 
 import streamlit as st
 
-C_GREEN = "#14F195"
+C_GREEN = "#4CC38A"
 C_VIOLET = "#9945FF"
-C_CYAN = "#8EF9FF"
-C_GOLD = "#FFD700"
-C_RED = "#FF073A"
-C_DIM = "#8FA89B"
-_MONO = "font-family:'Share Tech Mono',monospace;"
+C_CYAN = "#5BE0EC"
+C_GOLD = "#D6B45A"
+C_RED = "#E5484D"
+C_DIM = "#A9BCBE"
+_MONO = "font-family:'IBM Plex Mono',monospace;"
 
 
 def _db_path() -> Path | None:
@@ -91,7 +91,7 @@ def _fmt_dt(sec: float | None) -> str:
 def _chip(label: str, value: str, color: str) -> str:
     return (f"<span style='{_MONO}font-size:0.6rem;letter-spacing:1px;"
             f"border:1px solid {color}55;border-radius:999px;padding:2px 9px;"
-            f"margin-right:5px;color:{color};background:rgba(5,7,6,.6);'>"
+            f"margin-right:5px;color:{color};background:rgba(7,20,23,.6);'>"
             f"{label} <b>{value}</b></span>")
 
 
@@ -99,7 +99,7 @@ def render_runner_intelligence() -> None:
     db = _db_path()
     if not db or not db.exists():
         st.markdown(f"<div style='text-align:center;padding:26px;{_MONO}"
-                    "font-size:0.65rem;color:#555;'>// DATABASE NOT WIRED //</div>",
+                    "font-size:0.65rem;color:#4F6669;'>// DATABASE NOT WIRED //</div>",
                     unsafe_allow_html=True)
         return
     conn = _ro(db)
@@ -128,7 +128,7 @@ def render_runner_intelligence() -> None:
 
     led = _cols(conn, "mode_b_decision_ledger")
     st.markdown(
-        f"<div style='{_MONO}font-size:0.68rem;color:{C_GOLD};letter-spacing:2px;"
+        f"<div style='{_MONO}font-size:0.68rem;color:{C_GOLD};letter-spacing:1.2px;"
         f"margin-bottom:10px;'>{len(runners)} RUNNERS (peak ≥ 80%) in last {hours}h</div>",
         unsafe_allow_html=True)
 
@@ -182,7 +182,7 @@ def render_runner_intelligence() -> None:
         edge = C_RED if blocked else C_GREEN
         st.markdown(
             f"<div style='border:1px solid {C_VIOLET}33;border-left:3px solid {edge};"
-            f"border-radius:10px;padding:9px 12px;margin-bottom:9px;background:rgba(5,7,6,.72);'>"
+            f"border-radius:10px;padding:9px 12px;margin-bottom:9px;background:rgba(7,20,23,.72);'>"
             f"<div style='display:flex;justify-content:space-between;align-items:baseline;'>"
             f"<span style='{_MONO}font-size:0.72rem;color:{C_GOLD};'>"
             f"{r['token_name'] or r['mint_address'][:10]} · peak +{r['peak_pct']:.0f}%</span>"

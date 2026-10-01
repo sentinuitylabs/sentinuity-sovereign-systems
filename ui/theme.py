@@ -33,18 +33,18 @@ from __future__ import annotations
 import html as _html
 
 # ── WORLD TOKENS ──────────────────────────────────────────────────────────────
-FOREST_DEEP = "#0B1410"   # damp fungal forest floor (left world)
-FOREST_MOSS = "#16241B"
-VAULT_STEEL = "#11141C"   # machine vault (right world)
-VAULT_EDGE  = "#1B2230"
+FOREST_DEEP = "#0C1D21"   # damp fungal forest floor (left world)
+FOREST_MOSS = "#12272C"
+VAULT_STEEL = "#0C1D21"   # machine vault (right world)
+VAULT_EDGE  = "#1C3A40"
 SOL_PURPLE  = "#9945FF"   # live capital rail
-SOL_GREEN   = "#14F195"   # paper proving rail
-GOLD        = "#FFD700"   # health/confidence >= 0.75 ONLY
-EMBER       = "#FF6B35"   # veto / stall / jam
-BLOOD       = "#E2384D"   # dead / hard failure
-CYAN        = "#38E1FF"   # oracle / price truth
-MIST        = "#9DB5A8"   # body text on forest
-STEEL_TXT   = "#AAB4C8"   # body text on vault
+SOL_GREEN   = "#4CC38A"   # paper proving rail
+GOLD        = "#D6B45A"   # health/confidence >= 0.75 ONLY
+EMBER       = "#F2994A"   # veto / stall / jam
+BLOOD       = "#E5484D"   # dead / hard failure
+CYAN        = "#5BE0EC"   # oracle / price truth
+MIST        = "#A9BCBE"   # body text on forest
+STEEL_TXT   = "#A9BCBE"   # body text on vault
 
 GOLD_THRESHOLD = 0.75
 
@@ -118,31 +118,31 @@ def semantic_css() -> str:
   --sent-label:0.72rem; --sent-micro:0.66rem;
 }
 /* Neutral crystalline glass — the DEFAULT state. No persistent bloom. */
-.sent-glass{background:linear-gradient(150deg,rgba(255,255,255,.035),rgba(9,6,24,.86) 40%,rgba(5,2,16,.93));
-  border:1px solid rgba(142,249,255,.13);border-radius:12px;box-shadow:none;
+.sent-glass{background:linear-gradient(150deg,rgba(244,248,248,.035),rgba(12,29,33,.86) 40%,rgba(7,20,23,.93));
+  border:1px solid rgba(91,224,236,.13);border-radius:12px;box-shadow:none;
   backdrop-filter:blur(12px) saturate(1.2);-webkit-backdrop-filter:blur(12px) saturate(1.2);}
 /* Gold authority bloom — ONLY when canonical capital authority is granted. */
-.sent-authority-sealed{border-color:rgba(255,215,0,.55)!important;
-  box-shadow:0 0 14px rgba(255,215,0,.22),inset 0 0 10px rgba(255,215,0,.06)!important;}
+.sent-authority-sealed{border-color:rgba(214,180,90,.55)!important;
+  box-shadow:0 0 14px rgba(214,180,90,.22),inset 0 0 10px rgba(214,180,90,.06)!important;}
 /* Red family — three DISTINGUISHABLE treatments, never interchangeable. */
-.sent-critical-break{border:1px dashed rgba(255,7,58,.75)!important;
-  box-shadow:inset 0 0 12px rgba(255,7,58,.12)!important;}          /* mandatory veto / broken contract */
-.sent-danger-exposure{border-left:3px solid #FF073A!important;
-  background:linear-gradient(90deg,rgba(255,7,58,.10),transparent 55%)!important;} /* dangerous open live exposure */
-.sent-service-failure{border:1px solid rgba(255,7,58,.45)!important;
-  border-top:3px solid #FF073A!important;box-shadow:none!important;} /* operational service outage */
+.sent-critical-break{border:1px dashed rgba(229,72,77,.75)!important;
+  box-shadow:inset 0 0 12px rgba(229,72,77,.12)!important;}          /* mandatory veto / broken contract */
+.sent-danger-exposure{border-left:3px solid #E5484D!important;
+  background:linear-gradient(90deg,rgba(229,72,77,.10),transparent 55%)!important;} /* dangerous open live exposure */
+.sent-service-failure{border:1px solid rgba(229,72,77,.45)!important;
+  border-top:3px solid #E5484D!important;box-shadow:none!important;} /* operational service outage */
 /* DEGRADED is amber, not red. */
-.sent-degraded{border:1px solid rgba(255,179,71,.5)!important;
-  box-shadow:inset 0 0 10px rgba(255,179,71,.08)!important;}
+.sent-degraded{border:1px solid rgba(242,153,74,.5)!important;
+  box-shadow:inset 0 0 10px rgba(242,153,74,.08)!important;}
 /* Heartbeat freshness — ONLY fresh may pulse; stale freezes. */
 .sent-heartbeat-fresh{animation:sentPulse 1.8s ease-in-out infinite;}
 .sent-heartbeat-aging{animation:none!important;opacity:.75;filter:saturate(.6);}
-.sent-heartbeat-stale{animation:none!important;opacity:.5;background:#FFB347!important;
+.sent-heartbeat-stale{animation:none!important;opacity:.5;background:#F2994A!important;
   box-shadow:none!important;}
-.sent-heartbeat-stale.sent-failed{background:#FF073A!important;}
+.sent-heartbeat-stale.sent-failed{background:#E5484D!important;}
 @keyframes sentPulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.4);opacity:.65}}
 @media (prefers-reduced-motion: reduce){
-  .sent-heartbeat-fresh{animation:none!important;outline:2px solid rgba(20,241,149,.55);outline-offset:1px;}
+  .sent-heartbeat-fresh{animation:none!important;outline:2px solid rgba(76,195,138,.55);outline-offset:1px;}
 }
 </style>"""
 
@@ -167,7 +167,7 @@ def inject(st) -> None:
     st.session_state["_glassbox_css"] = True
     st.markdown(f"""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=JetBrains+Mono:wght@400;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
 .gbx-world {{
   border-radius: 8px;
@@ -175,21 +175,21 @@ def inject(st) -> None:
   margin-bottom: 14px;
   background: linear-gradient(100deg,
       {FOREST_DEEP} 0%, {FOREST_MOSS} 38%,
-      #0E1A18 50%,
+      #0C1D21 50%,
       {VAULT_STEEL} 62%, {VAULT_EDGE} 100%);
-  border: 1px solid rgba(142,249,255,0.12);
+  border: 1px solid rgba(91,224,236,0.12);
   box-shadow: none;
   backdrop-filter: blur(16px);
 }}
 .gbx-title {{
-  font-family: 'Cinzel', serif;
+  font-family: 'IBM Plex Sans', serif;
   letter-spacing: 0.14em;
   font-size: 0.95rem;
   color: {MIST};
   text-transform: uppercase;
   margin-bottom: 6px;
 }}
-.gbx-mono, .gbx-chip, .gbx-lane {{ font-family: 'JetBrains Mono', monospace; }}
+.gbx-mono, .gbx-chip, .gbx-lane {{ font-family: 'IBM Plex Mono', monospace; }}
 .gbx-chip {{
   display: inline-block;
   padding: 2px 10px;
@@ -197,12 +197,12 @@ def inject(st) -> None:
   border-radius: 999px;
   font-size: 0.68rem;
   border: 1px solid color-mix(in srgb, currentColor 45%, transparent);
-  background: rgba(5,3,13,0.46);
+  background: rgba(7,20,23,0.46);
 }}
 .gbx-src {{
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'IBM Plex Mono', monospace;
   font-size: 0.66rem;  /* TIER1: floored from 0.62rem — data-source provenance is operational text */
-  color: #5C6F66;
+  color: #4F6669;
   margin-top: 4px;
 }}
 .gbx-lane {{
@@ -210,7 +210,7 @@ def inject(st) -> None:
   padding: 12px 14px;
   margin: 6px 0;
   border: 1px solid;
-  background: rgba(5,3,13,0.34);
+  background: rgba(7,20,23,0.34);
   box-shadow: none;
   font-size: 0.8rem;
 }}
@@ -218,7 +218,7 @@ def inject(st) -> None:
 .gbx-lane.live  {{ border-color: {SOL_PURPLE}; color: {SOL_PURPLE}; }}
 .gbx-lane.closed {{ opacity: 0.55; border-style: dashed; }}
 .gbx-big {{ font-size: 1.4rem; font-weight: 600; }}
-.gbx-dim {{ color: #6E7F76; font-size: 0.72rem; }}
+.gbx-dim {{ color: #7E9699; font-size: 0.72rem; }}
 @media (prefers-reduced-motion: no-preference) {{
   .gbx-pulse {{ animation: gbxpulse 2.4s ease-in-out infinite; }}
   @keyframes gbxpulse {{ 0%,100% {{ opacity: 1; }} 50% {{ opacity: 0.55; }} }}
@@ -261,11 +261,11 @@ def gate_rail_svg(gates: list[dict], paper_open: bool, live_open: bool,
     All states come from real log counters — this function only draws.
     """
     state_color = {"pass": SOL_GREEN, "shadow": MIST, "demoted": CYAN,
-                   "veto": EMBER, "idle": "#3A4A40"}
+                   "veto": EMBER, "idle": "#4F6669"}
     w, gate_w = 760, 132
     parts = [f'<svg viewBox="0 0 {w} 190" width="100%" role="img" '
              f'aria-label="final gate rail" xmlns="http://www.w3.org/2000/svg">',
-             f'<rect x="0" y="0" width="{w}" height="190" rx="12" fill="#0D1512"/>',
+             f'<rect x="0" y="0" width="{w}" height="190" rx="12" fill="#0C1D21"/>',
              # mycelium inflow (left) and vault wall (right)
              f'<path d="M0 95 C 40 60, 40 130, 80 95" stroke="{SOL_GREEN}" '
              f'stroke-width="2" fill="none" opacity="0.5"/>',
@@ -274,9 +274,9 @@ def gate_rail_svg(gates: list[dict], paper_open: bool, live_open: bool,
     for g in gates:
         c = state_color.get(g.get("state", "idle"), MIST)
         parts.append(
-            f'<g font-family="JetBrains Mono, monospace">'
+            f'<g font-family="IBM Plex Mono, monospace">'
             f'<rect x="{x}" y="55" width="{gate_w}" height="80" rx="8" '
-            f'fill="#0A0F0C" stroke="{c}" stroke-width="2"/>'
+            f'fill="#071417" stroke="{c}" stroke-width="2"/>'
             f'<text x="{x + gate_w/2}" y="80" text-anchor="middle" '
             f'fill="{c}" font-size="11">{_html.escape(g["name"])}</text>'
             f'<text x="{x + gate_w/2}" y="112" text-anchor="middle" '
@@ -288,25 +288,25 @@ def gate_rail_svg(gates: list[dict], paper_open: bool, live_open: bool,
             parts.append(f'<line x1="{x-16}" y1="95" x2="{x}" y2="95" '
                          f'stroke="{MIST}" stroke-width="2" opacity="0.6"/>')
     # lane split
-    pc = SOL_GREEN if paper_open else "#2C4A3C"
-    lc = SOL_PURPLE if live_open else "#3A2C52"
+    pc = SOL_GREEN if paper_open else "#2E7D5B"
+    lc = SOL_PURPLE if live_open else "#4F6669"
     parts.append(f'<path d="M{x} 95 C {x+24} 95, {x+24} 60, {x+52} 60" '
                  f'stroke="{pc}" stroke-width="4" fill="none"/>'
                  f'<text x="{x+58}" y="64" fill="{pc}" font-size="11" '
-                 f'font-family="JetBrains Mono, monospace">PAPER'
+                 f'font-family="IBM Plex Mono, monospace">PAPER'
                  f'{"" if paper_open else " ✕"}</text>')
     parts.append(f'<path d="M{x} 95 C {x+24} 95, {x+24} 130, {x+52} 130" '
                  f'stroke="{lc}" stroke-width="4" fill="none"/>'
                  f'<text x="{x+58}" y="134" fill="{lc}" font-size="11" '
-                 f'font-family="JetBrains Mono, monospace">LIVE'
+                 f'font-family="IBM Plex Mono, monospace">LIVE'
                  f'{"" if live_open else " ✕"}</text>')
     if paper_reason and not paper_open:
         parts.append(f'<text x="{x+58}" y="46" fill="{EMBER}" font-size="10" '
-                     f'font-family="JetBrains Mono, monospace">'
+                     f'font-family="IBM Plex Mono, monospace">'
                      f'{_html.escape(paper_reason[:42])}</text>')
     if live_reason and not live_open:
         parts.append(f'<text x="{x+58}" y="148" fill="{EMBER}" font-size="10" '
-                     f'font-family="JetBrains Mono, monospace">'
+                     f'font-family="IBM Plex Mono, monospace">'
                      f'{_html.escape(live_reason[:42])}</text>')
     parts.append("</svg>")
     return "".join(parts)
@@ -318,21 +318,21 @@ ANTIQUE_GOLD   = GOLD          # command / authority only
 EXEC_GREEN     = SOL_GREEN     # verified execution / healthy truth
 INTEL_CYAN     = CYAN          # observation / price truth (lower luminosity)
 COUNCIL_VIOLET = SOL_PURPLE    # cognition / council
-RISK_CRIMSON   = "#FF073A"     # real blockers, losses, broken services
-NEUTRAL_SMOKE  = "#5A6B70"     # waiting / unknown / not-wired
-GRAPHITE       = "#2A3038"
-MUTED_LAVENDER = "#7A6B8A"
-IVORY          = "#E8E0D0"
-OBSIDIAN       = "#05020F"
+RISK_CRIMSON   = "#E5484D"     # real blockers, losses, broken services
+NEUTRAL_SMOKE  = "#4F6669"     # waiting / unknown / not-wired
+GRAPHITE       = "#4F6669"
+MUTED_LAVENDER = "#7E9699"
+IVORY          = "#F4F8F8"
+OBSIDIAN       = "#071417"
 
 # Geometry tokens (eliminate radius drift)
 RADIUS_CRYSTAL = "12px"
 RADIUS_CHIP    = "999px"
 RADIUS_NODE    = "50%"
 BORDER_FINE    = "1px"
-GLOW_AUTHORITY = "0 0 14px rgba(255,215,0,.22)"
-GLOW_EXEC      = "0 0 12px rgba(20,241,149,.28)"
-GLOW_INTEL     = "0 0 10px rgba(56,225,255,.22)"
+GLOW_AUTHORITY = "0 0 14px rgba(214,180,90,.22)"
+GLOW_EXEC      = "0 0 12px rgba(76,195,138,.28)"
+GLOW_INTEL     = "0 0 10px rgba(91,224,236,.22)"
 
 # Mobile breakpoint (shared)
 MOBILE_BP = "760px"
@@ -346,18 +346,18 @@ def constellation_instrument_css() -> str:
    States: verified | pending | blocked | unavailable. Coherence, not fill %. */
 .sent-constellation {{
   position:relative; margin:12px 0 18px; padding:16px 14px 14px;
-  border:{BORDER_FINE} solid rgba(20,241,149,.18); border-radius:{RADIUS_CRYSTAL};
-  background:radial-gradient(ellipse at 50% -30%,rgba(20,241,149,.07),transparent 55%),
-             linear-gradient(155deg,rgba(5,2,16,.88),rgba(3,8,12,.82));
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.06);
+  border:{BORDER_FINE} solid rgba(76,195,138,.18); border-radius:{RADIUS_CRYSTAL};
+  background:radial-gradient(ellipse at 50% -30%,rgba(76,195,138,.07),transparent 55%),
+             linear-gradient(155deg,rgba(7,20,23,.88),rgba(7,20,23,.82));
+  box-shadow:inset 0 1px 0 rgba(244,248,248,.06);
   backdrop-filter:blur(12px);
 }}
 .sent-constellation .sc-label {{
-  font:600 {SENT_MICRO}/1 'Share Tech Mono',monospace;
-  letter-spacing:.16em; color:{INTEL_CYAN}; text-transform:uppercase; margin-bottom:10px;
+  font:600 {SENT_MICRO}/1 'IBM Plex Mono',monospace;
+  letter-spacing:0.11em; color:{INTEL_CYAN}; text-transform:uppercase; margin-bottom:10px;
 }}
 .sent-constellation .sc-coherence {{
-  font:700 {SENT_LABEL}/1 'Orbitron',sans-serif; letter-spacing:.12em;
+  font:700 {SENT_LABEL}/1 'IBM Plex Sans',sans-serif; letter-spacing:0.12em;
   color:{EXEC_GREEN}; float:right;
 }}
 .sent-constellation .sc-path {{
@@ -369,38 +369,38 @@ def constellation_instrument_css() -> str:
 }}
 .sent-constellation .sc-core {{
   width:36px; height:36px; margin:0 auto 6px; border-radius:{RADIUS_NODE};
-  border:1.5px solid {NEUTRAL_SMOKE}; background:rgba(8,10,14,.75);
+  border:1.5px solid {NEUTRAL_SMOKE}; background:rgba(7,20,23,.75);
   display:grid; place-items:center; font-size:14px; color:{NEUTRAL_SMOKE};
   transition:border-color .35s, box-shadow .35s, color .35s;
 }}
 .sent-constellation .sc-node.verified .sc-core {{
   border-color:{EXEC_GREEN}; color:{EXEC_GREEN};
-  box-shadow:0 0 16px rgba(20,241,149,.35), inset 0 0 10px rgba(20,241,149,.12);
+  box-shadow:0 0 16px rgba(76,195,138,.35), inset 0 0 10px rgba(76,195,138,.12);
 }}
 .sent-constellation .sc-node.pending .sc-core {{
   border-color:{INTEL_CYAN}; color:{INTEL_CYAN};
-  box-shadow:0 0 10px rgba(56,225,255,.2);
+  box-shadow:0 0 10px rgba(91,224,236,.2);
 }}
 .sent-constellation .sc-node.blocked .sc-core {{
   border-color:{RISK_CRIMSON}; color:{RISK_CRIMSON};
-  box-shadow:0 0 14px rgba(255,7,58,.3);
+  box-shadow:0 0 14px rgba(229,72,77,.3);
 }}
 .sent-constellation .sc-node.unavailable .sc-core {{
   border-color:{GRAPHITE}; color:{GRAPHITE}; opacity:.55;
 }}
 .sent-constellation .sc-cap {{
-  font:500 {SENT_MICRO}/1.25 'Share Tech Mono',monospace;
-  color:{MIST}; letter-spacing:.04em; max-width:64px; margin:0 auto;
+  font:500 {SENT_MICRO}/1.25 'IBM Plex Mono',monospace;
+  color:{MIST}; letter-spacing:0.04em; max-width:64px; margin:0 auto;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
 }}
 .sent-constellation .sc-link {{
   flex:1 1 12px; height:2px; min-width:8px; max-width:28px;
-  background:linear-gradient(90deg,rgba(20,241,149,.15),rgba(56,225,255,.25),rgba(20,241,149,.15));
+  background:linear-gradient(90deg,rgba(76,195,138,.15),rgba(91,224,236,.25),rgba(76,195,138,.15));
   opacity:.55;
 }}
 .sent-constellation .sc-link.on {{
   background:linear-gradient(90deg,{EXEC_GREEN},{INTEL_CYAN});
-  opacity:.9; box-shadow:0 0 8px rgba(20,241,149,.4);
+  opacity:.9; box-shadow:0 0 8px rgba(76,195,138,.4);
 }}
 .sent-constellation .sc-link.off {{
   background:repeating-linear-gradient(90deg,{RISK_CRIMSON}66 0 4px,transparent 4px 8px);
@@ -423,43 +423,43 @@ def substrate_lattice_css() -> str:
    Distinct from constellation. No rainbow fill bar. */
 .sent-lattice {{
   position:relative; margin:10px 0 14px; padding:12px 12px 10px;
-  border:{BORDER_FINE} solid rgba(153,69,255,.22); border-radius:{RADIUS_CRYSTAL};
-  background:linear-gradient(145deg,rgba(9,2,18,.88),rgba(5,3,16,.9));
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.05);
+  border:{BORDER_FINE} solid rgba(126,150,153,.22); border-radius:{RADIUS_CRYSTAL};
+  background:linear-gradient(145deg,rgba(7,20,23,.88),rgba(7,20,23,.9));
+  box-shadow:inset 0 1px 0 rgba(244,248,248,.05);
 }}
 .sent-lattice .sl-head {{
   display:flex; justify-content:space-between; align-items:baseline;
-  font:600 {SENT_MICRO}/1 'Share Tech Mono',monospace;
-  letter-spacing:.14em; color:{COUNCIL_VIOLET}; text-transform:uppercase; margin-bottom:10px;
+  font:600 {SENT_MICRO}/1 'IBM Plex Mono',monospace;
+  letter-spacing:0.14em; color:{COUNCIL_VIOLET}; text-transform:uppercase; margin-bottom:10px;
 }}
 .sent-lattice .sl-status {{
-  font:700 {SENT_LABEL}/1 'Orbitron',sans-serif; letter-spacing:.1em;
+  font:700 {SENT_LABEL}/1 'IBM Plex Sans',sans-serif; letter-spacing:0.1em;
 }}
 .sent-lattice .sl-rails {{
   display:grid; grid-template-columns:repeat(auto-fit,minmax(72px,1fr)); gap:6px;
 }}
 .sent-lattice .sl-cell {{
-  border:1px solid rgba(142,249,255,.12); border-radius:8px; padding:8px 6px;
-  background:rgba(3,6,12,.55); text-align:center; min-height:52px;
+  border:1px solid rgba(91,224,236,.12); border-radius:8px; padding:8px 6px;
+  background:rgba(7,20,23,.55); text-align:center; min-height:52px;
 }}
 .sent-lattice .sl-cell.ok {{
-  border-color:rgba(20,241,149,.45); background:rgba(20,241,149,.06);
+  border-color:rgba(76,195,138,.45); background:rgba(76,195,138,.06);
 }}
 .sent-lattice .sl-cell.warn {{
-  border-color:rgba(255,179,71,.45); background:rgba(255,179,71,.05);
+  border-color:rgba(242,153,74,.45); background:rgba(242,153,74,.05);
 }}
 .sent-lattice .sl-cell.bad {{
-  border-color:rgba(255,7,58,.5); background:rgba(255,7,58,.06);
+  border-color:rgba(229,72,77,.5); background:rgba(229,72,77,.06);
 }}
 .sent-lattice .sl-cell.idle {{
-  border-color:rgba(90,107,112,.35); opacity:.65;
+  border-color:rgba(79,102,105,.35); opacity:.65;
 }}
 .sent-lattice .sl-cell b {{
-  display:block; font:700 {SENT_MICRO}/1.2 'Share Tech Mono',monospace;
-  letter-spacing:.08em; color:{MIST}; margin-bottom:3px;
+  display:block; font:700 {SENT_MICRO}/1.2 'IBM Plex Mono',monospace;
+  letter-spacing:0.08em; color:{MIST}; margin-bottom:3px;
 }}
 .sent-lattice .sl-cell span {{
-  font:600 {SENT_BODY}/1 'Orbitron',sans-serif; color:{INTEL_CYAN};
+  font:600 {SENT_BODY}/1 'IBM Plex Sans',sans-serif; color:{INTEL_CYAN};
 }}
 .sent-lattice .sl-cell.ok span {{ color:{EXEC_GREEN}; }}
 .sent-lattice .sl-cell.bad span {{ color:{RISK_CRIMSON}; }}

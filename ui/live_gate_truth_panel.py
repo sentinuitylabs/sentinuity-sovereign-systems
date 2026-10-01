@@ -22,14 +22,14 @@ from pathlib import Path
 
 import streamlit as st
 
-C_GREEN = "#14F195"
+C_GREEN = "#4CC38A"
 C_VIOLET = "#9945FF"
-C_CYAN = "#8EF9FF"
-C_GOLD = "#FFD700"
-C_RED = "#FF073A"
-C_DIM = "#8FA89B"
+C_CYAN = "#5BE0EC"
+C_GOLD = "#D6B45A"
+C_RED = "#E5484D"
+C_DIM = "#A9BCBE"
 
-_MONO = "font-family:'Share Tech Mono',monospace;"
+_MONO = "font-family:'IBM Plex Mono',monospace;"
 
 
 def _db_path() -> Path | None:
@@ -71,14 +71,14 @@ def _cfg(conn: sqlite3.Connection, key: str, default: str = "—") -> str:
 def _chip(label: str, value: str, color: str) -> str:
     return (f"<span style='{_MONO}font-size:0.62rem;letter-spacing:1px;"
             f"border:1px solid {color}55;border-radius:999px;padding:3px 10px;"
-            f"margin-right:6px;color:{color};background:rgba(5,7,6,.6);'>"
+            f"margin-right:6px;color:{color};background:rgba(7,20,23,.6);'>"
             f"{label} <b>{value}</b></span>")
 
 
 def _not_wired(what: str) -> None:
     st.markdown(
         f"<div style='text-align:center;padding:26px;{_MONO}font-size:0.65rem;"
-        f"color:#555;letter-spacing:2px;'>// {what} NOT WIRED //</div>",
+        f"color:#4F6669;letter-spacing:1.2px;'>// {what} NOT WIRED //</div>",
         unsafe_allow_html=True)
 
 
@@ -166,12 +166,12 @@ def render_live_gate_truth() -> None:
             st.markdown(
                 "<div style='display:flex;gap:10px;margin:6px 0 14px;'>"
                 f"<div style='flex:1;border:1px solid {C_GREEN}33;border-radius:12px;"
-                f"padding:10px 14px;background:rgba(5,7,6,.7);'>"
-                f"<div style='{_MONO}font-size:0.58rem;letter-spacing:2px;color:{C_DIM};'>SIM LANE</div>"
+                f"padding:10px 14px;background:rgba(7,20,23,.7);'>"
+                f"<div style='{_MONO}font-size:0.58rem;letter-spacing:1.2px;color:{C_DIM};'>SIM LANE</div>"
                 f"<div style='{_MONO}font-size:0.95rem;color:{C_CYAN};'>{int(sim['n'])} open</div></div>"
                 f"<div style='flex:1;border:1px solid {C_GOLD}44;border-radius:12px;"
-                f"padding:10px 14px;background:rgba(5,7,6,.7);'>"
-                f"<div style='{_MONO}font-size:0.58rem;letter-spacing:2px;color:{C_DIM};'>REAL LANE</div>"
+                f"padding:10px 14px;background:rgba(7,20,23,.7);'>"
+                f"<div style='{_MONO}font-size:0.58rem;letter-spacing:1.2px;color:{C_DIM};'>REAL LANE</div>"
                 f"<div style='{_MONO}font-size:0.95rem;color:{C_GOLD};'>{int(real['n'])} open · "
                 f"${float(real['exp']):.2f} exposure</div></div></div>",
                 unsafe_allow_html=True)
@@ -202,7 +202,7 @@ def render_live_gate_truth() -> None:
         head = (
             f"<div style='border:1px solid {edge}44;border-left:3px solid {edge};"
             f"border-radius:10px;padding:8px 12px;margin-bottom:8px;"
-            f"background:rgba(5,7,6,.72);'>"
+            f"background:rgba(7,20,23,.72);'>"
             f"<div style='display:flex;justify-content:space-between;align-items:baseline;'>"
             f"<span style='{_MONO}font-size:0.72rem;color:{edge};'>"
             f"{'PASS' if passed else 'BLOCKED'} · {title}</span>"

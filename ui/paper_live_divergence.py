@@ -37,9 +37,9 @@ from typing import Any, Optional
 # Canonical colour doctrine. DOCTRINE_RED is deliberately identical to the
 # live pressure-gauge SL fill in services/sovereign_hub.py. Do not substitute
 # rose, coral, faded red, opacity, or a text glow for negative truth states.
-DOCTRINE_RED = "#FF073A"
-METER_RED = "#CC052E"  # #FF073A rendered at 80% opacity on the Sentinuity void
-DOCTRINE_RED_RGB = "255,7,58"
+DOCTRINE_RED = "#E5484D"
+METER_RED = "#E5484D"  # #E5484D rendered at 80% opacity on the Sentinuity void
+DOCTRINE_RED_RGB = "229,72,77"
 
 CLASS_EXPECTED_FRICTION = "EXPECTED_EXECUTION_FRICTION"
 CLASS_ORACLE_DELAY = "ORACLE_DELAY"
@@ -52,16 +52,16 @@ CLASS_MARKET_MOVE = "GENUINE_MARKET_MOVEMENT"
 CLASS_UNCLASSIFIED = "UNCLASSIFIED"
 
 _PALETTE = {
-    "ok": "#14F195",       # doctrine green — aligned
-    "warn": "#FFB347",     # doctrine amber — expected friction / delay
+    "ok": "#4CC38A",       # doctrine green — aligned
+    "warn": "#F2994A",     # doctrine amber — expected friction / delay
     "bad": DOCTRINE_RED,   # exact live-meter red — veto / mismatch / loss
-    "cyan": "#8EF9FF",
+    "cyan": "#5BE0EC",
     "violet": "#9945FF",
-    "gold": "#FFD700",
-    "dim": "#71817D",
-    "bg": "#05030D",
-    "panel": "#090713",
-    "edge": "#2A1647",
+    "gold": "#D6B45A",
+    "dim": "#7E9699",
+    "bg": "#071417",
+    "panel": "#071417",
+    "edge": "#0E6F7E",
 }
 
 
@@ -313,7 +313,7 @@ def render_paper_live_divergence(db_path: str | Path, limit: int = 25) -> None:
                 f"{_PALETTE['edge']};border-left:3px solid {_PALETTE['warn']};"
                 f"padding:.6rem 1rem;border-radius:4px'>"
                 f"<span style='color:{_PALETTE['gold']};font-size:.72rem;"
-                f"letter-spacing:.14em'>PAPER / LIVE DIVERGENCE INSTRUMENT</span><br>"
+                f"letter-spacing:0.14em'>PAPER / LIVE DIVERGENCE INSTRUMENT</span><br>"
                 f"<span style='color:{_PALETTE['warn']};font-size:.85rem'>"
                 f"INSTRUMENT UNAVAILABLE — {html.escape(type(exc).__name__)}: "
                 f"{html.escape(str(exc)[:160])} · trading backend unaffected"
@@ -336,7 +336,7 @@ def _render_inner(st, db_path: str | Path, limit: int) -> None:
          "truthful empty state, not an error)"))
 
     # The danger treatment deliberately mirrors the live pressure meter:
-    # the live meter’s effective #CC052E rail + crimson -> transparent bleed. Main copy remains
+    # the live meter’s effective #E5484D rail + crimson -> transparent bleed. Main copy remains
     # neutral so browser font antialiasing cannot turn the doctrine red pink.
     is_bad = n_bad > 0
     status_class = "pld-bad" if is_bad else ("pld-warn" if pairs else "pld-empty")
@@ -344,19 +344,19 @@ def _render_inner(st, db_path: str | Path, limit: int) -> None:
         f"""
 <style>
 .pld-shell{{position:relative;overflow:hidden;margin:0 0 .72rem;padding:.82rem 1rem .78rem 1.18rem;
- border:1px solid {P['edge']};border-radius:5px;background:linear-gradient(110deg,{P['panel']} 0%,#080510 72%,#05030d 100%);}}
+ border:1px solid {P['edge']};border-radius:5px;background:linear-gradient(110deg,{P['panel']} 0%,#071417 72%,#071417 100%);}}
 .pld-shell:before{{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:{banner_col};}}
 .pld-shell.pld-bad:after{{content:"";position:absolute;left:4px;right:0;top:0;height:3px;
- background:linear-gradient(90deg,#CC052E 0%,#CC052E 18%,rgba(204,5,46,.22) 55%,transparent 100%);}}
-.pld-kicker{{font-family:Share Tech Mono,monospace;font-size:.72rem;letter-spacing:.14em;color:{P['gold']};}}
-.pld-status{{display:flex;align-items:center;gap:.55rem;margin-top:.42rem;font-family:Share Tech Mono,monospace;
- font-size:.86rem;font-weight:700;letter-spacing:.015em;color:#DCE7E4;}}
+ background:linear-gradient(90deg,#E5484D 0%,#E5484D 18%,rgba(229,72,77,.22) 55%,transparent 100%);}}
+.pld-kicker{{font-family:IBM Plex Mono,monospace;font-size:.72rem;letter-spacing:0.14em;color:{P['gold']};}}
+.pld-status{{display:flex;align-items:center;gap:.55rem;margin-top:.42rem;font-family:IBM Plex Mono,monospace;
+ font-size:.86rem;font-weight:700;letter-spacing:0.015em;color:#F4F8F8;}}
 .pld-status-dot{{width:9px;height:9px;flex:0 0 9px;border-radius:2px;background:{banner_col};}}
-.pld-bad .pld-status-dot{{background:#CC052E;box-shadow:0 0 0 1px #CC052E,0 0 10px rgba(204,5,46,.48);}}
-.pld-exp{{margin:.42rem 0 .28rem;padding:.58rem .72rem;border-left:4px solid #CC052E;
- background:linear-gradient(90deg,rgba(204,5,46,.12),rgba(204,5,46,.028) 46%,transparent 100%);
- font-family:Share Tech Mono,monospace;font-size:.82rem;font-weight:650;line-height:1.45;color:#DCE7E4;}}
-.pld-exp b{{color:#CC052E;font-weight:900;}}
+.pld-bad .pld-status-dot{{background:#E5484D;box-shadow:0 0 0 1px #E5484D,0 0 10px rgba(229,72,77,.48);}}
+.pld-exp{{margin:.42rem 0 .28rem;padding:.58rem .72rem;border-left:4px solid #E5484D;
+ background:linear-gradient(90deg,rgba(229,72,77,.12),rgba(229,72,77,.028) 46%,transparent 100%);
+ font-family:IBM Plex Mono,monospace;font-size:.82rem;font-weight:650;line-height:1.45;color:#F4F8F8;}}
+.pld-exp b{{color:#E5484D;font-weight:900;}}
 </style>
 <div class="pld-shell {status_class}">
   <div class="pld-kicker">PAPER / LIVE DIVERGENCE INSTRUMENT</div>
@@ -381,7 +381,7 @@ def _render_inner(st, db_path: str | Path, limit: int) -> None:
                 )
             else:
                 explanation_html = (
-                    f"<div style='color:{edge};font-family:Share Tech Mono,monospace;"
+                    f"<div style='color:{edge};font-family:IBM Plex Mono,monospace;"
                     f"font-weight:700;padding:.45rem 0'>{html.escape(pair['explanation'])}</div>"
                 )
             st.markdown(explanation_html, unsafe_allow_html=True)
@@ -412,7 +412,7 @@ def _render_inner(st, db_path: str | Path, limit: int) -> None:
             body = "".join(
                 f"<tr><td style='color:{P['dim']};padding:.15rem .8rem .15rem 0;"
                 f"font-size:.78rem'>{html.escape(k)}</td>"
-                f"<td style='color:#cfd6e4;font-size:.82rem'>{html.escape(v)}</td></tr>"
+                f"<td style='color:#A9BCBE;font-size:.82rem'>{html.escape(v)}</td></tr>"
                 for k, v in rows
             )
             st.markdown(

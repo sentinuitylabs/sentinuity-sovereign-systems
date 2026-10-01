@@ -302,19 +302,37 @@ try:
 except Exception:
     pass
 
-# SIGNOFF_MATRIX_LIVE_TELEMETRY_20260718 (supersedes HOLOGRAPHIC_SUBSTRATE_20260717)
-# Visual-only Truth Fabric rain. Now streams SANITISED live operating telemetry
-# (recent cognition-log lines, heartbeat ages, gate counters, executor contract
-# state) merged with the fixed contract vocabulary — read-only DB access with a
-# hard sanitiser: key/secret/token lines dropped, base58/hex masked, URLs
-# stripped, config VALUES never read. Browser-side animation, no trading
-# authority. Installed as a singleton so Streamlit reruns cannot multiply
-# canvases or animation loops; each rerun refreshes the telemetry payload.
+# SENTINUITY_LABS_APPROVED_REVEAL_BACKGROUND_20261002
+# Presentation-only. The synthetic triangular/hex/facet canvas is retired here.
+# A lightweight excerpt from the approved 27-Sep Sentinuity Labs reveal now
+# supplies the lattice-forming atmosphere behind the interface.
 try:
-    from ui.cinematic_overlay import inject_holographic_substrate_rain as _inject_substrate_rain
-    _inject_substrate_rain()
-except Exception:
-    pass
+    from ui.sentinuity_reel_background import inject_sentinuity_reel_background as _inject_reveal_background
+    _inject_reveal_background()
+except Exception as _reveal_exc:
+    try:
+        import logging as _reveal_logging
+        _reveal_logging.getLogger("sovereign_hub").warning(
+            "[SENTINUITY_REVEAL_BACKGROUND_UNAVAILABLE] %s",
+            f"{type(_reveal_exc).__name__}: {_reveal_exc}",
+        )
+    except Exception:
+        pass
+
+# SENTINUITY_LABS_DOCTRINE_20261002
+# Final presentation-only Labs palette/typography layer. No execution authority.
+try:
+    from ui.sentinuity_labs_doctrine import doctrine_css as _sl_doctrine_css
+    st.markdown(_sl_doctrine_css(), unsafe_allow_html=True)
+except Exception as _sl_css_err:
+    try:
+        import logging as _sl_logging
+        _sl_logging.getLogger("sovereign_hub").warning(
+            "[SENTINUITY_LABS_DOCTRINE_UNAVAILABLE] %s",
+            f"{type(_sl_css_err).__name__}: {_sl_css_err}",
+        )
+    except Exception:
+        pass
 
 st.markdown("""<style>
 /* ── structural overflow containment (all widths) ── */
@@ -6889,10 +6907,17 @@ def render_living_cortex():
         pass
 
 
+    # SENTINUITY_LABS_HERO_20261002: official Labs identity anchor.
+    _sl_master_lockup = get_base64("sentinuity-labs-master-lockup-crop-20260927")
+    _sl_master_html = (f'<div class="sl-hero__master"><img src="{_sl_master_lockup}" alt="Sentinuity Labs"></div>'
+                       if _sl_master_lockup else f'<div class="sl-hero__mark">{_snty_crystalline_mark_svg(58, True, "hero")}</div>')
     st.markdown(f"""<div class="snty-hero-wrap">
-        <h1 class="snty-hero-word">SENTINUITY</h1>
-        <p class="snty-hero-sub" style="{'animation:flicker 0.8s infinite;' if dom_state=='HEALING' else ''}">"{dom_narrative}"</p>
-        <div id="cmd-ticker" style="font-family:var(--font-mono);font-size:0.66rem;letter-spacing:1.5px;text-align:center;height:18px;overflow:hidden;margin-top:2px;margin-bottom:2px;"></div>
+        {_sl_master_html}
+        <h1 class="sl-hero__sr-only">Sentinuity Labs</h1>
+        <div class="sl-hero__rule"></div>
+        <p class="sl-hero__kicker">Autonomous market intelligence and paper-trading infrastructure, with a separately gated live lane.</p>
+        <p class="snty-hero-sub">{html.escape(str(dom_narrative or ""))}</p>
+        <div id="cmd-ticker" style="font-size:0.74rem;text-align:center;height:18px;overflow:hidden;"></div>
         <script>
         (function(){{
             var cmds = {_cmd_ticker_js};
@@ -6902,14 +6927,12 @@ def render_living_cortex():
                 if(!cmds||!cmds.length)return;
                 el.innerHTML = cmds[i % cmds.length];
                 i++;
-                setTimeout(tick, 2200);
+                setTimeout(tick, 4800);
             }}
             tick();
         }})();
         </script>
-        <div class="snty-legal">
-            ⚠ EXPERIMENTAL SOVEREIGN SUBSTRATE - QUANTITATIVE RESEARCH ONLY - NOT FINANCIAL ADVICE
-        </div>
+        <p class="snty-legal">Experimental quantitative research system. Paper results are simulated. Not financial advice.</p>
     </div>""", unsafe_allow_html=True)
 
     # ── GENESIS VAULT - separate mode, live cockpit untouched ─────────────────
