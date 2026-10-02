@@ -462,7 +462,7 @@ def run() -> None:
     session = requests.Session()
 
     while True:
-        cooldown = get_config_value("ORACLE_429_COOLDOWN_SECONDS", 30, int)
+        cooldown = int(float(get_config_value("ORACLE_429_COOLDOWN_SECONDS", 30)))
         max_attempts = get_config_value("ORACLE_MAX_ATTEMPTS", 6, int)
 
         try:

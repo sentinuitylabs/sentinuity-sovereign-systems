@@ -57,6 +57,7 @@ import json
 import logging
 import os
 import time
+import threading
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
@@ -108,6 +109,50 @@ def _real_submission_contract() -> tuple[bool, str]:
         return False, "private_ack_missing"
     return True, "family_live_canary"
 
+def _real_exit_contract(position_id: int, mint: str) -> tuple[bool, str]:
+    """Authorize liquidation of risk already proven to be REAL.
+
+    Entry arming and the private-live acknowledgement control *new* funded risk.
+    They must not strand an already-owned position after the operator disarms.
+    Conversely, execute_live_sell must not be callable as a generic wallet drain.
+    This guard therefore requires a chain-backed REAL position row whose mint,
+    confirmed BUY signature, and lifecycle state all match the requested exit.
+    """
+    try:
+        from core.schema import get_connection
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT mint_address,funding_mode,status,COALESCE(live_state,''),"
+                "COALESCE(buy_tx_sig,''),COALESCE(chain_confirmed_at,0) "
+                "FROM paper_positions WHERE id=?",
+                (int(position_id),),
+            ).fetchone()
+    except Exception as exc:
+        return False, f"exit_provenance_read_error:{type(exc).__name__}"
+    if not row:
+        return False, "real_position_missing"
+    row_mint = str(row[0] or "").strip()
+    funding = str(row[1] or "SIM").strip().upper()
+    status = str(row[2] or "").strip().upper()
+    live_state = str(row[3] or "").strip().upper()
+    buy_sig = str(row[4] or "").strip()
+    try:
+        chain_confirmed_at = float(row[5] or 0.0)
+    except (TypeError, ValueError):
+        chain_confirmed_at = 0.0
+    if funding != "REAL":
+        return False, f"funding_mode={funding or 'missing'}"
+    if status != "OPEN":
+        return False, f"position_status={status or 'missing'}"
+    if row_mint != str(mint or "").strip():
+        return False, "mint_mismatch"
+    if live_state not in {"OPEN_REAL", "EXIT_INTENT", "SELL_TRIGGERED"}:
+        return False, f"live_state={live_state or 'missing'}"
+    if not buy_sig or chain_confirmed_at <= 0:
+        return False, "confirmed_buy_provenance_missing"
+    return True, "real_position_exit_authorized"
+
+
 # SOL mint address (always the input token for buys)
 _SOL_MINT  = "So11111111111111111111111111111111111111112"
 _WSOL_MINT = "So11111111111111111111111111111111111111112"
@@ -125,14 +170,19 @@ _sol_price_cache: dict = {"price": 0.0, "ts": 0.0}
 _SOL_CACHE_TTL = 60.0
 
 
-def _get_cached_sol_price() -> float:
-    """Return cached SOL/USD price, refreshing if older than 60s."""
+def _get_cached_sol_price(*, session=None) -> float:
+    """Return cached SOL/USD price, refreshing if older than 60s.
+
+    ``session`` is optional; the mesh supplies a thread-local persistent Session
+    while all historical zero-argument callers keep their previous behaviour.
+    """
     import requests as _req
+    _http = session if session is not None else _req
     now = time.time()
     if now - _sol_price_cache["ts"] < _SOL_CACHE_TTL and _sol_price_cache["price"] > 0:
         return _sol_price_cache["price"]
     try:
-        r = _req.get(
+        r = _http.get(
             "https://api.jup.ag/price/v3",
             params={"ids": _SOL_MINT},
             headers={},
@@ -426,16 +476,90 @@ def get_live_wallet_balance() -> Optional[float]:
 
 # ── JUPITER SWAP ──────────────────────────────────────────────────────────────
 
+# SIGNOFF_JUPITER_THREADLOCAL_SESSION_20260831
+# Every default quote caller gets one requests.Session per calling thread.  This
+# preserves request parameters, timeouts, headers, route validation and all
+# trading decisions while allowing HTTP keep-alive / TLS connection reuse.
+# Thread-local ownership avoids sharing requests.Session concurrently.
+_quote_http_tls = threading.local()
+
+def _thread_quote_http_session():
+    sess = getattr(_quote_http_tls, "session", None)
+    if sess is None:
+        import requests
+        sess = requests.Session()
+        _quote_http_tls.session = sess
+    return sess
+
+# REPAIR_20260919_QUOTE_FAILURE_CLASSIFICATION — telemetry only.
+# Every non-200 used to collapse to one ERROR "[LIVE] Jupiter quote failed",
+# so a terminal NO_ROUTES_FOUND (unroutable curve token) was indistinguishable
+# from a provider outage. Return values are unchanged (None on any failure).
+_QUOTE_FAILURES: dict = {}
+_QUOTE_FAILURES_LOCK = threading.Lock()
+
+
+def classify_quote_failure(status_code, body="") -> str:
+    b = str(body or "").upper()
+    if "NO_ROUTES_FOUND" in b or "COULD_NOT_FIND_ANY_ROUTE" in b or "NO_ROUTE" in b:
+        return "NO_ROUTE"
+    if "NOT_TRADABLE" in b or "TOKEN_NOT_TRADABLE" in b:
+        return "NOT_TRADABLE"
+    try:
+        s = int(status_code or 0)
+    except (TypeError, ValueError):
+        s = 0
+    if s == 429:
+        return "RATE_LIMIT"
+    if s in (401, 403):
+        return "AUTH"
+    if 500 <= s <= 599:
+        return "PROVIDER_5XX"
+    if 400 <= s <= 499:
+        return "HTTP_4XX"
+    return "UNKNOWN"
+
+
+def _record_quote_failure(input_mint, output_mint, cls, status_code=None, detail="") -> None:
+    rec = {"class": cls, "status": status_code, "detail": str(detail or "")[:160],
+           "input_mint": str(input_mint), "output_mint": str(output_mint), "at": time.time()}
+    with _QUOTE_FAILURES_LOCK:
+        _QUOTE_FAILURES[str(input_mint)] = rec
+        _QUOTE_FAILURES[str(output_mint)] = rec
+        if len(_QUOTE_FAILURES) > 4096:
+            for k in sorted(_QUOTE_FAILURES, key=lambda k: _QUOTE_FAILURES[k]["at"])[:1024]:
+                _QUOTE_FAILURES.pop(k, None)
+
+
+def last_quote_failure(mint) -> Optional[dict]:
+    with _QUOTE_FAILURES_LOCK:
+        rec = _QUOTE_FAILURES.get(str(mint))
+        return dict(rec) if rec else None
+
+
 def _get_jupiter_quote(
     input_mint: str,
     output_mint: str,
     amount_lamports: int,
     slippage_bps: int,
+    *,
+    session=None,
 ) -> Optional[dict]:
-    """Get a swap quote from Jupiter v6 API."""
+    """Get a swap quote from Jupiter v6 API.
+
+    LAYERC_HTTP_SESSION_REUSE_20260829:
+    ``session`` is optional so every existing live buy/sell caller preserves its
+    historical transport behaviour.  The price-truth mesh passes a thread-local
+    persistent Session, allowing keep-alive connection reuse without sharing one
+    requests.Session concurrently across workers.
+    """
     try:
-        import requests
-        r = requests.get(
+        # SIGNOFF_JUPITER_THREADLOCAL_SESSION_20260831: explicit callers may
+        # still supply their own worker-owned Session.  Otherwise use the
+        # thread-local Session above instead of opening a fresh TLS connection
+        # for every quote.
+        _http = session if session is not None else _thread_quote_http_session()
+        r = _http.get(
             "https://api.jup.ag/swap/v1/quote",
             params={
                 "inputMint":   input_mint,
@@ -450,11 +574,20 @@ def _get_jupiter_quote(
             timeout=(2.0, 4.0),
         )
         if r.status_code != 200:
-            log.error("[LIVE] Jupiter quote failed: %s %s", r.status_code, r.text[:200])
+            _cls = classify_quote_failure(r.status_code, r.text)
+            _record_quote_failure(input_mint, output_mint, _cls, r.status_code, r.text[:160])
+            if _cls in ("NO_ROUTE", "NOT_TRADABLE"):
+                log.warning("[QUOTE_%s] Jupiter %s %s->%s: terminal no executable route "
+                            "(market condition, not a provider fault)",
+                            _cls, r.status_code, str(input_mint)[:8], str(output_mint)[:8])
+            else:
+                log.error("[LIVE] Jupiter quote failed: %s %s class=%s",
+                          r.status_code, r.text[:200], _cls)
             return None
         return r.json()
     except Exception as e:
-        log.error("[LIVE] Jupiter quote error: %s", e)
+        _record_quote_failure(input_mint, output_mint, "NETWORK", None, f"{type(e).__name__}:{e}")
+        log.error("[LIVE] Jupiter quote error: %s class=NETWORK", e)
         return None
 
 
@@ -1125,6 +1258,16 @@ def preflight_live_buy(mint: str, pos_size_usd: float) -> dict:
             result["reason"] = "invalid_preflight_request"
             return result
 
+        # SIGNOFF_20260921_HONEST_LIVE_PREFLIGHT: fail on the private
+        # submission contract BEFORE wallet balance. Previously the contract
+        # caused get_live_wallet_balance() to return None, which surfaced as a
+        # misleading $0-wallet/market symptom instead of the real authority
+        # blocker. This changes diagnostics only; it does not loosen any gate.
+        _contract_ok, _contract_reason = _real_submission_contract()
+        if not _contract_ok:
+            result["reason"] = f"submission_contract_unmet:{_contract_reason}"
+            return result
+
         safety = inspect_live_token_safety(str(mint))
         result["token_safety"] = safety
         if not safety.get("safe"):
@@ -1568,7 +1711,7 @@ def blacklist_mint(mint: str, reason: str) -> None:
 
 
 _TOKEN_DECIMALS_CACHE: dict[str, int] = {}
-def _get_token_decimals(mint: str) -> int:
+def _get_token_decimals(mint: str, *, session=None) -> int:
     """Resolve SPL mint decimals via the shared cross-process metadata cache.
 
     SENTINUITY_EXIT_INFRA_20260805: the previous implementation used a
@@ -1593,7 +1736,7 @@ def _get_token_decimals(mint: str) -> int:
                   str(mint)[:16], exc)
         raise RuntimeError("token_decimals_unresolved") from exc
     try:
-        value = int(_tm_get_decimals(mint))
+        value = int(_tm_get_decimals(mint, session=session))
     except Exception as exc:
         log.error("[TOKEN_DECIMALS] mint=%s error=%s", str(mint)[:16], exc)
         raise
@@ -1640,6 +1783,16 @@ def execute_live_sell(
         "net_sol_received": None, "fee_sol": None, "error": None,
         "reconciliation_state": "NOT_SUBMITTED", "timings": {},
     }
+    # EXIT SAFETY: do not reuse the entry-arming contract here. The operator
+    # may disarm new risk while an already-owned REAL position still needs to
+    # liquidate. Instead prove that this request belongs to a confirmed REAL
+    # position in an exit-eligible lifecycle state.
+    _exit_ok, _exit_reason = _real_exit_contract(position_id, mint)
+    if not _exit_ok:
+        result["error"] = "live_exit_provenance_blocked:" + _exit_reason
+        log.critical("[LIVE_SELL_BLOCKED_PROVENANCE] pos=%s mint=%s reason=%s",
+                     position_id, str(mint)[:16], _exit_reason)
+        return result
     kp = _load_keypair()
     if not kp:
         result["error"] = "keypair_unavailable"
@@ -1785,3 +1938,58 @@ def is_live_mode() -> bool:
                                     "LIVE_TRADING_ENABLED","LIVE_MODE_B_ENABLED","LIVE_ARMED"))
     except Exception:
         return False
+
+# === PUBLIC_GITHUB_PAPER_ONLY_HARD_STUB_20261002 ===
+
+# Public distribution boundary. Keep read-only quote/price helpers available to
+# paper/research services, but make real signing and transaction submission
+# impossible from this checkout even if local config is altered.
+_PUBLIC_LIVE_STUB_REASON = "public_github_paper_only_live_submission_stubbed"
+
+def _real_submission_contract() -> tuple[bool, str]:
+    return False, _PUBLIC_LIVE_STUB_REASON
+
+def _real_exit_contract(position_id: int, mint: str) -> tuple[bool, str]:
+    return False, _PUBLIC_LIVE_STUB_REASON
+
+def _load_keypair():
+    return None
+
+def get_live_wallet_balance() -> Optional[float]:
+    return None
+
+def preflight_live_buy(mint: str, pos_size_usd: float) -> dict:
+    return {
+        "ok": False,
+        "allowed": False,
+        "blocked": True,
+        "reason": _PUBLIC_LIVE_STUB_REASON,
+        "mode": "paper",
+    }
+
+def execute_live_buy(*args, **kwargs):
+    return {
+        "ok": False,
+        "success": False,
+        "submitted": False,
+        "blocked": True,
+        "reason": _PUBLIC_LIVE_STUB_REASON,
+        "mode": "paper",
+    }
+
+def execute_live_sell(*args, **kwargs):
+    return {
+        "ok": False,
+        "success": False,
+        "submitted": False,
+        "blocked": True,
+        "reason": _PUBLIC_LIVE_STUB_REASON,
+        "mode": "paper",
+    }
+
+def _execute_jupiter_swap(*args, **kwargs):
+    raise RuntimeError(_PUBLIC_LIVE_STUB_REASON)
+
+def is_live_mode() -> bool:
+    return False
+# === END PUBLIC_GITHUB_PAPER_ONLY_HARD_STUB_20261002 ===
