@@ -6908,7 +6908,7 @@ def render_living_cortex():
 
 
     # SENTINUITY_LABS_HERO_20261002: official Labs identity anchor.
-    _sl_master_lockup = get_base64("sentinuity-labs-master-lockup-crop-20260927")
+    _sl_master_lockup = get_base64("sentinuity-labs-master-lockup-alpha-20261003") or get_base64("sentinuity-labs-master-lockup-crop-20260927")
     _sl_master_html = (f'<div class="sl-hero__master"><img src="{_sl_master_lockup}" alt="Sentinuity Labs"></div>'
                        if _sl_master_lockup else f'<div class="sl-hero__mark">{_snty_crystalline_mark_svg(58, True, "hero")}</div>')
     st.markdown(f"""<div class="snty-hero-wrap">

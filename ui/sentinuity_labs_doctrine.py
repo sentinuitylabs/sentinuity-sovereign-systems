@@ -371,6 +371,17 @@ html body .sl-sec--first{margin-top:12px}
   html body .snty-hero-wrap{padding-top:40px!important;padding-bottom:30px!important}
 }
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+
+/* -- V4 lockup 2026-10-03: true-alpha master (full LABS, no backing plate) --
+   The asset now carries its own transparency, so screen blending is retired:
+   screen made the dark glyph fill see-through to the moving lattice. */
+html body .sl-hero__master{max-width:min(520px,88vw)!important;padding:0 clamp(12px,2vw,24px)!important;margin:0 auto 4px!important}
+html body .sl-hero__master img{
+  width:100%!important;max-width:min(460px,80vw)!important;height:auto!important;
+  mix-blend-mode:normal!important;filter:none!important;
+  -webkit-user-drag:none;user-select:none}
+@media(max-width:640px){html body .sl-hero__master img{max-width:78vw!important}}
+
 </style>
 """
 

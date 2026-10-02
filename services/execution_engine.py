@@ -7730,11 +7730,13 @@ def _edge_measure_would_recycle(position: dict, *, position_id: int, mint: str,
 # PAPER_EXIT_PARITY_20261001 ---------------------------------------------------
 def _service_paper_no_executable(position: dict, position_id: int, mint: str,
                                  token_name: str, entry_price: float, opened_at: float,
-                                 *, max_hold_s: "Optional[float]" = None) -> bool:
+                                 *, max_hold_s: "Optional[float]" = None) -> "Optional[dict]":
     """Paper no-executable-price servicing using live's hierarchy.
 
-    Returns True when the position was closed (emergency executable exit, or
-    the pre-existing max-hold escalation labelled observational). Uses a fresh
+    Returns the fresh exact-size executable quote when one succeeds, so the
+    caller can run the normal evaluator on it (PAPER_EXIT_FRESH_QUOTE_FEED_20261003);
+    otherwise None (closed by observational max-hold escalation, coverage
+    failure recorded, grace, or retry backoff) and the sweep ends as before. Uses a fresh
     exact-size liquidation QUOTE only: no signing, no submission, no synthetic
     price. An unroutable position is persisted as a coverage failure.
     """
@@ -7745,11 +7747,12 @@ def _service_paper_no_executable(position: dict, position_id: int, mint: str,
             INTEGRITY_OBSERVATIONAL as _PEP_OBS,
             ACTION_EMERGENCY_EXIT as _PEP_EXIT,
             ACTION_ESCALATED as _PEP_ESC,
+            ACTION_FRESH_QUOTE as _PEP_FRESH,
         )
         from services.paper_exit_escalation import evaluate_paper_exit_escalation as _paper_escalate
     except Exception as _imp:
         log.warning("[PAPER_EXIT_PARITY_UNAVAILABLE] pos=%d %s", position_id, type(_imp).__name__)
-        return False
+        return None
 
     def _pep_quote():
         if not _PRICE_ROUTER_AVAILABLE:
@@ -7810,8 +7813,17 @@ def _service_paper_no_executable(position: dict, position_id: int, mint: str,
         )
     except Exception as _esc_exc:
         log.warning("[PAPER_EXIT_PARITY_ERROR] pos=%d %s", position_id, type(_esc_exc).__name__)
-        return False
-    return _res.get("action") in (_PEP_EXIT, _PEP_ESC)
+        return None
+    # PAPER_EXIT_FRESH_QUOTE_FEED_20261003: a successful fresh exact-size quote
+    # is returned to the caller for normal evaluation; every other outcome
+    # (closed, coverage failure, grace, backoff) ends this sweep as before.
+    if _res.get("action") == _PEP_FRESH and isinstance(_res.get("quote"), dict):
+        log.info("[PAPER_FRESH_EXEC_QUOTE] pos=%d %s price=%.10g src=%s - cache late; "
+                 "fresh exact-size quote fed to normal evaluator",
+                 position_id, token_name, float(_res.get("price") or 0.0),
+                 str(_res["quote"].get("source") or ""))
+        return _res["quote"]
+    return None
 
 
 def evaluate_exit_for_position(position: dict) -> None:
@@ -7900,12 +7912,17 @@ def evaluate_exit_for_position(position: dict) -> None:
                     "LIVE_EMERGENCY_NO_PRICE",
                     closure_mode="normal",
                 )
+        _pep_fresh = None
         if not _is_real_eval:
             # PAPER_EXIT_PARITY_20261001: live's no-price hierarchy for paper.
-            if _service_paper_no_executable(position, position_id, mint, token_name,
-                                            entry_price, opened_at):
-                return
-        return
+            # PAPER_EXIT_FRESH_QUOTE_FEED_20261003: a fresh executable quote now
+            # continues into the normal evaluator instead of forcing a close.
+            _pep_fresh = _service_paper_no_executable(position, position_id, mint, token_name,
+                                                      entry_price, opened_at)
+        if not (isinstance(_pep_fresh, dict) and _pep_fresh.get("can_execute_exit")
+                and float(_pep_fresh.get("price") or 0.0) > 0.0):
+            return
+        _pr = _pep_fresh
 
     if _is_real_eval:
         _maybe_adjudicate_router_executable_family(position, _pr)
@@ -7998,9 +8015,14 @@ def evaluate_exit_for_position(position: dict) -> None:
                         0.0, time.time(), source="gate_blocked")
                     if not _is_real_eval:
                         # PAPER_EXIT_PARITY_20261001
-                        if _service_paper_no_executable(position, position_id, mint, token_name,
-                                                        entry_price, opened_at, max_hold_s=max_hold_s):
-                            return
+                        _pep_mh = _service_paper_no_executable(position, position_id, mint, token_name,
+                                                               entry_price, opened_at, max_hold_s=max_hold_s)
+                        # PAPER_EXIT_FRESH_QUOTE_FEED_20261003: max-hold is already due; with a
+                        # fresh executable route the normal max-hold close applies at that price.
+                        if (isinstance(_pep_mh, dict) and _pep_mh.get("can_execute_exit")
+                                and float(_pep_mh.get("price") or 0.0) > 0.0):
+                            close_position_canonical(position_id, float(_pep_mh["price"]),
+                                f"MAX_HOLD_TIME_{hold_s:.0f}s", closure_mode="normal")
                     return
                 close_position_canonical(position_id, _router_exit_price,
                     f"MAX_HOLD_TIME_{hold_s:.0f}s", closure_mode="normal")
@@ -8078,12 +8100,21 @@ def evaluate_exit_for_position(position: dict) -> None:
                     token_name, price_age, _pr_warning,
                 )
             update_position_mark(position_id, current_price, 0.0, time.time(), source="router-held")
+            _pep_held = None
             if not _is_real_eval:
                 # PAPER_EXIT_PARITY_20261001
-                if _service_paper_no_executable(position, position_id, mint, token_name,
-                                                entry_price, opened_at):
-                    return
-            return
+                _pep_held = _service_paper_no_executable(position, position_id, mint, token_name,
+                                                         entry_price, opened_at)
+            if not (isinstance(_pep_held, dict) and _pep_held.get("can_execute_exit")
+                    and float(_pep_held.get("price") or 0.0) > 0.0):
+                return
+            # PAPER_EXIT_FRESH_QUOTE_FEED_20261003: the cached quote is not
+            # executable but a fresh exact-size route is - evaluate on it.
+            _pr = _pep_held
+            current_price = float(_pr["price"])
+            price_age     = float(_pr.get("age_sec") or 0.0)
+            _pr_can_exit  = True
+            _pr_warning   = str(_pr.get("warning") or "")
 
     # EXIT PRICE SANITY GUARD: reject if current_price > 1000x entry
     # Catches bad oracle data from ALL price sources before fake TP fires
