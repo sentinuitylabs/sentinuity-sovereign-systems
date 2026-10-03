@@ -434,7 +434,39 @@ _QUALIFIER_COLUMNS = [
     ("smart_money_tier",    "TEXT"),
     ("smart_money_holders_delta_180s", "REAL"),
     ("smart_money_wallet_cluster_score", "REAL"),
+    # EDGE_REMEDIATION_V2_FINAL_20260924 WS2 canonical feature contract (nullable; measured-or-NULL)
+    ("volume_5m_usd", "REAL"), ("buys_5m", "REAL"), ("sells_5m", "REAL"),
+    ("buy_sell_ratio", "REAL"), ("buy_velocity", "REAL"), ("curve_liquidity_usd", "REAL"),
+    ("feature_state_json", "TEXT"), ("feature_observed_at", "REAL"),
+    ("feature_contract_version", "TEXT"),
 ]
+
+
+def _fc_dex_safe(best_pair):  # EDGE_REMEDIATION_V2_FINAL_20260924 WS2
+    try:
+        from services.feature_contract import dex_truth
+        return dex_truth(best_pair)
+    except Exception:
+        return {}
+
+
+def _fc_curve_states_safe(metrics):  # EDGE_REMEDIATION_V2_FINAL_20260924 WS2
+    try:
+        from services.feature_contract import curve_states
+        return curve_states(metrics)
+    except Exception:
+        return {}
+
+
+def _fc_persist_safe(conn, row_id, metrics):  # EDGE_REMEDIATION_V2_FINAL_20260924 WS2
+    try:
+        from services.feature_contract import persist_snapshot
+        persist_snapshot(conn, row_id, metrics)
+    except Exception as _fc_exc:
+        try:
+            log.warning("FEATURE_CONTRACT_PERSIST_FAIL row=%s err=%s", row_id, _fc_exc)
+        except Exception:
+            pass
 
 def _ensure_qualifier_columns() -> None:
     try:
@@ -601,7 +633,8 @@ def _qualify_row_guarded(row: Dict[str, Any]) -> Tuple[int, str, str, str]:
                     "UPDATE market_snapshots SET "
                     "quality_status='pending', quality_reason='', "
                     "qualify_claimed_until=NULL "
-                    "WHERE id=?",
+                    "WHERE id=? AND candidate_state='pending' "
+                    "AND COALESCE(quality_status,'') NOT IN ('qualified','rejected','error')",
                     (row["id"],),
                 )
                 conn.commit()
@@ -628,6 +661,7 @@ def _qualify_row_guarded(row: Dict[str, Any]) -> Tuple[int, str, str, str]:
                         quality_reason='QUALIFIER_NO_VERDICT',
                         qualify_claimed_until=NULL
                     WHERE id=?
+                      AND candidate_state='pending'
                       AND COALESCE(quality_status,'') = 'pending'
                       AND COALESCE(quality_reason,'') = ''
                       AND qualify_claimed_until IS NOT NULL
@@ -685,6 +719,8 @@ def _claim_qualifier_rows(limit: int) -> List[Dict[str, Any]]:
                     UPDATE market_snapshots
                     SET qualify_claimed_until = ?
                     WHERE id = ?
+                      AND candidate_state='pending'
+                      AND COALESCE(quality_status, '') NOT IN ('qualified','rejected','error')
                       AND (qualify_claimed_until IS NULL OR qualify_claimed_until < ?)
                     """,
                     (now + QUALIFIER_CLAIM_SECONDS, row["id"], now),
@@ -719,8 +755,15 @@ def _write_qualifier_result(
     metrics: Dict[str, Any],
     quality_status: str,
     quality_reason: str,
-) -> None:
+) -> Optional[bool]:
     now = time.time()
+    # SIGNOFF_QUALIFIER_TERMINAL_OWNERSHIP_20260901:
+    # A claimed qualifier job can outlive the snapshot's freshness lifetime.
+    # Freshness/terminal actors own vetoed/expired rows; a late HTTP/RPC result
+    # must never resurrect one to candidate_state='qualified' or overwrite its
+    # terminal reason. Every result write below therefore revalidates ownership
+    # atomically in the UPDATE predicate. No gate, threshold, age or score changes.
+    _write_applied = False
 
     # SIGNOFF_CONFIDENCE_SPINE_20260731:
     # The profitable-era bridge used mint_confidence (identity certainty) as
@@ -758,7 +801,7 @@ def _write_qualifier_result(
                 elif metrics.get("token_price_usd"):
                     entry_price_usd = float(metrics["token_price_usd"])
 
-                conn.execute(
+                _qcur = conn.execute(
                     """
                     UPDATE market_snapshots SET
                         quality_status=?, quality_reason=?,
@@ -789,6 +832,8 @@ def _write_qualifier_result(
                         smart_money_holders_delta_180s=?,
                         smart_money_wallet_cluster_score=?
                     WHERE id=?
+                      AND candidate_state='pending'
+                      AND COALESCE(quality_status,'') NOT IN ('qualified','rejected','error')
                     """,
                     (
                         quality_status, quality_reason,
@@ -819,8 +864,11 @@ def _write_qualifier_result(
                         row_id,
                     ),
                 )
+                _write_applied = (_qcur.rowcount == 1)
+                if _write_applied:
+                    _fc_persist_safe(conn, row_id, metrics)  # EDGE_REMEDIATION_V2_FINAL_20260924 WS2
             else:
-                conn.execute(
+                _qcur = conn.execute(
                     """
                     UPDATE market_snapshots SET
                         quality_status=?, quality_reason=?,
@@ -832,6 +880,8 @@ def _write_qualifier_result(
                         vol_acceleration=?, price_change_5m=?, price_change_1h=?,
                         vol_5m_usd=?, vol_24h_usd=?, regime=?
                     WHERE id=?
+                      AND candidate_state='pending'
+                      AND COALESCE(quality_status,'') NOT IN ('qualified','rejected','error')
                     """,
                     (
                         quality_status, quality_reason,
@@ -850,9 +900,21 @@ def _write_qualifier_result(
                         row_id,
                     ),
                 )
+                _write_applied = (_qcur.rowcount == 1)
+                if _write_applied:
+                    _fc_persist_safe(conn, row_id, metrics)  # EDGE_REMEDIATION_V2_FINAL_20260924 WS2
             conn.commit()
     except Exception as e:
         log.warning("Signal write pathway fractured for row=%d: %s", row_id, e)
+        return None
+
+    if not _write_applied:
+        log.info(
+            "[QUALIFIER_STALE_RESULT_DROPPED] row=%d result=%s reason=%s; "
+            "snapshot no longer owned by qualifier",
+            row_id, quality_status, str(quality_reason)[:120],
+        )
+
     # SIGNOFF_FLOW_LATENCY_20260724: stage telemetry (additive, best-effort).
     try:
         from services.stage_telemetry import record_stage as _tel
@@ -871,9 +933,36 @@ def _write_qualifier_result(
              _tel_mint,
              snapshot_id=int(row_id) if row_id else None,
              source="qualifier",
-             success=(quality_status == "qualified"),
-             failure_reason=None if quality_status == "qualified"
-             else str(quality_reason)[:200])
+             success=(_write_applied and quality_status == "qualified"),
+             failure_reason=(
+                 "QUALIFIER_STALE_RESULT_DROPPED" if not _write_applied
+                 else (None if quality_status == "qualified" else str(quality_reason)[:200])
+             ))
+        # STAGE_LEDGER_20260825: append-only funnel spine. Reuses the mint already
+        # resolved above. QUALIFIED and its terminal counterpart are the first arrow
+        # of the leak budget; market_snapshots later overwrites candidate_state on
+        # the success path, so this is the only durable record of the transition.
+        try:
+            from services.candidate_stage_ledger import record_stage as _stage
+            _q_ok = (_write_applied and quality_status == "qualified")
+            if not _write_applied:
+                raise RuntimeError("QUALIFIER_STALE_RESULT_DROPPED")
+            _stage("QUALIFIED" if _q_ok else "VETOED",
+                   _tel_mint or None,
+                   prior_stage="DISCOVERED",
+                   source_service="market_intelligence",
+                   source_function="_write_qualifier_result",
+                   reason=None if _q_ok else str(quality_reason)[:200],
+                   candidate_state="qualified" if _q_ok else None,
+                   quality_status=quality_status,
+                   snapshot_id=int(row_id) if row_id else None,
+                   confidence=locals().get("trading_confidence"),
+                   market_cap=metrics.get("market_cap_usd"),
+                   liquidity=metrics.get("token_liquidity_usd"),
+                   provider=str(metrics.get("source_note") or "")[:60],
+                   transition_id="qual:{}".format(row_id))
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -883,6 +972,8 @@ def _write_qualifier_result(
     # gate, no threshold, no timestamp, and no entry behaviour. Fail-safe by
     # construction: a ledger fault must never become a qualification fault.
     try:
+        if not _write_applied:
+            return False
         from services.edge_ledger import record_candidate as _edge_record
         _edge_record(
             snapshot_id=row_id,
@@ -896,6 +987,7 @@ def _write_qualifier_result(
         )
     except Exception:
         pass
+    return bool(_write_applied)
 
 
 def _mark_qualifier_error(row_id: int, reason: str) -> None:
@@ -903,7 +995,7 @@ def _mark_qualifier_error(row_id: int, reason: str) -> None:
         with get_connection() as conn:
             conn.execute(
                 "UPDATE market_snapshots SET quality_status='error', "
-                "quality_reason=? WHERE id=?",
+                "quality_reason=? WHERE id=? AND candidate_state='pending'",
                 (reason[:220], row_id),
             )
             conn.commit()
@@ -1097,6 +1189,9 @@ def _derive_quality_metrics(best_pair: Dict[str, Any]) -> Dict[str, Any]:
         "sells_5m":                 sells_5m,
         "buy_sell_ratio":           buy_sell_ratio,
         "regime_classification":    regime,
+        # EDGE_REMEDIATION_V2_FINAL_20260924 WS2: None-preserving truth + per-field state. Legacy numeric keys
+        # above are unchanged so no in-memory gate outcome changes.
+        **_fc_dex_safe(best_pair),
     }
 
 
@@ -1116,8 +1211,8 @@ def _evaluate_quality_inner(metrics: Dict[str, Any]) -> Tuple[str, str]:
     # Tier 1 (launch, mcap < tier2_floor):  3 min  - pump tokens move in minutes
     # Tier 2 (mid-cap, tier2-tier3 floor):  15 min - needs time to reach entry band
     # Tier 3 (>tier3_floor / post-grad):    radar only, never a live trade
-    tier1_max      = float(get_config_value("SIGNAL_TIER1_MAX_AGE_SEC",  600))  # relaxed 600→900 - claim window now 1200s
-    tier2_max      = float(get_config_value("SIGNAL_TIER2_MAX_AGE_SEC",  900))  # relaxed 900→1800
+    tier1_max      = float(get_config_value("SIGNAL_TIER1_MAX_AGE_SEC",  900))  # QUALIFIER_F_20260824: current-tree default preserved; signal ceiling unchanged
+    tier2_max      = float(get_config_value("SIGNAL_TIER2_MAX_AGE_SEC",  1800))  # QUALIFIER_F_20260824: current-tree default preserved; signal ceiling unchanged
     tier2_min_mcap = float(get_config_value("SIGNAL_TIER2_MIN_MCAP",   10000))
     tier3_min_mcap = float(get_config_value("SIGNAL_TIER3_MIN_MCAP",   35000))
     radar_enabled  = str(get_config_value("RADAR_QUEUE_ENABLED",         "1")) == "1"
@@ -1180,7 +1275,11 @@ def _evaluate_quality_inner(metrics: Dict[str, Any]) -> Tuple[str, str]:
 # candidate. It CANNOT change a decision: the inner verdict is returned
 # unmodified on every path, and all telemetry work is exception-swallowed.
 _TELEMETRY_REASON_MAP = (
-    ("TOKEN_TOO_YOUNG",      "SIGNAL_TOO_OLD"),   # age gate, young side
+    # ADMISSION_OBSERVABILITY_20260907 (M6): TOKEN_TOO_YOUNG previously
+    # canonicalised to SIGNAL_TOO_OLD, inverting the meaning of the single
+    # deferral class the module header records as later running to +100%.
+    # deciding_gate always retained the raw string, so history is recoverable.
+    ("TOKEN_TOO_YOUNG",      "TOKEN_TOO_YOUNG"),  # age gate, young side
     ("TOKEN_AGE_UNKNOWN",    "OTHER"),
     ("BELOW_MIN_MCAP",       "MARKET_CAP_BELOW_MIN"),
     ("TIER3_RADAR_ONLY",     "MARKET_CAP_ABOVE_MAX"),
@@ -1202,13 +1301,84 @@ def _canonical_rejection(reason: str) -> str:
     return "OTHER"
 
 
+def _shadow_admission_verdicts(metrics: Dict[str, Any],
+                               state: str, reason: str) -> Dict[str, str]:
+    """ADMISSION_OBSERVABILITY_20260907 (M8) - counterfactuals, never enforced.
+
+    Fail-closed can only convert an acceptance into a rejection, so for those
+    cohorts the counterfactual is exact without re-running the gate. The Aug-12
+    age cohort mirrors the tier branch in _evaluate_quality_inner at 600s/900s.
+    Returns strings only; the caller discards them into telemetry.
+    """
+    out: Dict[str, str] = {}
+    try:
+        known = lambda k: bool(metrics.get(k))  # noqa: E731
+        mcap_ok, curve_ok = known("mcap_known"), known("curve_known")
+        liq_ok, hold_ok = known("liq_known"), known("holders_known")
+        age = _as_float(metrics.get("token_age_seconds"))
+        mcap = _as_float(metrics.get("market_cap_usd"))
+        mcap = mcap if mcap and mcap > 0 else None
+
+        def failclosed(*flags):
+            if state != "qualified":
+                return state.upper()
+            return "REJECTED" if not all(flags) else "QUALIFIED"
+
+        out["shadow_failclosed_mcap"] = failclosed(mcap_ok)
+        out["shadow_failclosed_mcap_curve"] = failclosed(mcap_ok, curve_ok)
+        out["shadow_failclosed_all"] = failclosed(mcap_ok, curve_ok, liq_ok, hold_ok)
+
+        # Aug-12 donor windows: tier1 600s, tier2 900s. Unknown mcap -> tier1.
+        aug12 = state.upper()
+        if state == "qualified" and age is not None:
+            t2_min = float(get_config_value("SIGNAL_TIER2_MIN_MCAP", 10000))
+            t3_min = float(get_config_value("SIGNAL_TIER3_MIN_MCAP", 35000))
+            if mcap is not None and mcap >= t3_min:
+                aug12 = "REJECTED"
+            elif mcap is not None and mcap >= t2_min:
+                aug12 = "REJECTED" if age > 900.0 else "QUALIFIED"
+            else:
+                aug12 = "REJECTED" if age > 600.0 else "QUALIFIED"
+        out["shadow_aug12_ages"] = aug12
+        out["shadow_failclosed_mcap_aug12"] = (
+            "REJECTED" if (out["shadow_failclosed_mcap"] == "REJECTED"
+                           or aug12 == "REJECTED") else "QUALIFIED"
+        )
+    except Exception:
+        pass
+    return out
+
+
 def _evaluate_quality(metrics: Dict[str, Any]) -> Tuple[str, str]:
     state, reason = _evaluate_quality_inner(metrics)
     try:
         from services.entry_telemetry import GateTrace
+        # ADMISSION_OBSERVABILITY_20260907 (M1): record explicitly when identity
+        # is absent instead of letting entry_telemetry substitute UNKNOWN_MINT.
+        _mint = str(metrics.get("mint_address") or "").strip()
+        _snap = metrics.get("snapshot_id")
+        _identity = "OK" if (_mint and _snap is not None) else "IDENTITY_MISSING_AT_GATE"
         trace = GateTrace(
-            mint=str(metrics.get("mint_address") or ""),
+            mint=_mint,
             source="market_intelligence._evaluate_quality",
+        )
+        trace.observe(
+            identity_status=_identity,
+            mcap_known=metrics.get("mcap_known"),
+            mcap_source=metrics.get("mcap_source"),
+            liq_known=metrics.get("liq_known"),
+            liq_source=metrics.get("liq_source"),
+            curve_known=metrics.get("curve_known"),
+            curve_source=metrics.get("curve_source"),
+            holders_known=metrics.get("holders_known"),
+            holders_source=metrics.get("holders_source"),
+            holder_concentration_known=metrics.get("holder_concentration_known"),
+            curve_liquidity_usd=_as_float(metrics.get("curve_liquidity_usd")),
+            curve_sol_reserves=_as_float(metrics.get("curve_sol_reserves")),
+            curve_progress_pct=_as_float(metrics.get("curve_progress_pct")),
+            top10_holder_pct=_as_float(metrics.get("top10_holder_pct")),
+            source_note=str(metrics.get("source_note") or "")[:64],
+            **_shadow_admission_verdicts(metrics, state, reason),
         )
         trace.observe(
             token_name=str(metrics.get("token_name") or "")[:64],
@@ -1323,19 +1493,27 @@ def _qualify_one(session: requests.Session, row: Dict[str, Any]) -> Tuple[str, s
         return "rejected", "QUALITY_DATA_MISSING:MINT"
 
     if not mint.lower().endswith("pump"):
-        _write_qualifier_result(row_id, {
+        _wr = _write_qualifier_result(row_id, {
             "token_age_seconds": None, "token_liquidity_usd": None,
             "market_cap_usd": None, "source_note": "not_pump_token",
         }, "rejected", "NOT_PUMP_TOKEN")
+        if _wr is None:
+            raise RuntimeError("QUALIFIER_RESULT_WRITE_FAILED")
+        if not _wr:
+            return "stale_dropped", "QUALIFIER_STALE_RESULT_DROPPED"
         return "rejected", "NOT_PUMP_TOKEN"
 
     curve_passed, curve_reason, curve_meta = _check_curve_gate(mint)
     if not curve_passed:
-        _write_qualifier_result(row_id, {
+        _wr = _write_qualifier_result(row_id, {
             "token_age_seconds": None, "token_liquidity_usd": None,
             "market_cap_usd": None, "source_note": "curve_rejected",
             **curve_meta,
         }, "rejected", curve_reason)
+        if _wr is None:
+            raise RuntimeError("QUALIFIER_RESULT_WRITE_FAILED")
+        if not _wr:
+            return "stale_dropped", "QUALIFIER_STALE_RESULT_DROPPED"
         _cognition("QUALIFIER",
             _COGNITION_MESSAGES.get(curve_reason,
                 f"Rejected at curve gate: {curve_reason}"),
@@ -1362,7 +1540,46 @@ def _qualify_one(session: requests.Session, row: Dict[str, Any]) -> Tuple[str, s
 
     _now_for_age = time.time()
     _price_ts = float(row.get("price_updated_at") or 0.0)
+    # ADMISSION_OBSERVABILITY_20260907 (M1/M2/M3/M4)
+    # row_id and mint are in scope here and were previously never placed into
+    # `metrics`, so every telemetry row became UNKNOWN_MINT / snapshot_id NULL
+    # and the ledger could not be joined to a candidate. These keys are ADDITIVE:
+    # _evaluate_quality_inner reads market_cap_usd / token_liquidity_usd /
+    # token_age_seconds / curve_sol_reserves / holder_count / top10_holder_pct
+    # only, none of which change value here, so the verdict is unchanged.
+    _mcap_known = 1 if (curve_mcap_usd and float(curve_mcap_usd) > 0) else 0
+    if _mcap_known:
+        _mcap_source = "CURVE_DERIVED"
+    elif not (sol_usd_now and float(sol_usd_now) > 0):
+        _mcap_source = "SOL_BASIS_UNAVAILABLE"
+    elif not (price_sol_now and float(price_sol_now) > 0):
+        _mcap_source = "CURVE_PRICE_UNAVAILABLE"
+    else:
+        _mcap_source = "UNKNOWN"
+    _curve_res = curve_meta.get("curve_sol_reserves")
+    try:
+        _curve_res_f = float(_curve_res) if _curve_res is not None else 0.0
+    except (TypeError, ValueError):
+        _curve_res_f = 0.0
+    _curve_known = 1 if _curve_res_f > 0 else 0
+    # Native pre-graduation depth proxy. Deliberately NOT called liquidity_usd
+    # and never equated with a DexScreener pool figure.
+    _curve_liq = (_curve_res_f * float(sol_usd_now)
+                  if (_curve_known and sol_usd_now and float(sol_usd_now) > 0) else None)
+
     metrics = {
+        "mint_address":        mint,
+        "snapshot_id":         row_id,
+        "mcap_known":          _mcap_known,
+        "mcap_source":         _mcap_source,
+        "liq_known":           0,
+        "liq_source":          "CURVE_PATH_NO_POOL_LIQUIDITY",
+        "curve_known":         _curve_known,
+        "curve_source":        "BONDING_CURVE_RPC" if _curve_known else "UNKNOWN",
+        "curve_liquidity_usd": _curve_liq,
+        "holders_known":       0,
+        "holders_source":      "NOT_PRODUCED_ON_CURVE_PATH",
+        "holder_concentration_known": 0,
         "market_cap_usd":      curve_mcap_usd,
         "token_liquidity_usd": None,
         "token_age_seconds":   token_age_seconds,
@@ -1376,6 +1593,7 @@ def _qualify_one(session: requests.Session, row: Dict[str, Any]) -> Tuple[str, s
         "token_price_usd":     token_price_usd,
     }
     metrics.update(curve_meta)
+    metrics["feature_states"] = _fc_curve_states_safe(metrics)  # EDGE_REMEDIATION_V2_FINAL_20260924 WS2
     quality_status, quality_reason = _evaluate_quality(metrics)
 
     if quality_status == "qualified":
@@ -1436,9 +1654,15 @@ def _qualify_one(session: requests.Session, row: Dict[str, Any]) -> Tuple[str, s
                     "buy_sell_ratio", "liquidity_balance_score",
                     "paid_boost_detected", "boost_amount",
                     "regime_classification",
+                    # EDGE_REMEDIATION_V2_FINAL_20260924 WS2 truth keys
+                    "volume_5m_usd_obs", "buys_5m_obs", "sells_5m_obs", "buy_velocity",
+                    "buy_sell_ratio_obs", "vol_acceleration_obs", "liquidity_usd_obs",
+                    "feature_source", "feature_observed_at",
                 ):
                     if _key in dex_metrics and dex_metrics[_key] is not None:
                         metrics[_key] = dex_metrics[_key]
+                metrics["feature_states"] = {**dict(metrics.get("feature_states") or {}),
+                                              **dict(dex_metrics.get("feature_states") or {})}
                 metrics["source_note"] = "bonding_curve_rpc+dexscreener"
                 enriched_status, enriched_reason = _evaluate_quality(metrics)
                 if enriched_status == "qualified":
@@ -1578,7 +1802,11 @@ def _qualify_one(session: requests.Session, row: Dict[str, Any]) -> Tuple[str, s
         except Exception:
             _sm_result = None
 
-    _write_qualifier_result(row_id, metrics, quality_status, quality_reason)
+    _wr = _write_qualifier_result(row_id, metrics, quality_status, quality_reason)
+    if _wr is None:
+        raise RuntimeError("QUALIFIER_RESULT_WRITE_FAILED")
+    if not _wr:
+        return "stale_dropped", "QUALIFIER_STALE_RESULT_DROPPED"
 
     if quality_status == "qualified":
         _cognition("QUALIFIER", _COGNITION_QUALIFIED, token=mint,
@@ -1805,7 +2033,7 @@ def _qualifier_loop() -> None:
                     processed += 1
                     if _status == "qualified":
                         qualified += 1
-                    elif _status == "deferred":
+                    elif _status in ("deferred", "stale_dropped"):
                         pass
                     else:
                         rejected += 1
@@ -2550,12 +2778,32 @@ _oracle_idle_count = 0
 
 
 def _build_resilient_session() -> requests.Session:
+    """Bound provider latency so network faults cannot consume candidate freshness.
+
+    DUAL_LAUNCH_PROVIDER_RECOVERY_20261002:
+    The late-Sep selection/latch code is unchanged, but the Oct-2 runtime showed
+    repeated SSL EOF/read failures being multiplied by urllib3's read/status
+    retry ladder.  That can hold pricer/oracle worker slots for tens of seconds
+    and starve otherwise-qualified candidates until the existing freshness gates
+    correctly expire them.
+
+    Retry connection establishment once only.  Read failures, 429s and 5xxs
+    return to the owning cycle immediately, where Sentinuity already has its
+    canonical cycle-level retry/failover behaviour.  No quality, latch, sizing,
+    executable-route or live-safety threshold is changed here.
+    """
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
     s = requests.Session()
-    retry = Retry(total=3, connect=3, read=3, backoff_factor=0.3,
-                  status_forcelist=[429, 500, 502, 503, 504],
-                  allowed_methods=frozenset(["POST", "GET"]))
+    retry = Retry(
+        total=1,
+        connect=1,
+        read=0,
+        status=0,
+        redirect=2,
+        backoff_factor=0.0,
+        allowed_methods=frozenset(["POST", "GET"]),
+    )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
